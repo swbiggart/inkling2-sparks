@@ -1,0 +1,3053 @@
+From 4d2e7cbab369b4510641d144aebbb32f60204d16 Mon Sep 17 00:00:00 2001
+From: Scott Biggart <297695+swbiggart@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 01:00:00 -0800
+Subject: [PATCH 3/8] inkling2: batching: lanes core for several streams a
+ decode step and interleaved prefill
+
+16 files (3 new, 13 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
+Part of the engine changes behind Inkling-2-Small TP4 v0.1 (github.com/swbiggart/inkling2-sparks).
+Apply the whole series in order with git am (scripts/build-engine.sh does); only the full series is built and gated.
+---
+ zig/src/core/engine_stats.zig                 |    8 +
+ zig/src/core/lane_host.zig                    |    9 +-
+ zig/src/core/lanes/allocate.zig               |   55 +-
+ zig/src/core/lanes/backend.zig                |    7 +
+ zig/src/core/lanes/config.zig                 |   14 +
+ zig/src/core/lanes/depth_shared_test.zig      |  257 +++
+ zig/src/core/lanes/engine.zig                 |   23 +-
+ zig/src/core/lanes/engine_test.zig            |   48 +-
+ zig/src/core/lanes/fake.zig                   |   24 +-
+ zig/src/core/lanes/grammar.zig                |   11 +
+ zig/src/core/lanes/grammar_parallel.zig       |    7 +-
+ zig/src/core/lanes/grammar_window.zig         |   10 +
+ zig/src/core/lanes/stream.zig                 |    8 +
+ zig/src/core/lanes/windows.zig                |    5 +-
+ .../families/inkling2/cuda_batch_check.zig    |  792 ++++++++++
+ zig/src/families/inkling2/cuda_lanes.zig      | 1384 +++++++++++++++++
+ 16 files changed, 2645 insertions(+), 17 deletions(-)
+ create mode 100644 zig/src/core/lanes/depth_shared_test.zig
+ create mode 100644 zig/src/families/inkling2/cuda_batch_check.zig
+ create mode 100644 zig/src/families/inkling2/cuda_lanes.zig
+
+diff --git a/zig/src/core/engine_stats.zig b/zig/src/core/engine_stats.zig
+index 5bc253e0a5322b9e6f6dfd1f4a500c3dcc114492..a683b798f71b61297def897de2294a635f855064 100644
+--- a/zig/src/core/engine_stats.zig
++++ b/zig/src/core/engine_stats.zig
+@@ -17,6 +17,14 @@ pub const Stats = struct {
+     gpu_seconds: ?f64 = null,
+     /// Seconds from engine submission to first admission; an engine that admits immediately leaves zero.
+     queued_seconds: f64 = 0,
++    /// Rounds by drafts verified (drafts 0 .. 7, the last bucket that or more) and the drafts they accepted; rounds
++    /// by drafts accepted (lanes Stream.depth_rounds).
++    depth_rounds: [8]u32 = @splat(0),
++    depth_kept: [8]u32 = @splat(0),
++    kept_rounds: [8]u32 = @splat(0),
++    /// The backend's drafts made from stale taps, and its mean host gap from a draft's return to the next verify.
++    stale_drafts: u32 = 0,
++    draft_gap_ms: ?f64 = null,
+     /// The drafter's own counters as a JSON object, or empty.
+     telemetry_json: []const u8 = "",
+ };
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index d883f1d8acbb0231ead6bd09ed36bfb3ab2875b3..1e449bc86f5edd434e1d2911e1bd4267c5d0b0f5 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -68,6 +68,7 @@ pub const LaneHost = struct {
+     decoded_rows: bool = false, // the backend prefills Request.decode_spans with decoded rows' arithmetic, cache or not
+     health: ?api.HealthSource = null,
+     fsr: ?@import("engine_status.zig").FsrSource = null, // the backend's SSD-expert cache counts; null: Status.fsr stays null
++    kv_source: ?@import("engine_status.zig").KvSource = null, // the backend's KV page pool counts; null: Status.kv stays null
+     frame_key: ?*const fn (images: []const api.Image) u32 = null, // a family's image frame (0: text's), in the cache key
+     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
+     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
+@@ -312,7 +313,7 @@ pub const LaneHost = struct {
+         h.gpa.free(job.marks);
+         h.gpa.free(job.key);
+         const s = &job.stream;
+-        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .grammar = if (s.grammar_time.windows > 0) s.grammar_time else null, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .prefill_widths = s.prefill_widths.items, .loop_period = s.loop_period, .gpu_seconds = s.gpu_seconds, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
++        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .grammar = if (s.grammar_time.windows > 0) s.grammar_time else null, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .prefill_widths = s.prefill_widths.items, .loop_period = s.loop_period, .gpu_seconds = s.gpu_seconds, .depth_rounds = s.depth_rounds, .depth_kept = s.depth_kept, .kept_rounds = s.kept_rounds, .stale_drafts = s.stale_drafts, .draft_gap_ms = if (s.draft_gaps > 0) @as(f64, @floatFromInt(s.draft_gap_ns)) / 1e6 / @as(f64, @floatFromInt(s.draft_gaps)) else null, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
+         var told = if (job.started) recalls.finished(h, job, reason, stats) else stats;
+         told.queued_seconds = if (job.admitted_ns) |at| @as(f64, @floatFromInt(@max(0, at - job.submitted))) / 1e9 else 0;
+         emit(job, .{ .finished = .{ .reason = reason, .stats = told, .message = message } });
+@@ -325,6 +326,12 @@ pub const LaneHost = struct {
+         h.gpa.destroy(job);
+     }
+ 
++    /// Kept prompt states give their storage back for a backend's own pages (lane_cache_queue.zig giveBack: the
++    /// queued and admitted requests' resumptions protected). Engine thread, outside the lock.
++    pub fn giveBackGuarded(h: *LaneHost, restoring: ?pc.Saved, left: anytype) bool {
++        return @import("lane_cache_queue.zig").giveBack(h, restoring, left);
++    }
++
+     pub fn lock(h: *LaneHost) void {
+         h.mutex.lockUncancelable(h.io);
+     }
+diff --git a/zig/src/core/lanes/allocate.zig b/zig/src/core/lanes/allocate.zig
+index 99426b5a0f1d3355f7e8ace24a06b475f0e08bbe..3968b8498b23a5e599e1c559961dffab240c46d1 100644
+--- a/zig/src/core/lanes/allocate.zig
++++ b/zig/src/core/lanes/allocate.zig
+@@ -23,6 +23,15 @@ pub const HeadCost = struct {
+     free_first: bool = false,
+     row_ms: f64 = 0.0, // what each row past a stream's first costs past the table on this machine (below it: less)
+     least_rows: u64 = 0, // a measuring round reaches this many rows, the likeliest nodes first, whatever they cost
++    pass_ms: f64 = 0.0, // a drafter's own pass: once a round any stream drafts in (the round without drafts has none)
++    first_ms: f64 = 0.0, // and its share a drafting stream (charged at the stream's first draft)
++    margin: f64 = 1.0, // drafts must beat the round without them by this factor (estimates near the line are noise)
++    /// Per stream (as `probs`), what its round costs past the shallow price at c drafts (`depth[s][c]`, c from 0 to its
++    /// chain's length): a stream deep in its context pays for its window's rows and its draft over that context
++    /// (depth.zig Rule.depthMs). Empty: none (the allocation as before). With it, the next node is the one with the
++    /// most chance a ms it adds (the table's next row, its depth, a stream's first its share of the pass), the likeliest
++    /// among equal ms.
++    depth: []const []const f64 = &.{},
+ };
+ 
+ /// allocate, each stream's drafts past its first costing one more head step.
+@@ -47,20 +56,32 @@ pub fn allocateDrafts(gpa: Allocator, fixed: []const u32, probs: []const []const
+     var live: u64 = 0;
+     for (fixed) |f| live += @intFromBool(f > 0);
+     const least = @min(head.least_rows, max_rows);
+-    var best = if (rows >= least) rate(costs, timed, rows, expected, overhead_ms + rowTerm(costs, timed, head, rows, live)) else -std.math.inf(f64);
++    const deep = head.depth.len == probs.len;
++    var depth_ms: f64 = 0; // the streams' depth at their counts (head.depth)
++    if (deep) for (head.depth) |d| {
++        depth_ms += d[0];
++    };
++    var best = if (rows >= least) head.margin * rate(costs, timed, rows, expected, overhead_ms + depth_ms + rowTerm(costs, timed, head, rows, live)) else -std.math.inf(f64);
+     while (rows < max_rows) {
+-        // the likeliest next node, ties to the lowest stream (Python's heapq of (-p, stream))
++        // the likeliest next node, ties to the lowest stream (Python's heapq of (-p, stream)); with depth, the most
++        // chance a ms it adds (the table's next row is the same for every stream)
++        const row: f64 = if (!deep) 0 else if (timed) @max(1e-3, (costs.get(@intCast(rows + 1)) orelse 0) - (costs.get(@intCast(rows)) orelse 0) + head.row_ms) else 1.0;
+         var pick: ?usize = null;
+         var pick_p: f64 = 0.0;
++        var pick_ms: f64 = 0.0;
+         for (probs, 0..) |p, s| {
+             if (counts[s] >= p.len) continue;
+             const v = p[counts[s]];
+-            if (pick == null or v > pick_p) {
++            const ms = if (deep) row + @max(0, head.depth[s][counts[s] + 1] - head.depth[s][counts[s]]) + (if (counts[s] == 0) head.first_ms else 0) else 0;
++            const better = if (ms == pick_ms) v > pick_p else v * pick_ms > pick_p * ms;
++            if (pick == null or better) {
+                 pick = s;
+                 pick_p = v;
++                pick_ms = ms;
+             }
+         }
+         const s = pick orelse break;
++        if (deep) depth_ms += head.depth[s][counts[s] + 1] - head.depth[s][counts[s]];
+         counts[s] += 1;
+         firsts += @intFromBool(counts[s] == 1);
+         rows += 1;
+@@ -69,7 +90,8 @@ pub fn allocateDrafts(gpa: Allocator, fixed: []const u32, probs: []const []const
+         expected += pick_p;
+         const steps: f64 = @floatFromInt(if (head.batched) deepest -| @intFromBool(head.free_first) else drafts - (if (head.free_first) firsts else 0));
+         if (rows < least) continue;
+-        const now = rate(costs, timed, rows, expected, overhead_ms + head.step_ms * steps + rowTerm(costs, timed, head, rows, live));
++        const pass = head.pass_ms + head.first_ms * @as(f64, @floatFromInt(firsts));
++        const now = rate(costs, timed, rows, expected, overhead_ms + depth_ms + head.step_ms * steps + pass + rowTerm(costs, timed, head, rows, live));
+         if (now > best or (!timed and head.step_ms == 0)) {
+             best = now;
+             @memcpy(best_counts, counts);
+@@ -152,6 +174,31 @@ fn find(costs: []const Cost, width: u32) ?f64 {
+     return null;
+ }
+ 
++test "a priced drafter pass: a round drafts only where its streams' drafts pay for the pass and their shares" {
++    const gpa = std.testing.allocator;
++    var costs = try extendCosts(gpa, &.{ .{ .width = 1, .ms = 34.0 }, .{ .width = 8, .ms = 77.0 }, .{ .width = 32, .ms = 161.0 } }, 32);
++    defer costs.deinit(gpa);
++    var likely: [8][]const f64 = undefined;
++    var some_land: [8][]const f64 = undefined;
++    for (&likely, &some_land) |*l, *s| {
++        l.* = &.{ 0.9, 0.85, 0.8, 0.75 };
++        s.* = &.{ 0.6, 0.4, 0.2 };
++    }
++    const ones: [8]u32 = @splat(1);
++    const head: HeadCost = .{ .pass_ms = 8.0, .first_ms = 4.6 };
++    // eight streams whose drafts land some of the time: priced free every stream drafts, priced the plain round wins
++    const free = try allocateDrafts(gpa, &ones, &some_land, &costs, 10.0, 32, .{});
++    defer gpa.free(free);
++    for (free) |c| try std.testing.expect(c >= 1);
++    const none = try allocateDrafts(gpa, &ones, &some_land, &costs, 10.0, 32, head);
++    defer gpa.free(none);
++    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0, 0, 0, 0, 0, 0 }, none);
++    // likely drafts pay for the pass
++    const some = try allocateDrafts(gpa, &ones, &likely, &costs, 10.0, 32, head);
++    defer gpa.free(some);
++    for (some) |c| try std.testing.expect(c >= 1);
++}
++
+ test "allocate takes the widest round when no cost is timed" {
+     const gpa = std.testing.allocator;
+     const empty: Table = .{};
+diff --git a/zig/src/core/lanes/backend.zig b/zig/src/core/lanes/backend.zig
+index 48e2c8ffa23ead69a9f04dc0792771fc6d038120..da0af20b964ecda9122cae3d302bf30769e1a09c 100644
+--- a/zig/src/core/lanes/backend.zig
++++ b/zig/src/core/lanes/backend.zig
+@@ -18,6 +18,7 @@ pub const Window = struct {
+     positions: []const u64, // the absolute position each row's draw is keyed at
+     early: bool = false, // also draft each row's first head draft behind the verify (speculate_early)
+     masks: []const u32 = &.{}, // structured output: each row's allowed-token bits (rows x words, lanes/grammar.zig); empty: none
++    late_masks: bool = false, // structured output: a grammar stream's held chain sent unread; the backend masks its rows (Backend.late_masks)
+ 
+     pub fn rows(w: Window) usize {
+         return 1 + @as(usize, w.held) + w.tokens.len;
+@@ -82,6 +83,12 @@ pub const Backend = struct {
+     penalties: bool = false,
+     /// Prompt fill gives the same tokens at any chunk cut, so --decode-share may cap its chunk rows; wrappers copy it.
+     chunk_invariant: bool = false,
++    /// Structured output with held drafts made inside the verify's own step: a grammar stream's window of a held chain
++    /// goes out without reading its drafts back first (Window.late_masks, no masks), and the backend draws its rows
++    /// under `Constraint.late` over the pending token and the drafts the step made, once they are on the host. A
++    /// grammar stream then drafts in the round's shared pass like any other instead of a pass of its own before its
++    /// window; the grammar's own drafts past the chain are not added. Wrappers leave it off.
++    late_masks: bool = false,
+     ptr: *anyopaque,
+     vtable: *const VTable,
+ 
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index 3d4470c510f263c030dd36b9b0d4a0dc9f9cc22e..ef7505e8ef6a0a47016ac54de617df67ad9bd3f4 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -4,6 +4,8 @@ const Allocator = std.mem.Allocator;
+ const Table = @import("table.zig").Table;
+ const alloc = @import("allocate.zig");
+ const Constants = @import("depth.zig").Constants;
++const DraftPass = @import("depth.zig").DraftPass;
++pub const ContextCost = @import("depth.zig").ContextCost;
+ 
+ pub const Cost = alloc.Cost;
+ 
+@@ -33,6 +35,9 @@ pub const Model = struct {
+     drafts: u32 = 1, // head drafts a round at most
+     window_costs: []const Cost = &.{}, // forward ms by exact window width (timed at load)
+     window_costs_lone: bool = false, // window_costs price a lone stream only; shared forwards use shared_costs
++    context_costs: []const ContextCost = &.{}, // a lone round's prices by the stream's context (depth.zig ContextCost)
++    depth_from: u64 = 0, // context_costs: shared rounds price a stream's depth past this context (depth.zig Rule.depth_from)
++    depth_ab: bool = false, // context_costs: A/B tooling, new streams priced by context, by the table, plain in turn (Rule.ab_modes)
+     shared_drafts: u32 = 0, // allocate_shared_drafts: a shared round's most head drafts a stream (0: drafts)
+     mtp_step_ms: f64 = 0.0, // one chained head step (timed at load)
+     shared_step_ms: ?f64 = null, // a separate shared head step; null keeps mtp_step_ms
+@@ -46,6 +51,7 @@ pub const Model = struct {
+     granted_depth: bool = false, // with draft_probabilities: every stream drafts its last grant plus a slack
+     draft_slack: u32 = 0, // drafts past a stream's last grant, short or not (0: the Constants' own)
+     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
++    draft_pass: ?DraftPass = null, // a shared round's drafter pass, priced: its streams draft only where it pays (depth.zig)
+     copy_first: bool = false, // a copy ahead takes the round: the head holds no drafts for it (a drafter's own pass)
+     hold_costs: []const @import("hold_price.zig").HoldCost = &.{}, // a drafter's own hold pass, timed at load
+     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
+@@ -84,6 +90,7 @@ pub const Config = struct {
+     fill_match: u32 = 8, // context tokens a suffix-match branch must match (shorter ones are coincidental phrases)
+     fill_floor: f64 = 0.35, // the share of grafted rows a stream must keep to go on reading its chain back every round
+     draft_streams: bool,
++    draft_pass: ?DraftPass = null, // Model.draft_pass
+     head_trees: bool,
+     /// a prompt in pieces leaves its last token as the pending row of its first shared round's window
+     join_tail: bool = false,
+@@ -102,6 +109,9 @@ pub const Config = struct {
+     shared_costs: Table,
+     lane_costs: Table, // window ms by rows to 64 (lanes/plan_lanes.zig)
+     mtp_step_ms: f64,
++    context_costs: []const ContextCost = &.{}, // Model.context_costs
++    depth_from: u64 = 0, // Model.depth_from
++    depth_ab: bool = false, // Model.depth_ab
+     draft_step_ms: f64 = 0, // Model.draft_step_ms
+     shared_drafts: u32 = 0, // Model.shared_drafts
+     lone_cost_tile: u32 = 0, // Model.lone_cost_tile
+@@ -168,6 +178,7 @@ pub const Config = struct {
+             .node_probabilities = m.draft_probabilities or m.draft_confidence != null,
+             .granted_depth = m.granted_depth and m.draft_probabilities,
+             .draft_streams = m.draft_streams,
++            .draft_pass = m.draft_pass,
+             .head_trees = m.head_trees,
+             .join_tail = m.join_tail,
+             .piece_runs = m.piece_runs,
+@@ -178,6 +189,9 @@ pub const Config = struct {
+             .shared_costs = try alloc.extendCosts(gpa, timed.items, batch_rows),
+             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
+             .mtp_step_ms = m.mtp_step_ms,
++            .context_costs = m.context_costs,
++            .depth_from = m.depth_from,
++            .depth_ab = m.depth_ab and m.context_costs.len > 0,
+             .k = .{
+                 .shared_step_ms = m.shared_step_ms,
+                 .depth_rate = if (m.depth_rate > 0) m.depth_rate else (Constants{}).depth_rate,
+diff --git a/zig/src/core/lanes/depth_shared_test.zig b/zig/src/core/lanes/depth_shared_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..535464face95481267380b700e26fc5492d6af3a
+--- /dev/null
++++ b/zig/src/core/lanes/depth_shared_test.zig
+@@ -0,0 +1,257 @@
++//! Context costs in shared rounds: a stream deep in its context pays for its rows and its draft there, so it drafts
++//! less or not at all beside shallow streams, which draft as they did without context costs; and the A/B modes.
++const std = @import("std");
++const alloc = @import("allocate.zig");
++const depth = @import("depth.zig");
++const Table = @import("table.zig").Table;
++const a = std.testing.allocator;
++
++const No = struct {
++    fn copy(_: *anyopaque, _: *const depth.Who) bool {
++        return false;
++    }
++};
++var unused: u8 = 0;
++const probe: depth.Probe = .{ .ptr = &unused, .copy = No.copy };
++
++// a window's ms by rows and the draft at a shallow, a flat and a deep context (the Sparks' shape, four widths)
++const nodes = [_]depth.ContextCost{
++    .{ .context = 600, .window_ms = &.{ 34.1, 42.4, 46.9, 51.7 }, .draft_ms = 8.4 },
++    .{ .context = 32_768, .window_ms = &.{ 35.1, 42.2, 47.7, 52.6 }, .draft_ms = 9.4 },
++    .{ .context = 524_000, .window_ms = &.{ 63.2, 72.0, 82.7, 99.9 }, .draft_ms = 39.7 },
++};
++const pass: depth.DraftPass = .{ .base_ms = 3.8, .stream_ms = 4.6, .drafted_ms = 4.2, .fair_above = 4 };
++
++fn rule(shared: *const Table, empty: *const Table, by_context: bool, prior: []const f64) depth.Rule {
++    return .{ .gpa = a, .prior = prior, .most_drafts = 3, .family_costs = empty, .shared_costs = shared, .mtp_step_ms = 0, .plain_guard = false, .node_probabilities = false, .batch_rows = 32, .batched_heads = true, .draft_pass = pass, .context_costs = if (by_context) &nodes else &.{}, .depth_from = 32_768 };
++}
++
++test "context costs: depthMs is the price past depth_from, none at or below it" {
++    var shared = try alloc.extendCosts(a, &.{ .{ .width = 1, .ms = 34.0 }, .{ .width = 8, .ms = 77.0 }, .{ .width = 32, .ms = 161.0 } }, 32);
++    defer shared.deinit(a);
++    const empty: Table = .{};
++    var r = rule(&shared, &empty, true, &.{0.84});
++    defer r.deinit();
++    try std.testing.expectEqual(@as(f64, 0), r.depthMs(0, 600));
++    try std.testing.expectEqual(@as(f64, 0), r.depthMs(2, 32_768));
++    try std.testing.expectApproxEqAbs(@as(f64, 63.2 - 35.1), r.depthMs(0, 524_000), 1e-9);
++    try std.testing.expectApproxEqAbs(@as(f64, 72.0 + 39.7 - 42.2 - 9.4), r.depthMs(1, 524_000), 1e-9);
++    try std.testing.expectApproxEqAbs(@as(f64, (72.0 + 39.7 - 42.2 - 9.4) / 2.0), r.depthMs(1, (32_768 + 524_000) / 2), 1e-6);
++    var none = rule(&shared, &empty, false, &.{0.84});
++    defer none.deinit();
++    try std.testing.expectEqual(@as(f64, 0), none.depthMs(1, 524_000));
++}
++
++test "context costs in shared rounds: shallow streams draft as without them; a deep one beside them goes plain" {
++    var shared = try alloc.extendCosts(a, &.{ .{ .width = 1, .ms = 34.0 }, .{ .width = 8, .ms = 77.0 }, .{ .width = 32, .ms = 161.0 } }, 32);
++    defer shared.deinit(a);
++    const empty: Table = .{};
++    for ([_][]const f64{ &.{ 0.84, 0.81, 0.81 }, &.{ 0.6, 0.4, 0.3 } }) |prior| {
++        // every stream within depth_from: the same budgets as a rule without context costs, round after round
++        var plain_rule = rule(&shared, &empty, false, prior);
++        defer plain_rule.deinit();
++        var ctx_rule = rule(&shared, &empty, true, prior);
++        defer ctx_rule.deinit();
++        var s1: [4]?depth.State = @splat(null);
++        defer for (&s1) |*s| if (s.*) |*x| x.deinit(a);
++        var s2: [4]?depth.State = @splat(null);
++        defer for (&s2) |*s| if (s.*) |*x| x.deinit(a);
++        var w1: [4]depth.Who = undefined;
++        var w2: [4]depth.Who = undefined;
++        for (&w1, &w2, &s1, &s2, 0..) |*x, *y, *p, *q, i| {
++            const ctx: u64 = 600 + 10_000 * i; // up to 30,600: flat
++            x.* = .{ .state = p, .draft_room = 100, .finished = false, .forced = false, .context = ctx };
++            y.* = .{ .state = q, .draft_room = 100, .finished = false, .forced = false, .context = ctx };
++        }
++        var o1: [4]i64 = undefined;
++        var o2: [4]i64 = undefined;
++        for (0..12) |round| {
++            try plain_rule.budgets(&w1, probe, false, &o1);
++            try ctx_rule.budgets(&w2, probe, false, &o2);
++            try std.testing.expectEqualSlices(i64, &o1, &o2);
++            const rows: u64 = 4 + @as(u64, @intCast(o1[0] + o1[1] + o1[2] + o1[3]));
++            const ms = shared.get(@intCast(rows)).? + 6.0 + @as(f64, @floatFromInt(round % 3));
++            try plain_rule.observeOverhead(4, rows, ms, false, plain_rule.headMs(&o1));
++            try ctx_rule.observeOverheadAt(4, rows, ms, false, ctx_rule.headMs(&o2), 0);
++        }
++    }
++    // one of the four at 524,000: likely drafts, the shallow streams draft, the deep one does not (its first draft
++    // costs ~32 ms more than at the shallow price); without context costs it drafts as the others do
++    {
++        const prior = &[_]f64{ 0.84, 0.81, 0.81 };
++        var plain_rule = rule(&shared, &empty, false, prior);
++        defer plain_rule.deinit();
++        var ctx_rule = rule(&shared, &empty, true, prior);
++        defer ctx_rule.deinit();
++        var s1: [4]?depth.State = @splat(null);
++        defer for (&s1) |*s| if (s.*) |*x| x.deinit(a);
++        var s2: [4]?depth.State = @splat(null);
++        defer for (&s2) |*s| if (s.*) |*x| x.deinit(a);
++        var w1: [4]depth.Who = undefined;
++        var w2: [4]depth.Who = undefined;
++        for (&w1, &w2, &s1, &s2, 0..) |*x, *y, *p, *q, i| {
++            const ctx: u64 = if (i == 2) 524_000 else 3_000;
++            x.* = .{ .state = p, .draft_room = 100, .finished = false, .forced = false, .context = ctx };
++            y.* = .{ .state = q, .draft_room = 100, .finished = false, .forced = false, .context = ctx };
++        }
++        var o1: [4]i64 = undefined;
++        var o2: [4]i64 = undefined;
++        try plain_rule.budgets(&w1, probe, false, &o1);
++        try ctx_rule.budgets(&w2, probe, false, &o2);
++        for (o1) |d| try std.testing.expect(d >= 1);
++        try std.testing.expectEqual(@as(i64, 0), o2[2]);
++        for (o2, 0..) |d, i| if (i != 2) try std.testing.expect(d >= 1);
++        // a deep stream whose drafts nearly always land, beside one whose drafts seldom do: it pays for its depth
++        // and drafts (the round's tokens a ms past plain's), the shallow one does not; beside a shallow stream whose
++        // drafts land as often, the shallow one's drafts are the cheaper tokens and the deep one goes plain
++        var sure = rule(&shared, &empty, true, &.{ 0.99, 0.99, 0.99 });
++        defer sure.deinit();
++        var s3: [2]?depth.State = @splat(null);
++        defer for (&s3) |*s| if (s.*) |*x| x.deinit(a);
++        var w3 = [_]depth.Who{
++            .{ .state = &s3[0], .draft_room = 100, .finished = false, .forced = false, .context = 524_000 },
++            .{ .state = &s3[1], .draft_room = 100, .finished = false, .forced = false, .context = 3_000 },
++        };
++        var o3: [2]i64 = undefined;
++        try sure.budgets(&w3, probe, false, &o3);
++        try std.testing.expectEqualSlices(i64, &.{ 0, 3 }, &o3);
++        @memcpy(s3[1].?.p, &[_]f64{ 0.2, 0.1, 0.1 });
++        try sure.budgets(&w3, probe, false, &o3);
++        try std.testing.expectEqual(@as(i64, 0), o3[0]); // a deep chain starts at one draft (ramp): one does not pay
++        s3[0].?.reach = 4; // its chains have landed three deep
++        try sure.budgets(&w3, probe, false, &o3);
++        try std.testing.expect(o3[0] >= 2);
++        try std.testing.expectEqual(@as(i64, 0), o3[1]);
++    }
++}
++
++test "context costs in shared rounds: the streams' depth is no part of the overhead a round teaches" {
++    var shared = try alloc.extendCosts(a, &.{ .{ .width = 1, .ms = 34.0 }, .{ .width = 8, .ms = 77.0 }, .{ .width = 32, .ms = 161.0 } }, 32);
++    defer shared.deinit(a);
++    const empty: Table = .{};
++    var r = rule(&shared, &empty, true, &.{0.84});
++    defer r.deinit();
++    const deep = r.depthMs(0, 524_000);
++    try r.observeOverheadAt(4, 4, shared.get(4).? + 10.0 + deep, false, 0, deep); // a plain round, one stream deep
++    try std.testing.expectApproxEqAbs(@as(f64, 10.0), r.fixedMs(4, false), 1e-9);
++    try std.testing.expectApproxEqAbs(@as(f64, 10.0), r.plain_overhead.items[0].ms, 1e-9);
++}
++
++test "context costs: A/B modes take turns (by context, by the table, plain) and price as their mode says" {
++    var fc: Table = .{};
++    defer fc.deinit(a);
++    for (nodes[0].window_ms, 0..) |ms, i| try fc.put(a, @intCast(i + 1), ms + if (i > 0) nodes[0].draft_ms else 0);
++    const shared: Table = .{};
++    // drafts that land seldom, at 524,000: by context plain (then a probe), by the table one draft, plain none
++    var r: depth.Rule = .{ .gpa = a, .prior = &.{ 0.3, 0.1, 0.05 }, .most_drafts = 3, .family_costs = &fc, .shared_costs = &shared, .mtp_step_ms = 0, .plain_guard = false, .node_probabilities = false, .batch_rows = 8, .context_costs = &nodes, .ab_modes = true };
++    defer r.deinit();
++    var states: [4]?depth.State = @splat(null);
++    defer for (&states) |*s| if (s.*) |*x| x.deinit(a);
++    var whos: [4]depth.Who = undefined;
++    for (&whos, &states) |*w, *s| w.* = .{ .state = s, .draft_room = 100, .finished = false, .forced = false, .context = 524_000 };
++    try std.testing.expectEqual(@as(i64, 0), try r.depth(whos[0]));
++    try std.testing.expectEqual(@as(i64, 1), try r.depth(whos[1]));
++    try std.testing.expectEqual(@as(i64, 0), try r.depth(whos[2]));
++    try std.testing.expectEqual(@as(i64, 0), try r.depth(whos[3])); // the fourth: by context again
++    try std.testing.expectEqual(depth.Mode.rule, states[0].?.mode);
++    try std.testing.expectEqual(depth.Mode.table, states[1].?.mode);
++    try std.testing.expectEqual(depth.Mode.plain, states[2].?.mode);
++    try std.testing.expectEqual(depth.Mode.rule, states[3].?.mode);
++    // the table stream's times are its own (raw), the others' past their prices
++    try r.observeCost(1, 70.0, false, whos[1]);
++    try std.testing.expectApproxEqAbs(@as(f64, 70.0), r.ab_table_ms.get(1).?, 1e-12);
++    try std.testing.expectEqual(@as(?f64, null), r.context_ms.get(1));
++    try r.observeCost(0, 64.2, false, whos[0]);
++    try std.testing.expectApproxEqAbs(@as(f64, 1.0), r.context_ms.get(0).?, 1e-9);
++    // plain stays plain, likely drafts or not; a table stream prices as if shallow (no depth in shared rounds)
++    @memcpy(states[2].?.p, &[_]f64{ 0.99, 0.99, 0.99 });
++    for (0..40) |_| try std.testing.expectEqual(@as(i64, 0), try r.depth(whos[2]));
++    try std.testing.expectEqual(@as(f64, 0), try r.streamDepthMs(whos[1], 1));
++    try std.testing.expect(try r.streamDepthMs(whos[2], 0) > 0);
++}
++
++test "allocate with depth: a costly stream's nodes come after cheaper ones of near chance, and none without depth as before" {
++    var costs = try alloc.extendCosts(a, &.{ .{ .width = 1, .ms = 34.0 }, .{ .width = 8, .ms = 77.0 }, .{ .width = 32, .ms = 161.0 } }, 32);
++    defer costs.deinit(a);
++    const probs = [_][]const f64{ &.{ 0.9, 0.8, 0.7 }, &.{ 0.85, 0.7, 0.6 } };
++    const ones = [_]u32{ 1, 1 };
++    const flat = [_][]const f64{ &.{ 0, 0, 0, 0 }, &.{ 0, 0, 0, 0 } };
++    const before = try alloc.allocateDrafts(a, &ones, &probs, &costs, 8.0, 32, .{});
++    defer a.free(before);
++    const zero = try alloc.allocateDrafts(a, &ones, &probs, &costs, 8.0, 32, .{ .depth = &flat });
++    defer a.free(zero);
++    try std.testing.expectEqualSlices(u32, before, zero);
++    // the first stream deep: its first draft 30 ms dearer, so it drafts none; the second as before or more
++    const deep = [_][]const f64{ &.{ 28, 58, 63, 75 }, &.{ 0, 0, 0, 0 } };
++    const priced = try alloc.allocateDrafts(a, &ones, &probs, &costs, 8.0, 32, .{ .depth = &deep });
++    defer a.free(priced);
++    try std.testing.expectEqual(@as(u32, 0), priced[0]);
++    try std.testing.expect(priced[1] >= before[1]);
++}
++
++test "context costs: a lone stream at or below depth_from drafts as without them; past it plain competes" {
++    var fc: Table = .{};
++    defer fc.deinit(a);
++    for (nodes[0].window_ms, 0..) |ms, i| try fc.put(a, @intCast(i + 1), ms + if (i > 0) nodes[0].draft_ms else 0);
++    const shared: Table = .{};
++    // drafts that land seldom: without context costs one draft at least, whatever the context
++    var r: depth.Rule = .{ .gpa = a, .prior = &.{ 0.3, 0.1, 0.05 }, .most_drafts = 3, .family_costs = &fc, .shared_costs = &shared, .mtp_step_ms = 0, .plain_guard = false, .node_probabilities = false, .batch_rows = 8, .context_costs = &nodes, .depth_from = 32_768 };
++    defer r.deinit();
++    var states: [3]?depth.State = @splat(null);
++    defer for (&states) |*s| if (s.*) |*x| x.deinit(a);
++    const ctx = [_]u64{ 3_000, 32_768, 524_000 };
++    for (&states, ctx) |*s, c| {
++        const w: depth.Who = .{ .state = s, .draft_room = 100, .finished = false, .forced = false, .context = c };
++        try std.testing.expectEqual(@as(i64, @intFromBool(c <= 32_768)), try r.depth(w));
++    }
++    // a shallow stream's round times are its own (raw, the table rule's), a deep one's past its price
++    const shallow: depth.Who = .{ .state = &states[0], .draft_room = 100, .finished = false, .forced = false, .context = 3_000 };
++    const deep: depth.Who = .{ .state = &states[2], .draft_room = 100, .finished = false, .forced = false, .context = 524_000 };
++    try r.observeCost(1, 52.0, false, shallow);
++    try std.testing.expectApproxEqAbs(@as(f64, 52.0), r.greedy_ms.get(1).?, 1e-12);
++    try r.observeCost(1, 113.7, false, deep);
++    try std.testing.expectApproxEqAbs(@as(f64, 2.0), r.context_ms.get(1).?, 1e-9);
++}
++
++test "context costs: a deep stream's chain starts at one draft and reaches one further each time a chain lands" {
++    var fc: Table = .{};
++    defer fc.deinit(a);
++    for (nodes[0].window_ms, 0..) |ms, i| try fc.put(a, @intCast(i + 1), ms + if (i > 0) nodes[0].draft_ms else 0);
++    const shared: Table = .{};
++    var r: depth.Rule = .{ .gpa = a, .prior = &.{ 0.99, 0.99, 0.99 }, .most_drafts = 3, .family_costs = &fc, .shared_costs = &shared, .mtp_step_ms = 0, .plain_guard = false, .node_probabilities = false, .batch_rows = 8, .context_costs = &nodes, .depth_from = 32_768 };
++    defer r.deinit();
++    var st: ?depth.State = null;
++    defer if (st) |*s| s.deinit(a);
++    const w: depth.Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false, .context = 524_000 };
++    try std.testing.expectEqual(@as(i64, 0), try r.depth(w)); // plain until a plain round is timed past depth_from
++    try r.observeCost(0, 63.2, false, w);
++    try std.testing.expectEqual(@as(i64, 1), try r.depth(w));
++    try r.observeDepth(w, 1, 1);
++    try std.testing.expectEqual(@as(i64, 2), try r.depth(w));
++    try r.observeDepth(w, 2, 2);
++    try std.testing.expectEqual(@as(i64, 3), try r.depth(w));
++    try r.observeDepth(w, 3, 0); // a chain that missed at once: the reach stays, the estimates decide below it
++    try std.testing.expectEqual(@as(i64, 3), try r.depth(w));
++    for (0..12) |_| try r.observeDepth(w, 1, 0); // its drafts stop landing: plain
++    try std.testing.expectEqual(@as(i64, 0), try r.depth(w));
++    // a shallow stream with the same estimates takes its whole chain at once
++    var s2: ?depth.State = null;
++    defer if (s2) |*s| s.deinit(a);
++    try std.testing.expectEqual(@as(i64, 3), try r.depth(.{ .state = &s2, .draft_room = 100, .finished = false, .forced = false, .context = 3_000 }));
++}
++
++test "context costs: rounds far cheaper than their prices (another machine) still choose by what they took" {
++    var fc: Table = .{};
++    defer fc.deinit(a);
++    for (nodes[0].window_ms, 0..) |ms, i| try fc.put(a, @intCast(i + 1), ms + if (i > 0) nodes[0].draft_ms else 0);
++    const shared: Table = .{};
++    var r: depth.Rule = .{ .gpa = a, .prior = &.{ 0.99, 0.99, 0.99 }, .most_drafts = 3, .family_costs = &fc, .shared_costs = &shared, .mtp_step_ms = 0, .plain_guard = false, .node_probabilities = false, .batch_rows = 8, .context_costs = &nodes, .depth_from = 32_768 };
++    defer r.deinit();
++    var st: ?depth.State = null;
++    defer if (st) |*s| s.deinit(a);
++    const w: depth.Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false, .context = 524_000 };
++    try r.observeCost(1, 20.0, false, w); // a drafted round took 20 ms (priced 111.7): no plain round timed yet
++    try std.testing.expectEqual(@as(i64, 0), try r.depth(w));
++    try r.observeCost(0, 4.6, false, w); // plain took 4.6 (priced 63.2): plain's 1 token in 4.6 ms wins
++    for (0..7) |_| try std.testing.expectEqual(@as(i64, 0), try r.depth(w));
++}
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 018ae4a72ebcde583ef11ce9d3f5625a4a96bb5e..163462796ae9df2fefb3d6c05ef85ecace1e1c01 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -70,12 +70,16 @@ pub const Engine = struct {
+                 .shared_costs = &cfg.shared_costs,
+                 .mtp_step_ms = cfg.mtp_step_ms,
+                 .draft_step_ms = cfg.draft_step_ms,
++                .context_costs = cfg.context_costs,
++                .depth_from = cfg.depth_from,
++                .ab_modes = cfg.depth_ab,
+                 .plain_guard = cfg.plain_guard,
+                 .node_probabilities = cfg.node_probabilities,
+                 .granted_depth = cfg.granted_depth,
+                 .confidence_floor = cfg.draft_confidence,
+                 .batch_rows = cfg.batch_rows,
+                 .batched_heads = cfg.draft_streams,
++                .draft_pass = cfg.draft_pass,
+             },
+         };
+     }
+@@ -227,7 +231,7 @@ pub const Engine = struct {
+                 if (early) if (e.backend.vtable.unspeculate) |undo| try undo(e.backend.ptr, s);
+                 try e.draftLate(s, plan.position, o.follow, o.path, null);
+             }
+-            if (e.cfg.timed and (plan.kind == .head or (plan.kind == .none and e.cfg.plain_guard))) {
++            if (e.cfg.timed and (plan.kind == .head or (plan.kind == .none and (e.cfg.plain_guard or e.cfg.context_costs.len > 0)))) {
+                 const ms = e.clock.elapsedMs(.cost);
+                 const first = s.rounds == 1; // a stream's first round carries the prefill-to-decode switch
+                 try trail.event(e, &.{ f("ev", str("cost")), f("stream", str(s.id)), f("drafts", int(rows - 1)), f("init", .{ .bool = first }), f("ms", ev.bits(ms)) });
+@@ -248,7 +252,7 @@ pub const Engine = struct {
+         if (e.cfg.timed and plan.kind == .head) {
+             const ms = e.clock.elapsedMs(.overhead);
+             try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(1)), f("rows", int(rows)), f("ms", ev.bits(ms)) });
+-            try e.rule.observeOverhead(1, rows, ms, s.sampling != null, 0.0);
++            try e.rule.observeOverheadAt(1, rows, ms, s.sampling != null, 0.0, try e.rule.streamDepthMs(win.who(s), @intCast(rows - 1)));
+         }
+         if (e.backend.round_observer != null) e.backend.observed(&.{o.path});
+         return .{ .rows = @intCast(rows), .keep = @intCast(o.path.len), .got = o.got };
+@@ -319,7 +323,12 @@ pub const Engine = struct {
+             for (budgets) |d| steps = if (e.cfg.draft_streams and depth.pricedBatched()) @max(steps, d - 1) else steps + @max(0, d - 1);
+             const ms = e.clock.elapsedMs(.overhead) - e.cfg.draft_step_ms * @as(f64, @floatFromInt(steps));
+             try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(plans.len)), f("rows", int(total)), f("ms", ev.bits(ms)) });
+-            try e.rule.observeOverhead(@intCast(plans.len), total, ms, sampled, e.rule.headMs(budgets));
++            // what the streams' depth took of it (context_costs) is no overhead either
++            var depth_ms: f64 = 0;
++            if (e.cfg.context_costs.len > 0) for (plans, windows) |p, w| {
++                depth_ms += try e.rule.streamDepthMs(win.who(p.stream), @intCast(w.rows() - 1));
++            };
++            try e.rule.observeOverheadAt(@intCast(plans.len), total, ms, sampled, e.rule.headMs(budgets), depth_ms);
+         }
+         if (e.backend.round_observer != null) e.backend.observed(paths);
+     }
+@@ -395,6 +404,14 @@ pub const Engine = struct {
+                 }
+             }
+             if (s.recall) |r| if (p.kind != .copy) r.noteHead(path.len); // its own rounds: the bar a copy must beat
++            {
++                // the reply's draft counts by depth (the done line): rows - 1 verified, path.len - 1 accepted
++                const last = s.depth_rounds.len - 1;
++                const d = @min(rows - 1, last);
++                s.depth_rounds[d] += 1;
++                s.depth_kept[d] += @intCast(path.len - 1);
++                s.kept_rounds[@min(path.len - 1, last)] += 1;
++            }
+         }
+         if (e.trim) |t| if (p.kind != .forced) {
+             const chain = parents.len == 0 or accept.isChain(parents);
+diff --git a/zig/src/core/lanes/engine_test.zig b/zig/src/core/lanes/engine_test.zig
+index 6c731c519eb277e51ef37329352cf1b86daa1fc6..b6628518aedcad703676041985c496dd6e35ef4b 100644
+--- a/zig/src/core/lanes/engine_test.zig
++++ b/zig/src/core/lanes/engine_test.zig
+@@ -98,12 +98,17 @@ pub fn modelWith(mtp: bool) !Config {
+     return Config.init(gpa, .{ .exact_width = 16, .gpu_tokens = true, .mtp = mtp, .speculate = true, .speculate_early = false, .drafts = 4, .window_costs = &costs, .mtp_step_ms = 0.5, .hidden_rows = true, .batch_rows = 32, .max_streams = 8, .draft_streams = true }, 16, 15);
+ }
+ 
++/// `run`'s target masks a grammar stream's held chain after its verify (Backend.late_masks), and what it saw.
++var run_late = false;
++var ran_late: struct { windows: usize = 0, free_rows: usize = 0 } = .{};
++
+ /// Every case's emitted tokens, the cases admitted together and stepped until done.
+ fn run(cases: []const Case) ![][]u32 {
+     var cfg = try model();
+     defer cfg.deinit(gpa);
+-    var target: fake.Fake = .{ .gpa = gpa };
++    var target: fake.Fake = .{ .gpa = gpa, .late_masks = run_late };
+     defer target.deinit();
++    defer ran_late = .{ .windows = target.late_windows, .free_rows = target.late_free_rows };
+     var clock: fake.FixedClock = .{};
+     var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+     defer engine.deinit();
+@@ -445,6 +450,47 @@ test "structured output: where the grammar spells its own text, its drafts fill
+     }
+ }
+ 
++test "structured output, late masks: a grammar stream's held chain goes out unread and every case commits what the walked windows commit" {
++    const sampled: Sampling = .{ .seed = 9, .temperature = 1.0, .top_k = 0, .top_p = 0.9 };
++    const groups = [_][]const Case{
++        &.{.{ .prompt = &p1, .classes = .{} }},
++        &.{.{ .prompt = &p1, .sampling = sampled, .classes = .{} }},
++        &.{.{ .prompt = &p1, .max_new = 80, .classes = .{ .length = 60, .free = true } }},
++        &.{.{ .prompt = &p1, .sampling = sampled, .max_new = 80, .classes = .{ .length = 60, .free = true } }},
++        &.{.{ .prompt = &p2, .think_budget = 9, .classes = .{ .after = 91 } }},
++        &.{.{ .prompt = &p1, .eos = &.{}, .max_new = 200, .classes = .{ .length = 5 } }},
++        &.{.{ .prompt = &p1, .max_new = 80, .classes = .{ .length = 50, .spell = true } }},
++        // shared rounds: grammar streams beside plain greedy and sampled ones
++        &.{ .{ .prompt = &p1, .classes = .{ .length = 20 } }, .{ .prompt = &p2, .sampling = sampled, .max_new = 30 }, .{ .prompt = &p2, .sampling = sampled, .classes = .{ .length = 7 } } },
++        &.{ .{ .prompt = &p1, .max_new = 60, .classes = .{ .length = 40, .free = true } }, .{ .prompt = &p2, .max_new = 60 }, .{ .prompt = &p1, .max_new = 60 }, .{ .prompt = &p2, .sampling = sampled, .max_new = 60, .classes = .{ .length = 30, .free = true } } },
++    };
++    defer run_late = false;
++    var late_windows: usize = 0;
++    var free_rows: usize = 0;
++    for (groups) |cases| {
++        run_late = false;
++        const walked = try run(cases);
++        defer free(walked);
++        run_late = true;
++        const late = try run(cases);
++        defer free(late);
++        late_windows += ran_late.windows;
++        free_rows += ran_late.free_rows;
++        for (cases, walked, late) |c, w, l| {
++            try std.testing.expectEqualSlices(u32, w, l);
++            if (c.classes) |g| try expectInGrammar(l, g);
++            // and drafted == one-token rounds under the late masks
++            var plain_case = c;
++            plain_case.drafts = false;
++            const plain = try run(&.{plain_case});
++            defer free(plain);
++            try std.testing.expectEqualSlices(u32, plain[0], l);
++        }
++    }
++    // late windows ran, and some held a draft the grammar refused (rows drawn unconstrained, never kept)
++    try std.testing.expect(late_windows > 20 and free_rows > 0);
++}
++
+ test "a family that keeps copies to shared rounds proposes none for a lone stream" {
+     for ([_]bool{ true, false }) |lone_copies| {
+         var cfg = try Config.init(gpa, .{ .exact_width = 16, .mtp = true, .speculate = true, .drafts = 4, .lone_copies = lone_copies }, 16, 15);
+diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
+index 4f68632ce7032b3db5883b9b309363de0b425881..90a310bc65c19c1ae2536d85e5134e68166b8624 100644
+--- a/zig/src/core/lanes/fake.zig
++++ b/zig/src/core/lanes/fake.zig
+@@ -92,6 +92,9 @@ pub const Fake = struct {
+     image_rows: usize = 0, // image rows fed (`image_words`): the rows a tower had to make
+     gpu_charge: ?f64 = null, // each verify and step charges its streams this many GPU seconds, as a timed backend does
+     head_accepts: ?usize = null, // head drafts a round right before one wrong (null: one in five wrong)
++    late_masks: bool = false, // Backend.late_masks: a late window's rows masked here, after its held drafts are known
++    late_windows: usize = 0, // late windows verified, and their rows past the grammar's (drawn unconstrained)
++    late_free_rows: usize = 0,
+ 
+     pub fn deinit(x: *Fake) void {
+         var it = x.lanes.valueIterator();
+@@ -108,7 +111,7 @@ pub const Fake = struct {
+     }
+ 
+     pub fn backend(x: *Fake) be.Backend {
+-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .alternatives = alternatives, .held = heldDrafts, .reports_fill = true }, .chunk_invariant = true };
++        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .alternatives = alternatives, .held = heldDrafts, .reports_fill = true }, .chunk_invariant = true, .late_masks = x.late_masks };
+     }
+ 
+     /// The same target taking several prompts in one pass (`prefill_many`).
+@@ -456,6 +459,19 @@ pub const Fake = struct {
+             @memcpy(o.drafts, l.rows.items[1..]);
+             const parents = if (w.parents) |ps| try x.gpa.dupe(i32, ps) else try accept.rowParents(x.gpa, l.rows.items.len, null);
+             defer x.gpa.free(parents);
++            // a late window: the grammar walks the pending token and the held drafts now (Constraint.late)
++            var late_arena: std.heap.ArenaAllocator = .init(x.gpa);
++            defer late_arena.deinit();
++            var masks = w.masks;
++            var masked_rows = l.rows.items.len;
++            if (w.late_masks) {
++                if (w.masks.len > 0 or w.tokens.len > 0 or w.parents != null) return error.LateWindowShape;
++                const gw = try w.stream.grammar.?.late(late_arena.allocator(), l.rows.items);
++                masks = gw.masks;
++                masked_rows = gw.rows.len;
++                x.late_windows += 1;
++                x.late_free_rows += l.rows.items.len - masked_rows;
++            }
+             for (0..l.rows.items.len) |r| {
+                 // each row reads the cache and its own path from the pending row
+                 l.history.shrinkRetainingCapacity(l.base);
+@@ -466,9 +482,9 @@ pub const Fake = struct {
+                 try l.history.appendSlice(x.gpa, path.items);
+                 if (w.positions[r] != l.history.items.len) return error.PositionMismatch;
+                 o.sampled[r] = x.targetNext(l.history.items, w.stream.sampling, w.positions[r]);
+-                if (w.masks.len > 0) {
+-                    const words = w.masks.len / l.rows.items.len;
+-                    o.sampled[r] = try allowed(o.sampled[r], w.masks[r * words ..][0..words]);
++                if (masks.len > 0 and r < masked_rows) {
++                    const words = masks.len / masked_rows;
++                    o.sampled[r] = try allowed(o.sampled[r], masks[r * words ..][0..words]);
+                 }
+                 if (o.rows.len > 0) o.rows[r] = rowAt(l.history.items, o.sampled[r], w.stream.logprobs.?);
+             }
+diff --git a/zig/src/core/lanes/grammar.zig b/zig/src/core/lanes/grammar.zig
+index 2d65c9c873fc75f6d62cddc4725d62531b17cfa0..41562301891a0fbf10ad027a2ee0d2ed4aa92150 100644
+--- a/zig/src/core/lanes/grammar.zig
++++ b/zig/src/core/lanes/grammar.zig
+@@ -333,6 +333,17 @@ pub const Constraint = struct {
+         return error.GrammarDeadEnd;
+     }
+ 
++    /// A late window's bits (Backend.late_masks): the chain of `tokens` (row 0 pending, then the held drafts the
++    /// verify made) walked as `window` walks host drafts before a forward, with no room for the grammar's own drafts.
++    /// `rows.len` rows from row 0 can be on an accepted path; a row past them follows a draft the grammar refuses (the
++    /// row before it draws under bits that refuse that draft, so no path reaches it) or the grammar's stop token (the
++    /// reply ends there), and is drawn unconstrained. Empty masks: no row is constrained.
++    pub fn late(c: *Constraint, a: Allocator, tokens: []const u32) !Window {
++        const parents = try a.alloc(i32, tokens.len);
++        for (parents, 0..) |*p, i| p.* = @as(i32, @intCast(i)) - 1;
++        return c.window(a, tokens, parents, false, 0); // no room: none of the grammar's own drafts (`extra`)
++    }
++
+     /// Rows of `tokens` (row 0 pending) an accepted path can use, with bits; `forced` keeps rows, unmasked past a miss.
+     pub fn window(c: *Constraint, a: Allocator, tokens: []const u32, parents: []const i32, forced: bool, room: usize) !Window {
+         const n = tokens.len;
+diff --git a/zig/src/core/lanes/grammar_parallel.zig b/zig/src/core/lanes/grammar_parallel.zig
+index 79494525a7742def2ec7b3b57f1436ae3ed09cf4..916ff81cb7f2e20392df4f29c52e16c042aab37c 100644
+--- a/zig/src/core/lanes/grammar_parallel.zig
++++ b/zig/src/core/lanes/grammar_parallel.zig
+@@ -69,7 +69,10 @@ pub fn independent(plans: []const Plan) bool {
+ pub fn constrain(e: anytype, plans: []Plan) !void {
+     var count: usize = 0;
+     var runnable: usize = 0;
++    // the backend masks a late plan's rows after its verify (Backend.late_masks): no walk here
++    for (plans) |*p| p.late_masks = window.late(e, p);
+     for (plans) |p| if (p.stream.grammar) |c| {
++        if (p.late_masks) continue;
+         count += 1;
+         const reaches = c.active or p.held > 0 or std.mem.indexOfScalar(u32, p.tokens, c.after.?) != null;
+         runnable += @intFromBool(!c.finished() and reaches);
+@@ -84,7 +87,7 @@ pub fn constrain(e: anytype, plans: []Plan) !void {
+     try pool.reserve(e.gpa, count);
+     var at: usize = 0;
+     // Held GPU drafts, row allocation and every engine/backend access run on the owner before dispatch.
+-    for (plans) |*p| if (p.stream.grammar != null) {
++    for (plans) |*p| if (p.stream.grammar != null and !p.late_masks) {
+         const j = &pool.jobs.items[at];
+         j.prepared = try window.prepare(e, p);
+         j.profile = .{ .clock = e.clock };
+@@ -98,7 +101,7 @@ pub fn constrain(e: anytype, plans: []Plan) !void {
+     try group.await(io);
+     at = 0;
+     // Matchers and job arenas stay live through the join; results and errors are consumed in stream order.
+-    for (plans) |*p| if (p.stream.grammar != null) {
++    for (plans) |*p| if (p.stream.grammar != null and !p.late_masks) {
+         const j = &pool.jobs.items[at];
+         timing.record(e, p.stream, j.profile);
+         const w = try j.result;
+diff --git a/zig/src/core/lanes/grammar_window.zig b/zig/src/core/lanes/grammar_window.zig
+index b65460b626d96bf1f3cb04a41adbe7554924f775..fcfb64874709ec7fb76345a13c3055e89e774ea0 100644
+--- a/zig/src/core/lanes/grammar_window.zig
++++ b/zig/src/core/lanes/grammar_window.zig
+@@ -59,8 +59,18 @@ pub fn apply(e: anytype, p: anytype, prepared: Prepared, w: grammar.Window) !voi
+     }
+     if (p.kind != .forced and w.rows.len == 1) p.kind = if (w.extra.len > 0) .grammar else .none;
+ }
++/// Whether the plan's rows are masked by the backend after its verify made the drafts (Backend.late_masks): a grammar
++/// stream's chain of held drafts alone, nothing forced, copied or grafted.
++pub fn late(e: anytype, p: anytype) bool {
++    if (!e.backend.late_masks or p.stream.grammar == null) return false;
++    return p.held > 0 and p.tokens.len == 0 and p.parents == null and p.lanes == null and p.branch_from == 0 and p.kind == .head;
++}
+ pub fn constrain(e: anytype, p: anytype) !void {
+     if (p.stream.grammar == null) return;
++    if (late(e, p)) {
++        p.late_masks = true;
++        return;
++    }
+     const prepared = try prepare(e, p);
+     var profile: timing.Profile = .{ .clock = e.clock };
+     defer timing.record(e, p.stream, profile);
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index baff3bd3100bbf287db9cb071c4d84da32ec0888..72621b7d881305a3e69639eb3d2214d9794e9780 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -1,5 +1,7 @@
+ //! One stream (Python LaneStream) and the round loop's state for it (Python's dicts keyed by stream id).
+ const std = @import("std");
++/// Buckets of the per-request draft counts (Stream.depth_rounds): drafts 0 .. 7, the last also deeper.
++pub const depth_buckets = 8;
+ const grammar = @import("grammar.zig");
+ const shape = @import("shape.zig");
+ const plan_lanes = @import("plan_lanes.zig");
+@@ -234,6 +236,12 @@ pub const Stream = struct {
+     grammar_time: @import("grammar_time.zig").Sum = .{},
+     grammar_round: @import("grammar_time.zig").Round = .{},
+     gpu_seconds: ?f64 = null, // a timed backend's passes this stream ran in (TF_Q27_PROFILE); null: untimed
++    depth_rounds: [depth_buckets]u32 = @splat(0), // drafted rounds by drafts verified (rows - 1; the last bucket: that or more)
++    depth_kept: [depth_buckets]u32 = @splat(0), // and the drafts they accepted
++    kept_rounds: [depth_buckets]u32 = @splat(0), // drafted rounds by drafts accepted (the last bucket: that or more)
++    stale_drafts: u32 = 0, // the backend's drafts made from another forward's taps than the stream's own last one
++    draft_gap_ns: u64 = 0, // the backend's host time from a draft's return to the stream's next verify (summed)
++    draft_gaps: u32 = 0,
+     paused: bool = false,
+     depth: ?State = null,
+     mode: ?Mode = null,
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index b3758b7c38498d8d1f82881b7c0f0291e3a4e471..2d5a43c0be4529a701e2107220ce38fb53dc6977 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -35,6 +35,7 @@ pub const Plan = struct {
+     tried: bool = false, // the planner read the head's chain back to graft branches
+     lanes: ?*const shape.Shape = null, // the held drafts' tree shape (each lane's depth and rank)
+     masks: []const u32 = &.{}, // structured output: the rows' allowed-token bits (constrain)
++    late_masks: bool = false, // structured output: the backend masks the held chain's rows itself (Backend.late_masks)
+     grammar_from: u32 = 0, // the first row the grammar drafted itself (0: none)
+     recalled: bool = false, // the copy came from Recall's record
+     graft_recalled: []const bool = &.{}, // each row from branch_from: a Recall candidate grafted it
+@@ -230,7 +231,7 @@ pub fn probe(e: *Engine) depth.Probe {
+ }
+ 
+ pub fn who(s: *Stream) depth.Who {
+-    return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .grant_short = s.grant_short, .gain = s.grant_gain, .stream = s, .sampled = s.sampling != null };
++    return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .grant_short = s.grant_short, .gain = s.grant_gain, .stream = s, .sampled = s.sampling != null, .context = s.cache_len };
+ }
+ 
+ /// Whether any of a round's streams draws keyed samples (its rows carry their host work).
+@@ -514,7 +515,7 @@ pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
+     const ds = try accept.depths(a, parents);
+     const positions = try a.alloc(u64, rows);
+     for (positions, ds) |*x, d| x.* = p.position + 1 + d;
+-    return .{ .stream = p.stream, .pending = p.stream.pending.?, .held = p.held, .tokens = p.tokens, .parents = if (p.parents != null) parents else null, .positions = positions, .early = early, .masks = p.masks };
++    return .{ .stream = p.stream, .pending = p.stream.pending.?, .held = p.held, .tokens = p.tokens, .parents = if (p.parents != null) parents else null, .positions = positions, .early = early, .masks = p.masks, .late_masks = p.late_masks };
+ }
+ 
+ pub fn rowParents(e: *Engine, w: be.Window) ![]const i32 {
+diff --git a/zig/src/families/inkling2/cuda_batch_check.zig b/zig/src/families/inkling2/cuda_batch_check.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..d7bc83834531522e8b48d9e7ee556c36a2e32567
+--- /dev/null
++++ b/zig/src/families/inkling2/cuda_batch_check.zig
+@@ -0,0 +1,792 @@
++//! tf-inkling2-decode's batched-decode gate (--streams S) and the state kernels' op check (--op-check).
++//!
++//! Streams gate: S slots on prompts of different lengths and contents (so different positions), each decoded alone
++//! first (greedy, one-row steps: the slot's CUDA graph when it applies), its logits rows hashed. Then the same slots
++//! again, stepped together in batched forwards (cuda_engine.zig forwardMany, a segment a slot), fed the solo run's
++//! tokens: pass A one row a slot a step; pass B windows of 1 to 3 rows a slot (staggered, as verify windows of
++//! different widths, so the set of slots changes as they finish); pass E pass A again with every forward eager (the
++//! graphs' paired A/B: a forward of several streams runs as a captured graph from its key's second sighting, so pass
++//! A is graphs after its first step). Each pass prints its forwards by kind. With the drafter loaded, pass C: every
++//! round each slot keeps its last window's accepted rows and drafts (Leader.draft: the keep, then the block from the
++//! taps of its own segment), then all slots' verify windows run in one forward: the anchor and 1 to 7 of the solo
++//! run's tokens with one made wrong at a pseudo-random depth (or none), so every slot rolls back on its own after a
++//! shared forward (a window at most head_rows / S rows, so 4 at 8 streams). Every slot's rows must equal its solo
++//! rows bit for bit (the hashes equal), and in pass C every accepted row too.
++//!
++//! Op check: the verify window's history commit (tf_ink2_conv_commit_spec) against the three copies it replaced, and
++//! the slot rollback (tf_ink2_conv_keep) against a copy a convolution, on random bytes: every byte equal. With the
++//! drafter loaded, also its context writes as a captured forward makes them (cuda_dspark.zig absorb with a device
++//! position): the keys' rope reading the position on the device and adding it to the table's base, against the host
++//! position and address; the values' row kernel against the 2D copy it replaced; positions 0, 1023, 3071 and the
++//! table's end - 8, rows 1..8, every byte of the table equal.
++const std = @import("std");
++const cuda = @import("cuda");
++const engine = @import("cuda_engine.zig");
++const state = @import("cuda_state.zig");
++const follow = @import("cuda_follow.zig");
++const ops = @import("cuda_ops.zig");
++const dspark = @import("cuda_dspark.zig");
++
++const Leader = follow.Leader;
++
++/// The slots the gate takes (tf-inkling2-decode uses 0 .. 2).
++pub const first_slot: u32 = 3;
++/// Positions stream j's prompt is shorter than the next (so the streams sit at different positions).
++const stagger = 61;
++
++fn argmax(row: []const f32) u32 {
++    var best: usize = 0;
++    for (row, 0..) |v, i| if (v > row[best]) {
++        best = i;
++    };
++    return @intCast(best);
++}
++
++fn secs(ns: i96) f64 {
++    return @as(f64, @floatFromInt(ns)) * 1e-9;
++}
++
++/// Stream j's prompt: `seq` from token j, `T - stagger * j` tokens.
++fn promptOf(seq: []const u32, T: usize, j: usize) []const u32 {
++    return seq[j..][0 .. T - stagger * j];
++}
++
++/// The prompt on `slot` (pos0 0 starts it over) in 2048-row chunks; the last row's logits into `row`.
++fn prefill(x: Leader, slot: u32, prompt: []const u32, row: []f32) !void {
++    var at: usize = 0;
++    while (at < prompt.len) {
++        const n = @min(prompt.len - at, engine.prompt_rows);
++        const last = at + n == prompt.len;
++        try x.forward(slot, at, prompt[at..][0..n], if (last) .{ .lo = n - 1, .n = 1 } else null);
++        at += n;
++        if (last) @memcpy(row, try x.e.logits());
++    }
++}
++
++/// The streams gate (see the header): true when every stream's batched rows equal its solo rows in both passes.
++pub fn streams(gpa: std.mem.Allocator, io: std.Io, x: Leader, seq: []const u32, T: usize, steps: usize, S: usize) !bool {
++    const e = x.e;
++    const clock = std.Io.Clock.awake;
++    const U = e.vocab();
++    if (S < 2 or S > engine.max_segs or T <= stagger * S or seq.len < T + S) return error.BadStreams;
++    const N = steps; // logits rows a stream: the prompt's last, then N - 1 decode steps
++    const solo = try gpa.alloc(f32, S * N * U);
++    defer gpa.free(solo);
++    const got = try gpa.alloc(f32, S * N * U);
++    defer gpa.free(got);
++    const toks = try gpa.alloc(u32, S * N);
++    defer gpa.free(toks);
++    // solo: each stream alone, greedy
++    var solo_ns: i96 = 0;
++    for (0..S) |j| {
++        const slot = first_slot + @as(u32, @intCast(j));
++        const p = promptOf(seq, T, j);
++        const rows = solo[j * N * U ..][0 .. N * U];
++        try prefill(x, slot, p, rows[0..U]);
++        const t0 = clock.now(io).toNanoseconds();
++        for (0..N) |k| {
++            toks[j * N + k] = argmax(rows[k * U ..][0..U]);
++            if (k + 1 == N) break;
++            try x.forward(slot, p.len + k, toks[j * N + k ..][0..1], .{ .lo = 0, .n = 1 });
++            @memcpy(rows[(k + 1) * U ..][0..U], try e.logits());
++        }
++        solo_ns += clock.now(io).toNanoseconds() - t0;
++    }
++    var ok = true;
++    // passes A, B, then A again with every forward eager (pass E: the graphs' paired A/B in this process)
++    var pass_ns: [3]i96 = @splat(0);
++    var pass_fwd: [3]usize = @splat(0);
++    var pass_med: [3]f64 = @splat(0);
++    const fwd_ms = try gpa.alloc(f64, 3 * N + 8);
++    defer gpa.free(fwd_ms);
++    for (0..3) |pass| {
++        var xp = x;
++        xp.eager = pass == 2;
++        @memset(got, std.math.nan(f32));
++        for (0..S) |j| try prefill(x, first_slot + @as(u32, @intCast(j)), promptOf(seq, T, j), got[j * N * U ..][0..U]);
++        // done[j]: stream j's rows so far (row 0 from its prompt); row k is fed toks[k - 1] at position len + k - 1
++        var done: [engine.max_segs]usize = @splat(1);
++        var round: usize = 0;
++        const c0 = e.counts;
++        const t0 = clock.now(io).toNanoseconds();
++        while (true) : (round += 1) {
++            var segs: [engine.max_segs]engine.Segment = undefined;
++            var who: [engine.max_segs]usize = undefined;
++            var ids: [engine.max_segs * 3]u32 = undefined;
++            var n: usize = 0;
++            var R: usize = 0;
++            for (0..S) |j| {
++                if (done[j] >= N) continue;
++                const width = if (pass != 1) 1 else 1 + (round + j) % 3;
++                const w = @min(width, N - done[j]);
++                const plen = promptOf(seq, T, j).len;
++                segs[n] = .{ .slot = first_slot + @as(u32, @intCast(j)), .pos0 = plen + done[j] - 1, .rows = w };
++                @memcpy(ids[R..][0..w], toks[j * N + done[j] - 1 ..][0..w]);
++                who[n] = j;
++                n += 1;
++                R += w;
++            }
++            if (n == 0) break;
++            const tf = clock.now(io).toNanoseconds();
++            try xp.forwardMany(segs[0..n], ids[0..R], .{ .lo = 0, .n = R });
++            const lg = try e.logits();
++            if (pass_fwd[pass] < fwd_ms.len) fwd_ms[pass_fwd[pass]] = secs(clock.now(io).toNanoseconds() - tf) * 1e3;
++            var r: usize = 0;
++            for (segs[0..n], who[0..n]) |g, j| {
++                @memcpy(got[(j * N + done[j]) * U ..][0 .. g.rows * U], lg[r * U ..][0 .. g.rows * U]);
++                done[j] += g.rows;
++                r += g.rows;
++            }
++            pass_fwd[pass] += 1;
++        }
++        pass_ns[pass] = clock.now(io).toNanoseconds() - t0;
++        const name: u8 = "ABE"[pass];
++        {
++            const v = fwd_ms[0..@min(pass_fwd[pass], fwd_ms.len)];
++            std.mem.sort(f64, v, {}, std.sort.asc(f64));
++            pass_med[pass] = if (v.len > 0) v[v.len / 2] else 0;
++        }
++        printPassCounts(e, name, c0, pass_fwd[pass]);
++        for (0..S) |j| {
++            const a = solo[j * N * U ..][0 .. N * U];
++            const b = got[j * N * U ..][0 .. N * U];
++            var equal: usize = 0;
++            for (0..N) |k| equal += @intFromBool(std.mem.eql(u8, std.mem.sliceAsBytes(a[k * U ..][0..U]), std.mem.sliceAsBytes(b[k * U ..][0..U])));
++            const ha = std.hash.XxHash64.hash(0, std.mem.sliceAsBytes(a));
++            const hb = std.hash.XxHash64.hash(0, std.mem.sliceAsBytes(b));
++            const same = ha == hb and equal == N;
++            ok = ok and same;
++            std.debug.print("  streams pass {c}, stream {d} (slot {d}, prompt {d}, positions {d} .. {d}): solo xxh64 {x:0>16}, batched {x:0>16}, rows bit-equal {d}/{d} {s}\n", .{ name, j, first_slot + j, promptOf(seq, T, j).len, promptOf(seq, T, j).len - 1, promptOf(seq, T, j).len + N - 2, ha, hb, equal, N, if (same) "EQUAL" else "DIFFER" });
++        }
++    }
++    if (e.drafter != null) ok = try passC(io, x, seq, T, N, S, solo, toks) and ok;
++    const solo_ms = secs(solo_ns) * 1e3 / @as(f64, @floatFromInt(S * (N - 1)));
++    const a_ms = secs(pass_ns[0]) * 1e3 / @as(f64, @floatFromInt(@max(pass_fwd[0], 1)));
++    std.debug.print("{s} streams: {d} streams stepped together equal their solo runs (pass A one row a stream, pass B windows of 1-3 rows, pass E pass A eager); solo {d:.1} ms a step ({d:.1} tok/s), batched {d:.1} ms a step of {d} rows ({d:.1} tok/s aggregate, {d:.1} a stream); pass B {d} forwards in {d:.2} s, {d:.1} ms a forward (median)\n", .{
++        if (ok) "PASS" else "FAIL", S, solo_ms, 1e3 / solo_ms, a_ms, S, @as(f64, @floatFromInt(S)) * 1e3 / a_ms, 1e3 / a_ms, pass_fwd[1], secs(pass_ns[1]), pass_med[1],
++    });
++    std.debug.print("streams step of {d} rows (median, ms): pass A {d:.2} (graphs from the second sighting), pass E {d:.2} (eager): eager - graph {d:.2} ms\n", .{ S, pass_med[0], pass_med[2], pass_med[2] - pass_med[0] });
++    return ok;
++}
++
++/// The forwards of a pass by kind: graph steps (replays and captures), captures, eager forwards.
++fn printPassCounts(e: *const engine.Engine, pass: u8, c0: engine.Counts, n: usize) void {
++    const c = e.counts;
++    std.debug.print("  streams pass {c}: {d} forwards, {d} as graphs ({d} captured), {d} eager\n", .{ pass, n, c.graph - c0.graph, c.captured - c0.captured, c.eager - c0.eager });
++}
++
++/// Pass C (see the header): drafted verify windows of every slot in one forward, each slot's rollback its own.
++fn passC(io: std.Io, x: Leader, seq: []const u32, T: usize, N: usize, S: usize, solo: []const f32, toks: []const u32) !bool {
++    const e = x.e;
++    const U = e.vocab();
++    const clock = std.Io.Clock.awake;
++    var together_ns: i96 = 0; // the drafts of a round's slots in one pass
++    var alone_ns: i96 = 0; // and each slot's again in a pass of its own
++    var passes: usize = 0;
++    var same_drafts: usize = 0;
++    var drafts_n: usize = 0;
++    var done: [engine.max_segs]usize = @splat(1); // rows matched (row 0: the prompt's last)
++    var keep_n: [engine.max_segs]usize = undefined; // rows of the slot's last forward its next draft keeps
++    var row: [engine.max_segs]usize = @splat(0); // rows bit-equal to solo
++    var rows_seen: [engine.max_segs]usize = @splat(0);
++    var props_ok: usize = 0;
++    var props_n: usize = 0;
++    var hist: [dspark.block]usize = @splat(0);
++    for (0..S) |j| {
++        const p = promptOf(seq, T, j);
++        const tmp = try std.heap.page_allocator.alloc(f32, U);
++        defer std.heap.page_allocator.free(tmp);
++        try prefill(x, first_slot + @as(u32, @intCast(j)), p, tmp);
++        keep_n[j] = if (p.len % engine.prompt_rows == 0) engine.prompt_rows else p.len % engine.prompt_rows;
++    }
++    var rng = std.Random.DefaultPrng.init(0xba7c4ed);
++    var rounds: usize = 0;
++    var fwds: usize = 0;
++    const c0 = e.counts;
++    // a window's rows at most: the forward's head covers every row (8 at 4 streams; 4 at 8)
++    const most = @min(dspark.block, engine.head_rows / S);
++    while (true) : (rounds += 1) {
++        var segs: [engine.max_segs]engine.Segment = undefined;
++        var who: [engine.max_segs]usize = undefined;
++        var wins: [engine.max_segs][dspark.block]u32 = undefined;
++        var ids: [engine.max_segs * dspark.block]u32 = undefined;
++        var n: usize = 0;
++        var R: usize = 0;
++        // every slot's keep and real block in one drafter pass (Leader.draftMany), then each slot's block again in a
++        // pass of its own (Leader.draft; its keep already done): the same drafts, token for token
++        var props_all: [engine.max_segs][dspark.drafts]u32 = undefined;
++        {
++            var items: [engine.max_segs]engine.DraftItem = undefined;
++            var keeps: [engine.max_segs]usize = undefined;
++            var outs: [engine.max_segs]*[dspark.drafts]u32 = undefined;
++            var m: usize = 0;
++            for (0..S) |j| {
++                if (done[j] >= N) continue;
++                items[m] = .{ .slot = first_slot + @as(u32, @intCast(j)), .anchor = toks[j * N + done[j] - 1] };
++                keeps[m] = keep_n[j];
++                outs[m] = &props_all[j];
++                m += 1;
++            }
++            if (m == 0) break;
++            var t0 = clock.now(io).toNanoseconds();
++            try x.draftMany(items[0..m], keeps[0..m], outs[0..m]);
++            together_ns += clock.now(io).toNanoseconds() - t0;
++            t0 = clock.now(io).toNanoseconds();
++            for (items[0..m], keeps[0..m], outs[0..m]) |it, k, o| {
++                var alone: [dspark.drafts]u32 = undefined;
++                try x.draft(it.slot, k, it.anchor, &alone);
++                same_drafts += @intFromBool(std.mem.eql(u32, &alone, o));
++                drafts_n += 1;
++            }
++            alone_ns += clock.now(io).toNanoseconds() - t0;
++            passes += 1;
++        }
++        for (0..S) |j| {
++            if (done[j] >= N) continue;
++            const slot = first_slot + @as(u32, @intCast(j));
++            const anchor = toks[j * N + done[j] - 1];
++            const props = props_all[j];
++            const D = @min(1 + (rounds + j) % dspark.drafts, N - done[j] - 1, most - 1);
++            const wrong = rng.random().uintAtMost(usize, D); // D: none wrong
++            for (0..D) |i| {
++                const truth = toks[j * N + done[j] + i];
++                props_ok += @intFromBool(props[i] == truth);
++                props_n += 1;
++                wins[n][1 + i] = if (i == wrong) (truth + 1) % @as(u32, @intCast(U)) else truth;
++            }
++            wins[n][0] = anchor;
++            const plen = promptOf(seq, T, j).len;
++            segs[n] = .{ .slot = slot, .pos0 = plen + done[j] - 1, .rows = D + 1 };
++            @memcpy(ids[R..][0 .. D + 1], wins[n][0 .. D + 1]);
++            who[n] = j;
++            n += 1;
++            R += D + 1;
++        }
++        if (n == 0) break;
++        try x.forwardMany(segs[0..n], ids[0..R], .{ .lo = 0, .n = R });
++        fwds += 1;
++        const lg = try e.logits();
++        var r: usize = 0;
++        for (segs[0..n], who[0..n], wins[0..n]) |g, j, w| {
++            const D = g.rows - 1;
++            var k: usize = 0;
++            while (k < D and argmax(lg[(r + k) * U ..][0..U]) == w[1 + k]) k += 1;
++            // rows 0 .. k hold the solo run's positions done .. done + k
++            for (0..k + 1) |i| {
++                const a = solo[(j * N + done[j] + i) * U ..][0..U];
++                const b = lg[(r + i) * U ..][0..U];
++                row[j] += @intFromBool(std.mem.eql(u8, std.mem.sliceAsBytes(a), std.mem.sliceAsBytes(b)));
++                rows_seen[j] += 1;
++            }
++            hist[k] += 1;
++            done[j] += k + 1;
++            keep_n[j] = k + 1;
++            r += g.rows;
++        }
++    }
++    printPassCounts(e, 'C', c0, fwds);
++    var ok = same_drafts == drafts_n;
++    std.debug.print("{s} streams pass C drafts: every round's slots drafted in one pass equal their drafts alone {d}/{d}; {d:.2} ms a round's pass ({d:.2} streams on average) against {d:.2} ms a round drafting them one by one\n", .{ if (ok) "PASS" else "FAIL", same_drafts, drafts_n, secs(together_ns) * 1e3 / @as(f64, @floatFromInt(@max(passes, 1))), @as(f64, @floatFromInt(drafts_n)) / @as(f64, @floatFromInt(@max(passes, 1))), secs(alone_ns) * 1e3 / @as(f64, @floatFromInt(@max(passes, 1))) });
++    for (0..S) |j| {
++        try x.keep(first_slot + @as(u32, @intCast(j)), keep_n[j]);
++        const same = row[j] == rows_seen[j] and rows_seen[j] == N - 1;
++        ok = ok and same;
++        std.debug.print("  streams pass C, stream {d}: accepted rows bit-equal to solo {d}/{d} {s}\n", .{ j, row[j], rows_seen[j], if (same) "EQUAL" else "DIFFER" });
++    }
++    std.debug.print("{s} streams pass C: {d} streams' drafted windows (mixed, 1-7 drafts) verified together and rolled back each on its own; {d} rounds; accepted drafts", .{ if (ok) "PASS" else "FAIL", S, rounds });
++    for (hist, 0..) |h, i| std.debug.print(" {d}:{d}", .{ i, h });
++    std.debug.print("; the real drafter's proposals equal the solo tokens {d}/{d}\n", .{ props_ok, props_n });
++    return ok;
++}
++
++/// The state kernels' op check (see the header), on this rank alone: true when every byte is equal.
++pub fn opCheck(gpa: std.mem.Allocator, e: *engine.Engine) !bool {
++    const c = e.opCtx();
++    var rng = std.Random.DefaultPrng.init(0x0b5e55ed);
++    const cap_c: usize = 4608;
++    const hist_bytes = (3 + state.spec_rows) * cap_c * 2;
++    const host = try gpa.alloc(u8, 4 * hist_bytes);
++    defer gpa.free(host);
++    const back = try gpa.alloc(u8, 4 * hist_bytes);
++    defer gpa.free(back);
++    var bufs: [7]cuda.DeviceBuffer = undefined;
++    var made: usize = 0;
++    defer for (bufs[0..made]) |*b| b.free();
++    for (&bufs) |*b| {
++        b.* = try cuda.DeviceBuffer.alloc(e.d, hist_bytes);
++        made += 1;
++    }
++    // commit: state A/B (bufs 0, 1), hist A/B (2, 3), x (4)
++    var cases: usize = 0;
++    var bad: usize = 0;
++    for ([_]usize{ 256, 512, 4608 }) |C| for (1..state.spec_rows + 1) |R| {
++        rng.random().bytes(host);
++        for (bufs[0..5], 0..) |b, i| try b.upload(0, host[i * (hist_bytes / 2) ..][0 .. hist_bytes / 2]);
++        try bufs[1].upload(0, host[0 .. hist_bytes / 2]);
++        try bufs[3].upload(0, host[2 * (hist_bytes / 2) ..][0 .. hist_bytes / 2]);
++        const x = ops.Mat.of(bufs[4].ptr, R, C, .bf16);
++        try state.convCommitSpecCopies(&c, bufs[0].ptr, bufs[2].ptr, x);
++        try state.convCommitSpec(&c, bufs[1].ptr, bufs[3].ptr, x);
++        try c.stream.synchronize();
++        for ([2][2]usize{ .{ 0, 1 }, .{ 2, 3 } }) |pair| {
++            try bufs[pair[0]].download(0, back[0 .. hist_bytes / 2]);
++            try bufs[pair[1]].download(0, back[hist_bytes .. hist_bytes + hist_bytes / 2]);
++            if (!std.mem.eql(u8, back[0 .. hist_bytes / 2], back[hist_bytes .. hist_bytes + hist_bytes / 2])) bad += 1;
++        }
++        cases += 1;
++    };
++    // keep: 4 convolutions (256, 256, 4608, 4608 columns) with their states A (bufs 0, 1) and B (2, 3), two a
++    // buffer, and a history each (the narrow two in 4, the wide in 5 and 6), every keep 1 .. 7
++    var keep_cases: usize = 0;
++    for (1..state.spec_rows) |n| {
++        rng.random().bytes(host);
++        for (bufs, 0..) |b, i| try b.upload(0, host[(i % 4) * (hist_bytes / 2) ..][0..hist_bytes]);
++        const cols = [4]u32{ 256, 256, 4608, 4608 };
++        const half = hist_bytes / 2;
++        const st_a = [4]u64{ bufs[0].ptr, bufs[0].ptr + half, bufs[1].ptr, bufs[1].ptr + half };
++        const st_b = [4]u64{ bufs[2].ptr, bufs[2].ptr + half, bufs[3].ptr, bufs[3].ptr + half };
++        const hs = [4]u64{ bufs[4].ptr, bufs[4].ptr + half, bufs[5].ptr, bufs[6].ptr };
++        // B starts as A
++        try c.copy(bufs[2].ptr, bufs[0].ptr, hist_bytes);
++        try c.copy(bufs[3].ptr, bufs[1].ptr, hist_bytes);
++        var table: [4]state.KeepEntry = undefined;
++        for (&table, st_b, hs, cols) |*t, s, h, k| t.* = .{ .state = s, .hist = h, .cols = k };
++        var tb = try cuda.DeviceBuffer.fromHost(e.d, std.mem.sliceAsBytes(&table));
++        defer tb.free();
++        for (st_a, hs, cols) |s, h, k| try state.convKeep(&c, s, h, k, n);
++        var st: state.State = .{ .gpa = gpa, .first = 0, .layers = &.{}, .context = 0, .keep_table = tb.ptr, .keep_entries = 4 };
++        try state.keepAll(&c, &st, n);
++        try c.stream.synchronize();
++        for ([2][2]usize{ .{ 0, 2 }, .{ 1, 3 } }) |pair| {
++            try bufs[pair[0]].download(0, back[0..hist_bytes]);
++            try bufs[pair[1]].download(0, back[hist_bytes .. 2 * hist_bytes]);
++            if (!std.mem.eql(u8, back[0..hist_bytes], back[hist_bytes .. 2 * hist_bytes])) bad += 1;
++        }
++        keep_cases += 1;
++    }
++    std.debug.print("{s} op check: window history commit (tf_ink2_conv_commit_spec) against its three copies, {d} cases (columns 256, 512, 4608; rows 1..8); slot rollback (tf_ink2_conv_keep) against a copy a convolution, {d} cases (keep 1..7, 4 convolutions); {d} differ\n", .{ if (bad == 0) "PASS" else "FAIL", cases, keep_cases, bad });
++    var ok = bad == 0;
++    if (e.drafter) |dr| ok = try drafterCheck(gpa, e, dr) and ok;
++    return ok;
++}
++
++/// The drafter's context writes with a device position against the host forms (see the header).
++fn drafterCheck(gpa: std.mem.Allocator, e: *engine.Engine, dr: *const dspark.Drafter) !bool {
++    const c = e.opCtx();
++    var rng = std.Random.DefaultPrng.init(0xd5a7c0de);
++    const D = 128;
++    const kvw = dr.hk * D; // a row of keys (or values), elements
++    const row = kvw * 2;
++    const cap = e.capacity();
++    if (cap < 3071 + 8 + 8) return error.OpCheckContextShort;
++    const R_max = state.spec_rows;
++    // x: R_max rows of [k | v] (2 kvw bf16 a row, finite values); gain fp32 [128]
++    const xh = try gpa.alloc(u16, R_max * 2 * kvw);
++    defer gpa.free(xh);
++    for (xh) |*v| v.* = @truncate(@as(u32, @bitCast(rng.random().float(f32) * 4 - 2)) >> 16);
++    var gh: [D]f32 = undefined;
++    for (&gh) |*g| g.* = 0.5 + rng.random().float(f32);
++    var xb = try cuda.DeviceBuffer.fromHost(e.d, std.mem.sliceAsBytes(xh));
++    defer xb.free();
++    var gb = try cuda.DeviceBuffer.fromHost(e.d, std.mem.sliceAsBytes(&gh));
++    defer gb.free();
++    var pb = try cuda.DeviceBuffer.alloc(e.d, 256);
++    defer pb.free();
++    // two tables of `cap` rows: A by the host forms, B by the device forms
++    var ta = try cuda.DeviceBuffer.alloc(e.d, cap * row);
++    defer ta.free();
++    var tb = try cuda.DeviceBuffer.alloc(e.d, cap * row);
++    defer tb.free();
++    const a_host = try gpa.alloc(u8, cap * row);
++    defer gpa.free(a_host);
++    const b_host = try gpa.alloc(u8, cap * row);
++    defer gpa.free(b_host);
++    var cases: usize = 0;
++    var bad: usize = 0;
++    for ([_]usize{ 0, 1023, 3071, cap - 8 }) |pos| for (1..R_max + 1) |R| for ([_]bool{ false, true }) |values| {
++        try ta.fill8(0, null);
++        try tb.fill8(0, null);
++        const p32 = [1]i32{@intCast(pos)};
++        try pb.upload(0, std.mem.sliceAsBytes(&p32));
++        if (values) {
++            try dspark.copy2d(&c, ta.ptr + pos * row, row, xb.ptr + row, 2 * row, row, R);
++            try dr.rowsAt(&c, tb.ptr, row, xb.ptr + row, 2 * row, row, R, 0, pb.ptr, 0);
++        } else {
++            try dr.rope(&c, xb.ptr, 2 * kvw, dr.hk, R, gb.ptr, ta.ptr + pos * row, kvw, pos, 0, 0);
++            try dr.rope(&c, xb.ptr, 2 * kvw, dr.hk, R, gb.ptr, tb.ptr, kvw, 0, pb.ptr, 0);
++        }
++        try c.stream.synchronize();
++        try ta.download(0, a_host);
++        try tb.download(0, b_host);
++        if (!std.mem.eql(u8, a_host, b_host)) bad += 1;
++        cases += 1;
++    };
++    // the local layers' mirrored rings: rows at (pos0 + r) % ring (and below the window again `ring` rows on) with
++    // pos0 from the host and from the device, against each row written alone at its rows (host position, plain
++    // address)
++    const ring = dspark.window + dr.cap; // dspark.ringRows of a slot past it
++    const rrows = ring + dspark.window; // dspark.localRows
++    var ra = try cuda.DeviceBuffer.alloc(e.d, rrows * row);
++    defer ra.free();
++    var rb = try cuda.DeviceBuffer.alloc(e.d, rrows * row);
++    defer rb.free();
++    const ra_host = try gpa.alloc(u8, rrows * row);
++    defer gpa.free(ra_host);
++    const rb_host = try gpa.alloc(u8, rrows * row);
++    defer gpa.free(rb_host);
++    var ring_cases: usize = 0;
++    for ([_]usize{ 0, dspark.window - 3, ring - 3, ring, 5 * ring + 1000, 131_000 }) |pos| for (1..R_max + 1) |R| for ([_]bool{ false, true }) |values| for ([_]bool{ false, true }) |on_dev| {
++        try ra.fill8(0, null);
++        try rb.fill8(0, null);
++        const p32 = [1]i32{@intCast(pos)};
++        try pb.upload(0, std.mem.sliceAsBytes(&p32));
++        for (0..R) |r| {
++            const rr = (pos + r) % ring;
++            for ([_]usize{ rr, rr + ring }) |at_row| {
++                if (at_row >= ring and rr >= dspark.window) continue;
++                const at = at_row * row;
++                if (values) {
++                    try dspark.copy2d(&c, ra.ptr + at, row, xb.ptr + r * 2 * row + row, 2 * row, row, 1);
++                } else try dr.rope(&c, xb.ptr + r * 2 * row, 2 * kvw, dr.hk, 1, gb.ptr, ra.ptr + at, kvw, pos + r, 0, 0);
++            }
++        }
++        const p0: usize = if (on_dev) 0 else pos;
++        const pp: u64 = if (on_dev) pb.ptr else 0;
++        if (values) {
++            try dr.rowsAt(&c, rb.ptr, row, xb.ptr + row, 2 * row, row, R, p0, pp, ring);
++        } else try dr.rope(&c, xb.ptr, 2 * kvw, dr.hk, R, gb.ptr, rb.ptr, kvw, p0, pp, ring);
++        try c.stream.synchronize();
++        try ra.download(0, ra_host);
++        try rb.download(0, rb_host);
++        if (!std.mem.eql(u8, ra_host, rb_host)) bad += 1;
++        ring_cases += 1;
++    };
++    std.debug.print("{s} op check: the drafter's context writes with a device position (rope adding the position to the table's base; the values' row kernel) against the host position and address (rope; the 2D copy), {d} cases (positions 0, 1023, 3071, {d}; rows 1..8); the local layers' mirrored rings of {d} positions in {d} rows (host and device positions; positions 0, {d}, {d}, {d}, {d}, 131000) against rows written one by one, {d} cases; {d} differ\n", .{ if (bad == 0) "PASS" else "FAIL", cases, cap - 8, ring, rrows, dspark.window - 3, ring - 3, ring, 5 * ring + 1000, ring_cases, bad });
++    return bad == 0;
++}
++
++/// Total rows the shared price measures (`sharedPrice`): 1 .. 8, then up to the lane core's 32 a round.
++pub const shared_sizes = [_]usize{ 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 28, 32 };
++
++/// Positions a slot of the shared price takes past its prompt (a keep of one row after each forward).
++pub fn sharedPositions(reps: usize) usize {
++    return shared_sizes.len * (reps + 2);
++}
++
++/// The shared price (tf-inkling2-decode --exp shared-price, the drafter loaded): forwards of R rows in all as the
++/// fewest streams of at most 8 rows each, at least two (one row: one stream), rows split evenly, on slots 3 ..
++/// at the gate's staggered prompts, with every row's head logits; each segment keeps one row after, so the slots
++/// stay at their positions. `reps` forwards a size after two not timed (a key of several streams runs eagerly at its
++/// first sighting and is captured at its second; TF_INK2_GRAPH=0 or TF_INK2_GRAPH_SEGS=1: all eager). Prints each
++/// size's median and mean ms from the call to the logits on the host, and the forwards of each kind: the lane core's
++/// shared_costs (cuda_lanes.zig shared_ms).
++pub fn sharedPrice(io: std.Io, x: Leader, seq: []const u32, T: usize, reps: usize) !void {
++    const e = x.e;
++    if (e.drafter == null) return error.SharedPriceNeedsTheDrafter; // the rollback (keep) needs the window history
++    const clock = std.Io.Clock.awake;
++    const S_most = 4;
++    if (T <= stagger * S_most or reps == 0) return error.BadStreams;
++    const tmp = try std.heap.page_allocator.alloc(f32, e.vocab());
++    defer std.heap.page_allocator.free(tmp);
++    for (0..S_most) |j| try prefill(x, first_slot + @as(u32, @intCast(j)), promptOf(seq, T, j), tmp);
++    const t = try std.heap.page_allocator.alloc(f64, reps);
++    defer std.heap.page_allocator.free(t);
++    std.debug.print("shared price (ms, {d} forwards a size, slots {d}.., prompts {d} .. {d}): rows streams median mean\n", .{ reps, first_slot, T - stagger * (S_most - 1), T });
++    for (shared_sizes) |R| {
++        const S: usize = if (R == 1) 1 else @max(2, (R + 7) / 8);
++        const c0 = e.counts;
++        for (0..reps + 2) |i| {
++            var segs: [S_most]engine.Segment = undefined;
++            var ids: [32]u32 = undefined;
++            var r: usize = 0;
++            for (segs[0..S], 0..) |*g, j| {
++                const slot = first_slot + @as(u32, @intCast(j));
++                const rows = R / S + @intFromBool(j < R % S);
++                g.* = .{ .slot = slot, .pos0 = e.pos(slot), .rows = rows };
++                for (ids[r..][0..rows], 0..) |*v, k| v.* = seq[(g.pos0 + k) % T];
++                r += rows;
++            }
++            const t0 = clock.now(io).toNanoseconds();
++            try x.forwardMany(segs[0..S], ids[0..R], .{ .lo = 0, .n = R });
++            _ = try e.logits();
++            const ms = secs(clock.now(io).toNanoseconds() - t0) * 1e3;
++            for (segs[0..S]) |g| try x.keep(g.slot, 1);
++            if (i > 1) t[i - 2] = ms;
++        }
++        var sum: f64 = 0;
++        for (t) |v| sum += v;
++        std.mem.sort(f64, t, {}, std.sort.asc(f64));
++        const med = if (reps % 2 == 1) t[reps / 2] else (t[reps / 2 - 1] + t[reps / 2]) / 2;
++        const c = e.counts;
++        std.debug.print("  {d} {d} {d:.2} {d:.2} (graphs {d}, captured {d}, eager {d})\n", .{ R, S, med, sum / @as(f64, @floatFromInt(reps)), c.graph - c0.graph, c.captured - c0.captured, c.eager - c0.eager });
++    }
++}
++
++/// Chunk invariance (the interleave design's G1, tf-inkling2-decode --exp chunks): the cut lists a prompt of T
++/// tokens is prefilled with on slot `chunks_slot`, each followed by the check's decode (S - 1 greedy one-row steps);
++/// a list's sizes are taken in order, the last one repeated, each clamped to the rows left, to `prompt_rows` and to
++/// the forced cuts. T up to 4,096 (the check's 3,040): `short_lists` and three seeded random lists (16 .. 1,024 rows);
++/// longer: 256-row chunks and one seeded random list with cuts forced at 20,000 and T - 1. Every list must give the
++/// check's decode logits (its xxh64, the prompt's last row included): a prompt's state does not depend on its cuts.
++const short_lists = [_][]const usize{ &.{2048}, &.{512}, &.{256}, &.{128}, &.{64}, &.{37}, &.{ 1, 2, 3, 8, 9, 1000 }, &.{ 1023, 1, 2047 }, &.{ 2047, 2, 2048 } };
++const long_lists = [_][]const usize{&.{256}};
++const random_lists_short: usize = 3;
++const random_lists_long: usize = 1;
++/// The slot `chunks` and `mixPrice` take (tf-inkling2-decode's draft gates start it over too).
++pub const chunks_slot: u32 = 2;
++
++/// The chunks experiment (see `short_lists`): true when every list's decode logits hash to `ref` (the check's) and
++/// every row equals the first list's. Without `ref` (no check before it, or several depths) the hashes print only.
++pub fn chunks(gpa: std.mem.Allocator, io: std.Io, x: Leader, seq: []const u32, T: usize, S: usize, ref: ?u64) !bool {
++    const e = x.e;
++    const U = e.vocab();
++    const clock = std.Io.Clock.awake;
++    const long = T > 4096;
++    const fixed: []const []const usize = if (long) &long_lists else &short_lists;
++    const lists = fixed.len + if (long) random_lists_long else random_lists_short;
++    const first = try gpa.alloc(f32, S * U);
++    defer gpa.free(first);
++    const rows = try gpa.alloc(f32, S * U);
++    defer gpa.free(rows);
++    var forced_buf: [2]usize = undefined;
++    var nf: usize = 0;
++    if (long) {
++        if (T > 20000 + 1) {
++            forced_buf[nf] = 20000;
++            nf += 1;
++        }
++        forced_buf[nf] = T - 1;
++        nf += 1;
++    }
++    const forced = forced_buf[0..nf];
++    var ok = true;
++    std.debug.print("chunks: prompt {d} on slot {d} in {d} cut lists, each then {d} decode steps; reference {s}\n", .{ T, chunks_slot, lists, S - 1, if (ref != null) "the check's decode logits xxh64" else "none (hashes only)" });
++    for (0..lists) |li| {
++        var rng = std.Random.DefaultPrng.init(0xc0751de + li);
++        const list: ?[]const usize = if (li < fixed.len) fixed[li] else null;
++        var at: usize = 0;
++        var nfwd: usize = 0;
++        var lo: usize = std.math.maxInt(usize);
++        var hi: usize = 0;
++        const t0 = clock.now(io).toNanoseconds();
++        while (at < T) : (nfwd += 1) {
++            var n = if (list) |l| l[@min(nfwd, l.len - 1)] else rng.random().intRangeAtMost(usize, 16, 1024);
++            n = @min(n, T - at, engine.prompt_rows);
++            for (forced) |c| if (at < c and at + n > c) {
++                n = c - at;
++            };
++            const last = at + n == T;
++            try x.forward(chunks_slot, at, seq[at..][0..n], if (last) .{ .lo = n - 1, .n = 1 } else null);
++            at += n;
++            lo = @min(lo, n);
++            hi = @max(hi, n);
++            if (last) @memcpy(rows[0..U], try e.logits());
++        }
++        const pre = secs(clock.now(io).toNanoseconds() - t0);
++        var toks_same: usize = 0;
++        for (0..S) |k| {
++            const t = argmax(rows[k * U ..][0..U]);
++            toks_same += @intFromBool(seq.len >= T + S and t == seq[T + k]);
++            if (k + 1 == S) break;
++            try x.forward(chunks_slot, T + k, &.{t}, .{ .lo = 0, .n = 1 });
++            @memcpy(rows[(k + 1) * U ..][0..U], try e.logits());
++        }
++        if (li == 0) @memcpy(first, rows);
++        var equal: usize = 0;
++        var first_diff: ?usize = null;
++        for (0..S) |k| {
++            const same_row = std.mem.eql(u8, std.mem.sliceAsBytes(first[k * U ..][0..U]), std.mem.sliceAsBytes(rows[k * U ..][0..U]));
++            equal += @intFromBool(same_row);
++            if (!same_row and first_diff == null) first_diff = k;
++        }
++        const h = std.hash.XxHash64.hash(0, std.mem.sliceAsBytes(rows));
++        const same = (if (ref) |r| h == r else true) and equal == S;
++        ok = ok and same;
++        std.debug.print("  chunks list {d} ", .{li});
++        if (list) |l| {
++            std.debug.print("{{", .{});
++            for (l, 0..) |v, i| std.debug.print("{s}{d}", .{ if (i > 0) ", " else "", v });
++            std.debug.print("}}", .{});
++        } else std.debug.print("random (seed {d}, 16..1024{s})", .{ li, if (forced.len > 0) ", cuts forced" else "" });
++        std.debug.print(": {d} forwards of {d} .. {d} rows, prefill {d:.2} s; decode logits xxh64 {x:0>16}{s}; rows bit-equal to list 0's {d}/{d}", .{ nfwd, lo, hi, pre, h, if (ref) |r| (if (h == r) " EQUAL to the check's" else " DIFFERS from the check's") else "", equal, S });
++        if (first_diff) |k| std.debug.print(" (first difference at row {d}, position {d})", .{ k, T - 1 + k });
++        if (seq.len >= T + S and ref != null) std.debug.print("; tokens equal {d}/{d}", .{ toks_same, S });
++        std.debug.print(" {s}\n", .{if (same) "EQUAL" else "DIFFER"});
++    }
++    std.debug.print("{s} chunks: {d} cut lists of a {d}-token prompt give the same decode logits{s}\n", .{ if (ok) "PASS" else "FAIL", lists, T, if (ref != null) " as the check" else "" });
++    return ok;
++}
++
++/// The chunk sizes `mixPrice` measures.
++pub const mix_ks = [_]usize{ 64, 128, 256, 512, 1024 };
++/// Decode streams `mixPrice` takes at most (slots first_slot + 1 ..).
++pub const mix_dec_most = 4;
++/// A decode stream's prompt in `mixPrice`: 512 + 61 j tokens from token j.
++fn mixDecPrompt(seq: []const u32, j: usize) []const u32 {
++    return seq[j..][0 .. 512 + stagger * j];
++}
++
++/// Positions `mixPrice` takes on `chunks_slot` (each depth band from where the slot stands, at least its depth; a
++/// band of depth 0 restarts the slot for every chunk).
++pub fn mixPositions(reps: usize, depths: []const usize, decs: []const usize) usize {
++    var sum_k: usize = 0;
++    for (mix_ks) |k| sum_k += k;
++    const band = (reps * sum_k * 2 + 4 * mix_ks[0]) * decs.len; // A and B a pair, after two warm-up pairs at the smallest k
++    var pos: usize = 0;
++    var top: usize = 0;
++    for (depths) |d| {
++        if (d == 0) {
++            top = @max(top, mix_ks[mix_ks.len - 1]);
++            continue;
++        }
++        pos = @max(pos, d) + band;
++        top = @max(top, pos);
++    }
++    return top + 64;
++}
++
++/// The mixed step's price (the interleave design's S0 `mixprice`, tf-inkling2-decode --exp mixprice): on
++/// `chunks_slot`, prompt chunks of k rows (`mix_ks`) at each depth band (`depths`: 0 restarts the slot for each
++/// chunk; above, the slot is prefilled to the depth, then its chunks go on from there), beside R decode streams
++/// (`decs`, one row each, slots first_slot + 1 ..), as pairs in one process, which goes first alternating:
++///   A: the chunk alone (eager, no head; to its end on the device), then the decoders' forward with their head
++///      (one stream: a captured step; several: a captured forward from its key's second sighting);
++///   B: one forward of [the chunk, the decoders' rows] (eager), the head over the decode rows (the fold's step).
++/// Each cell prints the medians over `reps` of the chunk (C), the decode (D), the mixed step (M), the fold's saving
++/// (C + D - M, the median of the pairs' savings) and its share of C + D; the bits are not checked (a price).
++pub fn mixPrice(io: std.Io, x: Leader, seq: []const u32, T: usize, reps: usize, depths: []const usize, decs: []const usize) !void {
++    const e = x.e;
++    const clock = std.Io.Clock.awake;
++    var most: usize = 0;
++    for (decs) |r| {
++        if (r == 0) return error.BadMixPrice; // the chunk alone is every pair's C
++        most = @max(most, r);
++    }
++    if (reps == 0 or reps > 16 or most > mix_dec_most or T < 512 + stagger * mix_dec_most + mix_dec_most) return error.BadMixPrice;
++    // the decode streams' prompts
++    for (0..most) |j| {
++        const p = mixDecPrompt(seq, j);
++        var at: usize = 0;
++        while (at < p.len) {
++            const n = @min(p.len - at, engine.prompt_rows);
++            try x.forward(first_slot + 1 + @as(u32, @intCast(j)), at, p[at..][0..n], null);
++            at += n;
++        }
++    }
++    std.debug.print("mixprice: chunks of {any} rows on slot {d} beside 1-row decode streams {any} (slots {d}..), {d} pairs a cell, which goes first alternating; ms from the call to the end on the device (the chunk) or to the logits on the host\n", .{ mix_ks, chunks_slot, decs, first_slot + 1, reps });
++    var ids: [mix_ks[mix_ks.len - 1] + mix_dec_most]u32 = undefined;
++    var flip = false;
++    const Cell = struct { c: [16]f64, d: [16]f64, m: [16]f64, s: [16]f64, pos: usize };
++    for (depths) |d| {
++        // the slot to its depth (from where it stands)
++        if (d > 0) {
++            const t0 = clock.now(io).toNanoseconds();
++            while (e.pos(chunks_slot) < d) {
++                const p = e.pos(chunks_slot);
++                const n = @min(d - p, engine.prompt_rows);
++                var big: [engine.prompt_rows]u32 = undefined;
++                for (big[0..n], 0..) |*v, i| v.* = seq[(p + i) % T];
++                try x.forward(chunks_slot, p, big[0..n], null);
++            }
++            try e.stream.synchronize();
++            std.debug.print("mixprice depth {d}: slot {d} at position {d} ({d:.2} s to get there)\n", .{ d, chunks_slot, e.pos(chunks_slot), secs(clock.now(io).toNanoseconds() - t0) });
++        }
++        var cells: [mix_ks.len][mix_dec_most + 1]Cell = undefined;
++        for (decs) |R| {
++            // warm-up (not timed): the decoders' graphs captured (a key of several streams at its second sighting)
++            for (0..2) |_| {
++                _ = try mixA(io, x, seq, T, d, mix_ks[0], R, &ids);
++                _ = try mixB(io, x, seq, T, d, mix_ks[0], R, &ids);
++            }
++        }
++        for (0..reps) |rep| for (mix_ks, 0..) |k, ki| for (decs) |R| {
++            const cell = &cells[ki][R];
++            if (rep == 0) cell.pos = 0;
++            cell.pos += if (d == 0) 0 else e.pos(chunks_slot);
++            flip = !flip;
++            var a: [2]f64 = undefined;
++            var m: f64 = undefined;
++            if (flip) {
++                a = try mixA(io, x, seq, T, d, k, R, &ids);
++                m = try mixB(io, x, seq, T, d, k, R, &ids);
++            } else {
++                m = try mixB(io, x, seq, T, d, k, R, &ids);
++                a = try mixA(io, x, seq, T, d, k, R, &ids);
++            }
++            cell.c[rep] = a[0];
++            cell.d[rep] = a[1];
++            cell.m[rep] = m;
++            cell.s[rep] = a[0] + a[1] - m;
++        };
++        for (mix_ks, 0..) |k, ki| for (decs) |R| {
++            const cell = &cells[ki][R];
++            const c = medianOf(cell.c[0..reps]);
++            const dd = medianOf(cell.d[0..reps]);
++            const m = medianOf(cell.m[0..reps]);
++            const sv = medianOf(cell.s[0..reps]);
++            var lo: f64 = std.math.inf(f64);
++            var hi: f64 = -std.math.inf(f64);
++            for (cell.s[0..reps]) |v| {
++                lo = @min(lo, v);
++                hi = @max(hi, v);
++            }
++            std.debug.print("  mixprice depth {d} (mean position {d}) k {d} decoders {d}: chunk {d:.2} ms ({d:.3} a row), decode {d:.2}, chunk + decode {d:.2}, mixed {d:.2}; the fold saves {d:.2} ms (pairs {d:.2} .. {d:.2}), {d:.1} % of chunk + decode\n", .{ d, cell.pos / reps, k, R, c, c / @as(f64, @floatFromInt(k)), dd, c + dd, m, sv, lo, hi, 100 * sv / (c + dd) });
++        };
++    }
++}
++
++/// The median of `xs` (sorted in place).
++fn medianOf(xs: []f64) f64 {
++    std.mem.sort(f64, xs, {}, std.sort.asc(f64));
++    const m = xs.len / 2;
++    return if (xs.len % 2 == 1) xs[m] else (xs[m - 1] + xs[m]) / 2;
++}
++
++/// The decode streams' segments and ids (one row each at its position; any token: a price).
++fn mixDecs(e: *engine.Engine, seq: []const u32, T: usize, R: usize, segs: []engine.Segment, ids: []u32) void {
++    for (0..R) |j| {
++        const slot = first_slot + 1 + @as(u32, @intCast(j));
++        const p = e.pos(slot);
++        segs[j] = .{ .slot = slot, .pos0 = p, .rows = 1 };
++        ids[j] = seq[p % T];
++    }
++}
++
++/// The chunk's position at depth band `d` (0: the slot starts over).
++fn mixAt(e: *engine.Engine, d: usize) usize {
++    return if (d == 0) 0 else e.pos(chunks_slot);
++}
++
++/// Pair half A: the chunk alone, then the decoders' forward with its head; their ms.
++fn mixA(io: std.Io, x: Leader, seq: []const u32, T: usize, d: usize, k: usize, R: usize, ids: []u32) ![2]f64 {
++    const e = x.e;
++    const clock = std.Io.Clock.awake;
++    const p = mixAt(e, d);
++    for (ids[0..k], 0..) |*v, i| v.* = seq[(p + i) % T];
++    const t0 = clock.now(io).toNanoseconds();
++    try x.forward(chunks_slot, p, ids[0..k], null);
++    try e.stream.synchronize();
++    const t1 = clock.now(io).toNanoseconds();
++    var segs: [mix_dec_most]engine.Segment = undefined;
++    mixDecs(e, seq, T, R, &segs, ids[0..R]);
++    const t2 = clock.now(io).toNanoseconds();
++    try x.forwardMany(segs[0..R], ids[0..R], .{ .lo = 0, .n = R });
++    _ = try e.logits();
++    const t3 = clock.now(io).toNanoseconds();
++    return .{ secs(t1 - t0) * 1e3, secs(t3 - t2) * 1e3 };
++}
++
++/// Pair half B: one forward of [the chunk, the decoders' rows], the head over the decode rows; its ms.
++fn mixB(io: std.Io, x: Leader, seq: []const u32, T: usize, d: usize, k: usize, R: usize, ids: []u32) !f64 {
++    const e = x.e;
++    const clock = std.Io.Clock.awake;
++    const p = mixAt(e, d);
++    for (ids[0..k], 0..) |*v, i| v.* = seq[(p + i) % T];
++    var segs: [1 + mix_dec_most]engine.Segment = undefined;
++    segs[0] = .{ .slot = chunks_slot, .pos0 = p, .rows = k };
++    mixDecs(e, seq, T, R, segs[1..][0..R], ids[k..][0..R]);
++    const t0 = clock.now(io).toNanoseconds();
++    try x.forwardMany(segs[0 .. 1 + R], ids[0 .. k + R], .{ .lo = k, .n = R });
++    _ = try e.logits();
++    return secs(clock.now(io).toNanoseconds() - t0) * 1e3;
++}
+diff --git a/zig/src/families/inkling2/cuda_lanes.zig b/zig/src/families/inkling2/cuda_lanes.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5dbc286adec
+--- /dev/null
++++ b/zig/src/families/inkling2/cuda_lanes.zig
+@@ -0,0 +1,1384 @@
++//! Inkling-2's CUDA lane backend: a slot a stream (its state on every rank), prompts in 2048-row chunks, then decode
++//! windows. Rank 0 draws on the host from the softcapped fp32 logits rows: greedy, or the request's sampling keyed at
++//! each row's position over the whole vocabulary (sample.zig). Without the drafter a window is the pending row alone.
++//! With it (TF_INK2_DSPARK=1, cuda_dspark.zig) a window is the pending row and up to 7 held drafts in one forward;
++//! `keep` takes the slot back to the accepted rows (cuda_engine.zig keep: the convolution states; keys and values
++//! are rewritten) and `draft` runs the drafter's block from the accepted rows' taps. The keep goes to the ranks with
++//! the next draft (or before the next window when no draft came between).
++//! Several streams' windows run as one forward (cuda_engine.zig forwardMany: a segment a stream, each stream's rows
++//! with the bits of a forward of their own), so the lane core shares a round between streams (`hidden_rows`).
++//! TF_INK2_BATCH=0 (rank 0) keeps a forward a stream (the lane core's per-stream rounds).
++//! Structured output (a stream with a grammar): the lane core gives each row's allowed tokens (`Window.masks`, and
++//! the first token's to `first_masked`); rank 0 sets the others to -inf in a copy of the row and draws it by the same
++//! rule (`drawMasked`). The prompt's last row is kept for a grammar stream until its first token is drawn. A greedy
++//! row takes the device's argmax when its mask allows it (the first largest value is then the first largest allowed
++//! one), else its logits come down then and the largest allowed value wins; only sampled rows bring theirs down first.
++//! With the drafter, a grammar stream's held drafts are made in its verify's own step, in the round's one drafter
++//! pass, as every stream's are (Backend.late_masks): the window goes out unread, and its rows' masks are walked
++//! (`Constraint.late`) once the step's drafts are on the host, before its draws. TF_INK2_LATE_MASKS=0 (rank 0) reads
++//! them back first instead (a drafter pass of the grammar streams' own before their windows; for A/B).
++//! TF_INK2_MASK_DUMP=PATH (rank 0, debug): every masked draw appends its row and mask to PATH (`dumpRow`).
++//! The lane plumbing follows minimax_m3/cuda_lanes.zig and glm/cuda_lanes.zig.
++const std = @import("std");
++const lanes = @import("lanes");
++const ic = @import("inkling2_cuda");
++const sample = @import("sample.zig");
++
++const be = lanes.backend;
++const engine = ic.engine;
++
++/// Drawn tokens a handle names.
++const ring = 1024;
++
++const Lane = struct {
++    slot: u32,
++    first: ?u64 = null,
++    fill: ?usize = null, // a prompt going a chunk at a time: where its next chunk starts
++    from: usize = 0, // where its prompt pass started: a kept state's position (the prompt cache), else 0
++    kept: ?usize = null, // rows of the last window `keep` accepted, not yet sent to the ranks
++    held: [ic.dspark.drafts]u32 = undefined, // the drafter's block for the next window
++    held_n: usize = 0,
++    /// The draft `draft` asked for, not run yet (TF_INK2_DRAFT_DEFER): it runs with the stream's next verify, in its
++    /// step (Leader.forwardDrafted: one header, the keep, the block, then the window), its drafts read back after
++    /// the head. Any other forward first runs it on its own (`flush`), since the block reads the taps of the
++    /// stream's last forward.
++    pending: ?Pending = null,
++    /// A grammar stream's prompt's last row (the softcapped fp32 logits, owned) until its first token is drawn:
++    /// `first_masked` draws it under the grammar's mask (or `first` without one).
++    first_row: []f32 = &.{},
++
++    fn dropRow(l: *Lane, gpa: std.mem.Allocator) void {
++        if (l.first_row.len > 0) gpa.free(l.first_row);
++        l.first_row = &.{};
++    }
++};
++
++const Pending = struct { n: usize, anchor: u32, stream: *lanes.Stream };
++
++/// The prompt cache's store as the lanes see it (native/cuda.zig: its giveBack and borrowed over the store).
++pub const StoreHooks = struct {
++    ctx: *anyopaque,
++    /// Kept states dropped, least valuable first, never `restoring` nor a borrowed one, and when `guarded` never one a
++    /// queued or admitted request will resume (the lane host's protection), until `fits(left)` (false: none left to
++    /// drop).
++    give_back: *const fn (ctx: *anyopaque, restoring: ?*anyopaque, left: *anyopaque, fits: *const fn (*anyopaque) bool, guarded: bool) bool,
++    borrowed: *const fn (ctx: *anyopaque, saved: *anyopaque) bool,
++};
++
++/// What the reclaim chain did (`reclaimChain`): whether `want` pages are available after it, and whether it went
++/// past the lane host's protection.
++pub const Reclaimed = struct { ok: bool, unguarded: bool = false };
++
++/// The reclaim chain over rank 0's allocator `a`: kept states give their pages back (the store's order: least
++/// valuable first, never `restoring` nor a borrowed one) until `want` pages are available. First guarded: a state a
++/// queued or admitted request will resume stays. When that leaves too few and the stream is `alone` (no other stream
++/// runs, so waiting brings no page back), unguarded: admission (`Lanes.fits`) counted every page no borrowed state
++/// holds, and the lane host fails a request that finds no memory with nothing else running, so the protected states
++/// go instead of the request (a queued request that would have resumed one runs its prompt from the start: the same
++/// bits). Engine thread.
++pub fn reclaimChain(a: *const ic.pages.Alloc, hooks: StoreHooks, restoring: ?*anyopaque, want: usize, alone: bool) Reclaimed {
++    if (a.available() >= want) return .{ .ok = true };
++    const Left = struct {
++        a: *const ic.pages.Alloc,
++        want: usize,
++        fn fits(ptr: *anyopaque) bool {
++            const l: *const @This() = @ptrCast(@alignCast(ptr));
++            return l.a.available() >= l.want;
++        }
++    };
++    var left: Left = .{ .a = a, .want = want };
++    if (hooks.give_back(hooks.ctx, restoring, &left, Left.fits, true)) return .{ .ok = true };
++    if (!alone) return .{ .ok = false };
++    return .{ .ok = hooks.give_back(hooks.ctx, restoring, &left, Left.fits, false), .unguarded = true };
++}
++
++/// A lone window's ms by rows at TP4 on four GB10s (switch fabric with the RoCE mesh wire, checkpoint mode, experts
++/// split, all 48 layers, the drafter loaded, the one-row latency forms, lane A's 1-8-row attention passes, lane K's
++/// window tiles), measured by `tf-inkling2-decode --exp price` (20 a width) at a 600-token prompt (the server's
++/// requests' depth; at 3040 tokens within 1.5 ms: 33.4 41.3 45.4 50.1 54.9 60.3 63.2 68.0): the window as a captured
++/// graph with every row's head logits, plus the keep that rolls back the rejected rows (0.05 ms from two rows on).
++const tp4_window_ms = [_]f64{ 34.1, 42.4, 46.9, 51.7, 57.6, 60.2, 65.5, 67.3 };
++/// The drafter's block (with its keep) at TP4, measured the same way: one pass whatever its depth (its 7 drafts at
++/// once), so a round's draft is a fixed cost, not a cost a draft.
++const tp4_draft_ms = 8.4;
++/// What the lane core weighs depths by: a round of a window of R rows (R - 1 drafts) is the window and, from two
++/// rows on, the draft that made its drafts (the head steps are priced at 0: `mtp_step_ms`).
++const tp4_costs = costs: {
++    var c: [tp4_window_ms.len]lanes.config.Cost = undefined;
++    for (&c, tp4_window_ms, 0..) |*x, ms, i| x.* = .{ .width = i + 1, .ms = ms + if (i > 0) tp4_draft_ms else 0 };
++    break :costs c;
++};
++/// A lone round's prices by the stream's context (lanes/depth.zig ContextCost): the drafter's global layer and the
++/// window's global layers read the whole context, so at depth the draft and every window cost more, a window's rows
++/// more than one row. The first node is `tp4_window_ms`/`tp4_draft_ms` (the server's shallow requests); the others
++/// were measured as those were, on the same Sparks: 3,040 by `--exp check,price` (20 a width), 32,768 .. 524,000 by
++/// `--exp deep-draft --price-depths` in one prefill of real text (10 a width; slot 524,304), the window as a captured
++/// graph with every row's head logits plus the keep, the draft with its keep. A round is priced at its stream's own
++/// context (interpolated between two nodes), and a plain round competes with the drafted depths (lanes/depth.zig
++/// `depth`), so a stream deep enough that its drafts do not pay decodes plainly. In a shared round each stream pays
++/// what its rows and its draft cost past `depth_from` (lanes/depth.zig `depthMs`): a deep stream drafts less or not
++/// at all beside shallow streams. Up to `depth_from` (32,768: the nodes there are one price within noise) a stream is
++/// priced as v0.1 prices it (lone rounds by `tp4_costs`, always drafting; shared rounds without depth): on short
++/// prompts a plain round competing lost 4-14 % on bursty acceptance (it went plain in a stretch of misses and waited).
++const depth_costs = [_]lanes.depth.ContextCost{
++    .{ .context = 600, .window_ms = &tp4_window_ms, .draft_ms = tp4_draft_ms },
++    .{ .context = 3_040, .window_ms = &.{ 33.9, 41.1, 47.1, 50.9, 54.3, 61.4, 63.6, 68.2 }, .draft_ms = 8.5 },
++    .{ .context = 32_768, .window_ms = &.{ 35.1, 42.2, 47.7, 52.6, 56.9, 65.4, 66.9, 72.2 }, .draft_ms = 9.4 },
++    .{ .context = 131_072, .window_ms = &.{ 41.1, 48.1, 54.5, 62.2, 69.7, 73.5, 82.2, 90.3 }, .draft_ms = 16.1 },
++    .{ .context = 262_144, .window_ms = &.{ 48.3, 56.1, 65.3, 74.7, 86.8, 91.3, 103.9, 115.9 }, .draft_ms = 23.0 },
++    .{ .context = 524_000, .window_ms = &.{ 63.2, 72.0, 82.7, 99.9, 110.1, 121.7, 140.7, 150.3 }, .draft_ms = 39.7 },
++};
++
++const depth_from: u64 = 32_768;
++
++/// TF_INK2_DRAFT_DEPTH (rank 0; A/B tooling for the depth measurements, not a setting of the release: the recipe never
++/// sets it): `0` prices a round by `tp4_costs` whatever the stream's context (v0.1's prices); `ab` prices new streams
++/// in turn by their context, by `tp4_costs`, and plain (never drafted), each logged as it starts ("lanes depth a/b");
++/// anything else (or unset) by the stream's context (`depth_costs`), the release's behaviour.
++fn depthPriced() bool {
++    const v = std.c.getenv("TF_INK2_DRAFT_DEPTH") orelse return true;
++    return !(v[0] == '0' and v[1] == 0);
++}
++
++fn depthAb() bool {
++    const v = std.c.getenv("TF_INK2_DRAFT_DEPTH") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "ab");
++}
++
++/// A shared forward's ms by its total rows at TP4 (several streams' rows as a captured graph, B2 C2; the same Sparks
++/// and settings), measured by `tf-inkling2-decode --exp shared-price` (medians of 10, after the key's eager first
++/// sighting and its capture) at prompts of 417 .. 600 tokens: R rows as the fewest streams of at most 8 rows each (at
++/// least two; one row: a lone graph step), with every row's head logits.
++/// Rows between two measured counts are interpolated (lanes allocate.zig extendCosts). The lane core weighs a shared
++/// round's rows against them; what a round costs past them (its streams' draft, the host) it learns as the round's
++/// overhead, by streams.
++const shared_ms = [_]struct { u32, f64 }{
++    .{ 1, 33.8 },  .{ 2, 44.7 },   .{ 3, 53.5 },   .{ 4, 56.7 },   .{ 5, 63.0 },   .{ 6, 66.1 },   .{ 7, 74.4 },
++    .{ 8, 77.3 }, .{ 12, 90.4 }, .{ 16, 105.3 }, .{ 20, 126.5 }, .{ 24, 135.6 }, .{ 28, 153.5 }, .{ 32, 161.1 },
++};
++const shared_costs = costs: {
++    var c: [shared_ms.len]lanes.config.Cost = undefined;
++    for (&c, shared_ms) |*x, m| x.* = .{ .width = m[0], .ms = m[1] };
++    break :costs c;
++};
++/// A shared forward's streams and rows at most: the step header's segments; 32 rows keeps a round's forward under the
++/// by-rows exchange's 64 (cuda_xrows.zig) and the head's 128.
++const batch_streams: u32 = engine.max_segs;
++const batch_rows: u32 = 32;
++
++/// TF_INK2_BATCH (rank 0): `0` keeps a forward a stream; anything else (or unset) shares rounds.
++fn batching() bool {
++    const v = std.c.getenv("TF_INK2_BATCH") orelse return true;
++    return !(v[0] == '0' and v[1] == 0);
++}
++
++/// TF_INK2_LATE_MASKS (rank 0): `0` reads a grammar stream's held drafts back before its window (a drafter pass of
++/// the grammar streams' own a round) so the lane core walks them first; anything else (or unset) leaves them in the
++/// verify's step with every other stream's and walks them after (Backend.late_masks: the same draws, one pass).
++fn lateMasks() bool {
++    const v = std.c.getenv("TF_INK2_LATE_MASKS") orelse return true;
++    return !(v[0] == '0' and v[1] == 0);
++}
++
++/// TF_INK2_DRAFT_DEFER (rank 0): `0` runs a stream's draft when the lane core asks for it (its own header, then a
++/// wait for its drafts); anything else (or unset) runs it in the step of the stream's next verify (one header a
++/// round, no wait between the draft and the window: the host gap between them measured 0.0-0.02 ms, so overlapping
++/// the draft with the host would gain nothing).
++fn deferDrafts() bool {
++    const v = std.c.getenv("TF_INK2_DRAFT_DEFER") orelse return true;
++    return !(v[0] == '0' and v[1] == 0);
++}
++
++/// TF_INK2_DRAFT_STREAMS (rank 0): `0` drafts each stream of a shared round in a pass (and a header) of its own;
++/// anything else (or unset) drafts them all in one pass (Leader.draftMany: each stream's drafts the same bits).
++fn draftStreams() bool {
++    const v = std.c.getenv("TF_INK2_DRAFT_STREAMS") orelse return true;
++    return !(v[0] == '0' and v[1] == 0);
++}
++
++/// A shared round's drafter pass at TP4 (one pass for every drafting stream, Leader.draftMany), measured by the
++/// streams gate's pass C (one pass against the streams' own: 8.4 ms for one stream, 21.4 for 3.7, 35.8 for 6.9 at
++/// prompts of 173 .. 600 tokens, 36.6 for 7.1 at 3k): about 3.8 ms plus 4.6 a drafting stream. A drafted shared
++/// round also runs its forward eagerly far more often than a plain one (its key, the rows a stream, rarely repeats;
++/// `shared_ms` are graph prices): 3.5-6.4 ms more at 8-32 rows, priced as 4.2 ms on the pass until the lane core has
++/// measured drafted and plain rounds' overheads apart (lanes/depth.zig DraftPass).
++/// In rounds of more than 4 streams no stream's share may fall below plain's (lanes/depth.zig `fair`): at 8 streams on
++/// distinct prompts the allocation alone left the streams whose drafts land seldom slower than plain (DSpark 71.0-71.3
++/// against plain 74.4-74.6 aggregate; with the rule 74.0 against 74.8), while at 4 streams the rule cost 71 -> 66.
++const shared_pass: lanes.depth.DraftPass = .{ .base_ms = 3.8, .stream_ms = 4.6, .drafted_ms = 4.2, .fair_above = 4 };
++
++/// TF_INK2_DRAFT_PRICE (rank 0): `0` prices a shared round's drafts free and every stream of it drafts at least one
++/// (stage 2c, for A/B); anything else (or unset) prices the pass (`shared_pass`), so a stream drafts only when its
++/// drafts' expected tokens a ms beat the round without them, and a round where none pays runs plain (no pass).
++/// TF_INK2_DRAFT_MOST=N (with the price): a shared round of more than N streams drafts none. TF_INK2_DRAFT_FAIR=N:
++/// the plain-share rule in rounds of more than N streams (0: every shared round; default 4). TF_INK2_DRAFT_LOG=1: the
++/// lane core logs each shared round's decision and observed overhead (diagnostics).
++fn draftPass() ?lanes.depth.DraftPass {
++    if (std.c.getenv("TF_INK2_DRAFT_PRICE")) |v| if (v[0] == '0' and v[1] == 0) return null;
++    var p = shared_pass;
++    p.deferred = deferDrafts();
++    if (std.c.getenv("TF_INK2_DRAFT_LOG")) |v| p.log = v[0] == '1';
++    if (std.c.getenv("TF_INK2_DRAFT_FAIR")) |v| p.fair_above = std.fmt.parseInt(u32, std.mem.span(v), 10) catch p.fair_above;
++    if (std.c.getenv("TF_INK2_DRAFT_MOST")) |v| p.most_streams = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
++    return p;
++}
++
++/// The drafter's acceptance by depth (offline, the checkpoint oracle's greedy replies on four prompts: each depth's
++/// chance given the one before it landed).
++const draft_prior = [_]f64{ 0.84, 0.81, 0.81, 0.81, 0.83, 0.84, 0.86 };
++
++pub const Lanes = struct {
++    x: ic.follow.Leader,
++    gpa: std.mem.Allocator,
++    lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
++    drawn: [ring]u32 = undefined,
++    next: u64 = 0,
++    /// TF_INK2_SCRIPT's tokens (debug), owned.
++    script: []u32 = &.{},
++    sampler: ?sample.Sampler = null,
++    /// When the last `draft` that drafted returned (ns, the awake clock): the next verify measures the host gap
++    /// from it (the done line's `gap`; the draft overlap's case), then clears it.
++    draft_end: ?i96 = null,
++    /// Since start: the gaps measured, their sum (ns), and drafts made.
++    gaps: u64 = 0,
++    gap_ns: u64 = 0,
++    drafts_made: u64 = 0,
++    /// Since start: verify rounds, their rows, and the ns their draw loops took (the host tail after the head).
++    draw_rounds: u64 = 0,
++    draw_rows: u64 = 0,
++    draw_ns: u64 = 0,
++    /// Structured output: a row with its disallowed tokens at -inf (rank 0's draw under a mask), and since start the
++    /// masked draws and the ns they took (the copy, the mask and the draw).
++    masked: []f32 = &.{},
++    masked_rows: u64 = 0,
++    masked_ns: u64 = 0,
++    /// Greedy masked rows whose device argmax the mask refused (their logits brought down after the head).
++    masked_misses: u64 = 0,
++    /// Since start: late windows (Backend.late_masks), and their rows past a draft the grammar refused or its stop
++    /// (drawn unconstrained, never on an accepted path).
++    late_windows: u64 = 0,
++    late_free_rows: u64 = 0,
++    /// TF_INK2_MASK_DUMP (debug): 0 not read yet, 1 off, 2 on; records left (TF_INK2_MASK_DUMP_ROWS, default 4096);
++    /// the flags of the window being drawn (8: late masks).
++    dump_state: u8 = 0,
++    dump_left: u64 = 0,
++    dump_flags: u32 = 0,
++    /// The prompt cache on pages (stage 2d): the server's store (cuda_native.zig snap_store), asked to give kept
++    /// states' pages back before a stream's pages do not fit (the reclaim chain), and whether a state is borrowed
++    /// (a resume in flight: its pages are not reclaimable).
++    store: ?StoreHooks = null,
++
++    fn now(self: *const Lanes) i96 {
++        return std.Io.Clock.awake.now(self.x.e.io).toNanoseconds();
++    }
++
++    pub fn deinit(self: *Lanes) void {
++        var it = self.lanes.valueIterator();
++        while (it.next()) |l| l.dropRow(self.gpa);
++        self.lanes.deinit(self.gpa);
++        if (self.masked.len > 0) self.gpa.free(self.masked);
++        if (self.sampler) |*smp| smp.deinit();
++        if (self.script.len > 0) self.gpa.free(self.script);
++    }
++
++    /// TF_INK2_SCRIPT: a file of token ids (whitespace or commas between them) every stream's reply starts with.
++    pub fn loadScript(self: *Lanes, io: std.Io) !void {
++        const path = std.c.getenv("TF_INK2_SCRIPT") orelse return;
++        const text = try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(path), self.gpa, .limited(1 << 20));
++        defer self.gpa.free(text);
++        var ids: std.ArrayList(u32) = .empty;
++        errdefer ids.deinit(self.gpa);
++        var it = std.mem.tokenizeAny(u8, text, " \t\r\n,[]");
++        while (it.next()) |t| try ids.append(self.gpa, try std.fmt.parseInt(u32, t, 10));
++        self.script = try ids.toOwnedSlice(self.gpa);
++        std.log.warn("inkling2: TF_INK2_SCRIPT: every reply starts with the script's {d} tokens (debug)", .{self.script.len});
++    }
++
++    /// Chunk-invariant: a prompt's state and first token are the same bits however it is cut into forwards (every op
++    /// is row-invariant; tf-inkling2-decode --exp chunks checks 2,048 .. 1-row cuts and seeded random ones against
++    /// the decode check's hash), so the lane host may cap a long prompt's chunks beside live decoders
++    /// (--decode-share: 512 rows a step, the share's debt between them).
++    pub fn backend(self: *Lanes) be.Backend {
++        return .{ .ptr = self, .vtable = &vt, .chunk_invariant = true, .late_masks = lateMasks() };
++    }
++
++    const vt: be.Backend.VTable = .{
++        .prefill = prefillFn,
++        .prefill_step = prefillStepFn,
++        .cancel_prefill = cancelPrefillFn,
++        .first = firstFn,
++        .queue = queueFn,
++        .read = readFn,
++        .verify = verifyFn,
++        .keep = keepFn,
++        .draft = draftFn,
++        .held = heldFn,
++        .first_masked = firstMaskedFn,
++        .release = releaseFn,
++    };
++
++    /// One row a window without the drafter (two for a forced token; any width is exact); with it, the pending row
++    /// and up to 7 held drafts. Several streams' windows share a forward unless TF_INK2_BATCH=0.
++    pub fn facts(self: *const Lanes) lanes.Model {
++        const shared = batching();
++        if (self.x.e.drafter != null) return .{
++            .copy_drafts = false,
++            .lone_copies = false,
++            .root_copies = false,
++            .context_copies = false,
++            .exact_width = ic.state.spec_rows,
++            .gpu_tokens = false,
++            .mtp = true,
++            .speculate = true,
++            .speculate_early = false,
++            .drafts = ic.dspark.drafts,
++            .draft_prior = &draft_prior,
++            .mtp_step_ms = 0, // the draft is a round's fixed cost, in tp4_costs (lone) or the round's overhead (shared)
++            .window_costs = &tp4_costs,
++            .window_costs_lone = shared,
++            .context_costs = if (depthPriced()) &depth_costs else &.{},
++            .depth_from = depth_from,
++            .depth_ab = depthAb(),
++            .draft_streams = shared and draftStreams(), // a shared round's drafts in one call: one pass for all
++            .draft_pass = if (shared and draftStreams()) draftPass() else null,
++            .hidden_rows = shared,
++            .batch_rows = batch_rows,
++            .max_streams = batch_streams,
++            .shared_costs = if (shared) &shared_costs else &.{},
++        };
++        return .{
++            .copy_drafts = false,
++            .lone_copies = false,
++            .root_copies = false,
++            .context_copies = false,
++            .exact_width = if (shared) 2 else 1,
++            .gpu_tokens = false,
++            .mtp = false,
++            .speculate = false,
++            .speculate_early = false,
++            .drafts = 0,
++            .draft_streams = false,
++            .hidden_rows = shared,
++            .batch_rows = batch_rows,
++            .max_streams = batch_streams,
++            .shared_costs = if (shared) &shared_costs else &.{},
++        };
++    }
++
++    /// The widest window `verify` takes (the server's row limit).
++    pub fn widest(self: *const Lanes) u32 {
++        return if (self.x.e.drafter != null) ic.state.spec_rows else self.facts().exact_width;
++    }
++
++    fn of(ptr: *anyopaque) *Lanes {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    fn take(self: *Lanes, token: u32) u64 {
++        const h = self.next;
++        self.drawn[h % ring] = token;
++        self.next += 1;
++        return h;
++    }
++
++    fn freeSlot(self: *const Lanes) u32 {
++        var slot: u32 = 0;
++        while (true) : (slot += 1) {
++            var it = self.lanes.valueIterator();
++            const taken = while (it.next()) |l| {
++                if (l.slot == slot) break true;
++            } else false;
++            if (!taken) return slot;
++        }
++    }
++
++    /// The row's draw on the host: greedy, or the stream's sampling keyed at `position` over the whole vocabulary
++    /// (sample.zig: the lane core's keyed sampler, its temperature floor, exact top_k and top_p). TF_INK2_SCRIPT
++    /// (debug): a stream's k-th draw is the script's k-th token while it lasts (the forwards still run; for the text
++    /// layer's checks).
++    fn draw(self: *Lanes, logits: []const f32, s: *const lanes.Stream, position: u64) !u32 {
++        const k = position -| s.prompt_len;
++        if (k < self.script.len) return self.script[k];
++        const v = s.sampling orelse return lanes.gpu_rule.argmax(logits);
++        if (!(v.temperature > 0)) return lanes.gpu_rule.argmax(logits);
++        if (self.sampler == null) self.sampler = .{ .gpa = self.gpa };
++        return self.sampler.?.draw(logits, v, position);
++    }
++
++    /// Whether the row at `position` of `s` is drawn greedily with nothing else read from its logits: no script token
++    /// there, no logprobs, greedy sampling. A forward whose every head row is such a row needs only the device's
++    /// argmax rows (Engine.want_logits, B2 C4); a grammar's row among them brings its logits down only when its mask
++    /// refuses the argmax (`drawAt`).
++    fn greedyRow(self: *const Lanes, s: *const lanes.Stream, position: u64) bool {
++        if (s.logprobs != null or s.prompt_logprobs != null) return false;
++        return self.greedyDraw(s, position);
++    }
++
++    /// Whether the draw at `position` of `s` is greedy (no script token there, greedy sampling).
++    fn greedyDraw(self: *const Lanes, s: *const lanes.Stream, position: u64) bool {
++        if (position -| s.prompt_len < self.script.len) return false;
++        const v = s.sampling orelse return true;
++        return !(v.temperature > 0);
++    }
++
++    /// The draw of head row `r` of the last forward at `position` of `s` (`mask`: the grammar's allowed tokens there;
++    /// empty: none): a greedy row from the device's argmax (each the host argmax of its row: B2 C4's op check), else
++    /// `draw` over the row's logits, under the mask when there is one (`drawMasked`).
++    fn drawAt(self: *Lanes, r: usize, s: *const lanes.Stream, position: u64, mask: []const u32) !u32 {
++        const t = try self.drawRow(r, s, position, mask);
++        if (mask.len > 0 and self.dumping()) {
++            const dev: ?u32 = if (self.x.e.argmax_on) (try self.x.e.argmaxRows())[r] else null;
++            const refused = if (dev) |d| !lanes.grammar.allows(mask, d) else false;
++            const flags = @as(u32, @intFromBool(refused)) | @as(u32, @intFromBool(!self.greedyDraw(s, position))) << 1 | self.dump_flags;
++            self.dumpRow(try self.x.e.fetchRow(r), mask, s, position, dev, t, flags);
++        }
++        return t;
++    }
++
++    fn drawRow(self: *Lanes, r: usize, s: *const lanes.Stream, position: u64, mask: []const u32) !u32 {
++        if (self.greedyRow(s, position) and self.x.e.argmax_on) {
++            const t = (try self.x.e.argmaxRows())[r];
++            if (mask.len == 0 or lanes.grammar.allows(mask, t)) {
++                if (mask.len > 0) self.masked_rows += 1;
++                return t;
++            }
++            // the row's best is not allowed: its logits (still on the device), and the largest allowed value
++            self.masked_misses += 1;
++            return self.drawMasked(try self.x.e.fetchRow(r), mask, s, position);
++        }
++        const row = try self.x.e.logitsRow(r);
++        if (mask.len == 0) return self.draw(row, s, position);
++        return self.drawMasked(row, mask, s, position);
++    }
++
++    /// The row's draw under a grammar mask: `draw`'s rule over the row with every token the mask does not allow at
++    /// -inf (ids past the mask's words too). Greedy: the first largest allowed value, read in place (`argmaxMasked`);
++    /// sampled: the stream's keyed sampler over a masked copy of the row.
++    fn drawMasked(self: *Lanes, logits: []const f32, mask: []const u32, s: *const lanes.Stream, position: u64) !u32 {
++        const t0 = self.now();
++        defer {
++            self.masked_rows += 1;
++            self.masked_ns += @intCast(@max(0, self.now() - t0));
++        }
++        if (self.greedyDraw(s, position)) return argmaxMasked(logits, mask);
++        if (self.masked.len < logits.len) {
++            if (self.masked.len > 0) self.gpa.free(self.masked);
++            self.masked = &.{};
++            self.masked = try self.gpa.alloc(f32, logits.len);
++        }
++        const row = self.masked[0..logits.len];
++        try maskRow(row, logits, mask);
++        return self.draw(row, s, position);
++    }
++
++    /// TF_INK2_MASK_DUMP=PATH (rank 0, debug) is set: masked draws are recorded (`dumpRow`).
++    fn dumping(self: *Lanes) bool {
++        if (self.dump_state == 0) {
++            self.dump_state = 1;
++            if (std.c.getenv("TF_INK2_MASK_DUMP") != null) {
++                self.dump_state = 2;
++                self.dump_left = 4096;
++                if (std.c.getenv("TF_INK2_MASK_DUMP_ROWS")) |v| self.dump_left = std.fmt.parseInt(u64, std.mem.span(v), 10) catch self.dump_left;
++                std.log.warn("inkling2: TF_INK2_MASK_DUMP: the first {d} masked draws' rows and masks are appended to {s} (debug)", .{ self.dump_left, std.mem.span(std.c.getenv("TF_INK2_MASK_DUMP").?) });
++            }
++        }
++        return self.dump_state == 2 and self.dump_left > 0;
++    }
++
++    /// One masked draw appended to TF_INK2_MASK_DUMP (little-endian): u32 magic 0x444d4654 ("TFMD"), version 1,
++    /// position (u64), the stream's prompt length (u64), the device argmax (0xffffffff: none), the pick, the row's
++    /// width U, the mask's words W, flags (1: the mask refused the device argmax, 2: sampled, 4: the first token from
++    /// the prompt's kept row, 8: a late window's row), 0; then the W mask words (u32) and the U logits (f32) the draw
++    /// read. Errors are logged, never returned (a debug aid).
++    fn dumpRow(self: *Lanes, logits: []const f32, mask: []const u32, s: *const lanes.Stream, position: u64, dev: ?u32, pick: u32, flags: u32) void {
++        self.dump_left -= 1;
++        const path = std.c.getenv("TF_INK2_MASK_DUMP") orelse return;
++        const f = std.c.fopen(path, "ab") orelse {
++            std.log.err("inkling2: TF_INK2_MASK_DUMP: cannot open {s}", .{std.mem.span(path)});
++            return;
++        };
++        defer _ = std.c.fclose(f);
++        const pl: u64 = s.prompt_len;
++        const head = [_]u32{ 0x444d4654, 1, @truncate(position), @truncate(position >> 32), @truncate(pl), @truncate(pl >> 32), dev orelse 0xffff_ffff, pick, @intCast(logits.len), @intCast(mask.len), flags, 0 };
++        const hb = std.mem.asBytes(&head);
++        var n = std.c.fwrite(hb, 1, hb.len, f);
++        n += std.c.fwrite(std.mem.sliceAsBytes(mask).ptr, 1, mask.len * 4, f);
++        n += std.c.fwrite(std.mem.sliceAsBytes(logits).ptr, 1, logits.len * 4, f);
++        if (n != hb.len + mask.len * 4 + logits.len * 4) std.log.err("inkling2: TF_INK2_MASK_DUMP: short write", .{});
++    }
++
++    /// A prompt begins: the stream's slot, and on the KV page pool its pages (`pagesFor`).
++    fn opening(self: *Lanes, s: *lanes.Stream) !*Lane {
++        const ids = s.prompt();
++        if (ids.len == 0) return error.EmptyPrompt;
++        if (s.images.len > 0) return error.NoVision;
++        if (ids.len + s.max_new + 1 > self.x.e.capacity()) return error.PromptTooLong;
++        // its slot, or the lowest one no other stream holds
++        const again = self.lanes.getPtr(s) != null;
++        const slot = if (self.lanes.getPtr(s)) |l| had: {
++            l.dropRow(self.gpa);
++            break :had l.slot;
++        } else self.freeSlot();
++        try self.lanes.put(self.gpa, s, .{ .slot = slot });
++        errdefer {
++            _ = self.lanes.remove(s);
++            self.x.e.unmapPages(slot);
++        }
++        s.cached = 0;
++        // without the drafter no row past a window's first is rolled back (the convolutions keep their inputs for a
++        // keep only with it), but a lone grammar stream's window may take the grammar's forced text as drafts, which
++        // its masked draw can refuse (another spelling of the text): such a stream takes no drafts (forced tokens one
++        // a round)
++        if (self.x.e.drafter == null and s.grammar != null) s.drafts = false;
++        const l = self.lanes.getPtr(s).?;
++        // a kept state's pages adopted and its fixed part restored (the prompt cache on pages), else the slot's pages
++        l.from = if (s.prompt_logprobs != null) 0 else try self.resumeFrom(s, slot, ids.len, again);
++        if (l.from == 0) try self.pagesFor(s, slot, ids.len, s.max_new, again, null);
++        return l;
++    }
++
++    /// On the KV page pool (cuda_pages.zig): slot `slot` takes the pages of a prompt of `prompt` tokens, its reply and
++    /// one verify window (one run of consecutive pages when one is free), and every rank maps them; `k`: a kept state
++    /// it resumes, whose pages are the first of them (adopted) and the rest taken after them. Kept states give their
++    /// pages back first when the pages do not fit (`reclaim`). LaneMemory: not now (the lane host queues the request
++    /// again); RequestOverPool: never (refused by name).
++    /// `again`: the stream opens again on its slot: the pages it holds serve (none a kept state holds), grown in place
++    /// when it needs more; a new stream gives back whatever the slot still held first.
++    fn pagesFor(self: *Lanes, s: *const lanes.Stream, slot: u32, prompt: usize, max_new: usize, again: bool, k: ?*const ic.snap.Kept) !void {
++        const p = self.x.e.pool orelse return;
++        if (!again) self.x.e.unmapPages(slot);
++        const n = ic.pages.need(prompt, max_new, ic.state.spec_rows, p.entries);
++        const adopt: []const u32 = if (k) |kk| kk.pages else &.{};
++        if (n <= p.total()) self.reclaim(s, n -| adopt.len);
++        _ = try self.x.openPages(slot, n, adopt);
++    }
++
++    /// The reclaim chain (`reclaimChain`): kept states give their pages back until `want` pages are available, or
++    /// none is left to give; past the lane host's protection only when no other stream holds a lane (this stream's
++    /// is in `lanes` already).
++    fn reclaim(self: *Lanes, s: *const lanes.Stream, want: usize) void {
++        const p = self.x.e.pool orelse return;
++        const a = &(p.alloc orelse return);
++        if (a.available() >= want) return;
++        const hooks = self.store orelse return;
++        const before = a.nkept;
++        const r = reclaimChain(a, hooks, s.reuse.saved, want, self.lanes.count() <= 1);
++        if (@import("builtin").is_test) return;
++        std.log.info("inkling2 pages: the prompt cache gave back kept pages for a stream needing {d}: {d} kept pages before, {d} after, {d} available{s}{s}", .{ want, before, a.nkept, a.available(), if (r.unguarded) " (no other stream runs: states queued requests would resume given back too)" else "", if (r.ok) "" else " (not enough: the request waits)" });
++    }
++
++    /// The lane host's admission on the KV page pool: a slot is free and the request's pages are available now, or
++    /// once kept states no resume borrows give theirs back (the reclaim chain at its open: guarded, then with no other
++    /// stream running unguarded, so on an idle server the open frees every page counted here). A request larger than the
++    /// whole pool is let through, so its open refuses it by name rather than it waiting.
++    pub fn fits(self: *Lanes, prompt: usize, max_tokens: usize) bool {
++        const p = self.x.e.pool orelse return true;
++        const n = ic.pages.need(prompt, max_tokens, ic.state.spec_rows, p.entries);
++        if (n > p.total()) return true;
++        const slot_free = self.lanes.count() < p.slots;
++        const ok = slot_free and (p.fits(n) or p.fits(n -| self.reclaimable()));
++        defer p.show(); // /health's counts (B3): the pool and the wait as admission saw them
++        if (ok) {
++            p.waiting = null;
++        } else if (slot_free and p.waiting != n) {
++            // a new request waiting for pages (logged once, however often the lane host asks again)
++            p.waiting = n;
++            p.waits += 1;
++            const a = p.alloc.?;
++            std.log.info("inkling2 pages: a request needing {d} pages ({d} positions) waits for them: {d} of {d} pages available ({d} kept states'), {d} of {d} slots taken; waits since start {d}", .{ n, n * ic.pages.page_rows, a.available(), a.total(), a.nkept, self.lanes.count(), p.slots, p.waits });
++        }
++        return ok;
++    }
++
++    /// Pages the reclaim chain could free: those only kept states hold, but for states a resume borrows.
++    fn reclaimable(self: *Lanes) usize {
++        const p = self.x.e.pool orelse return 0;
++        const hooks = self.store orelse return 0;
++        var buf: [256][]const u32 = undefined;
++        const protect = ic.snap.protectedPages(self.x.e, hooks.ctx, hooks.borrowed, &buf);
++        return p.reclaimable(protect);
++    }
++
++    /// The stream's kept state resumed in its slot on every rank (the prompt cache on pages): its pages adopted
++    /// (`pagesFor`) and its fixed part restored; where its pass starts. A state refused before any rank moved is the
++    /// stream's alone: its pass starts at 0 (on fresh pages) and the store drops it. LaneMemory (its pages do not fit
++    /// now) returns, so the request waits with its state.
++    fn resumeFrom(self: *Lanes, s: *lanes.Stream, slot: u32, len: usize, again: bool) !usize {
++        const saved = s.reuse.saved orelse return 0;
++        const k: *const ic.snap.Kept = @ptrCast(@alignCast(saved));
++        const refused: anyerror = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at) error.SnapshotOutOfStep else ok: {
++            self.pagesFor(s, slot, len, s.max_new, again, k) catch |err| switch (err) {
++                error.LaneMemory, error.RequestOverPool => return err,
++                else => break :ok err,
++            };
++            ic.snap.restore(self.x, slot, k.*, null) catch |err| break :ok err;
++            s.cached = k.at;
++            return k.at;
++        };
++        s.reuse_failed = true;
++        s.reuse_error = refused;
++        return 0;
++    }
++
++    /// The prompt pass passed `at` (a chunk's end, or a mark captured inside it): the store keeps the state there when
++    /// it marked it.
++    fn mark(s: *lanes.Stream, at: usize) void {
++        const hook = s.reuse.hook orelse return;
++        if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) == null) return;
++        hook.at(hook.ptr, s, @intCast(at));
++    }
++
++    /// The stream's slot (the prompt cache's saves find it by the stream).
++    pub fn slotOf(self: *const Lanes, s: *const lanes.Stream) ?u32 {
++        return if (self.lanes.get(s)) |l| l.slot else null;
++    }
++
++    /// The chunk of the prompt from `at`; true when it ends the prompt (the first token drawn).
++    fn chunk(self: *Lanes, s: *lanes.Stream, l: *Lane, at: usize, max_rows: usize) !bool {
++        const ids = s.prompt();
++        if (s.isCancelled()) return error.Cancelled; // decided before the step goes out: every rank runs what it is sent
++        // the prompt cache's marks: those inside the chunk are captured by its forward (cuda_snap.zig, stage 1b; more
++        // than max_caps end it at the next), or with TF_INK2_SNAP_SPLIT=1 every mark ends a chunk (stage 1); each
++        // mark the forward passed is kept after it
++        const want = @min(ids.len - at, if (max_rows == 0) engine.prompt_rows else @min(max_rows, engine.prompt_rows));
++        var caps: [ic.snap.max_caps]u32 = undefined;
++        const split = ic.snap.splitAtMarks() or self.x.e.snap.cap == null;
++        const in: ic.snap.Inside = if (split) .{ .n = 0, .rows = ic.snap.rowsTo(s.reuse.marks, at, want) } else ic.snap.inside(s.reuse.marks, at, want, &caps);
++        const n = in.rows;
++        const last = at + n == ids.len;
++        try self.flush(); // a deferred draft reads its stream's taps: before this forward writes them
++        if (in.n > 0 and s.reuse.hook != null) try ic.snap.capture(self.x, l.slot, at, n, caps[0..in.n]);
++        self.x.e.want_logits = !(last and self.greedyRow(s, ids.len) and s.grammar == null); // a grammar's row is kept
++        defer self.x.e.want_logits = true;
++        try self.x.forward(l.slot, at, ids[at..][0..n], if (last) .{ .lo = n - 1, .n = 1 } else null);
++        if (!last) {
++            keepMarks(s, at, n);
++            l.fill = at + n;
++            // the lane host bills this step's time to decoders (--decode-share): end it on the device, or its tail
++            // lands in the next decode round's time and the share's debt sees only the launches
++            if (s.settle_step) try self.x.e.stream.synchronize();
++            return false;
++        }
++        if (s.grammar != null) {
++            // structured output: the row is kept until the lane core asks for the first token, under its mask
++            // (`first_masked`) or without one (`first`)
++            l.dropRow(self.gpa);
++            l.first_row = try self.gpa.dupe(f32, try self.x.e.logitsRow(0));
++            l.first = null;
++        } else l.first = self.take(try self.drawAt(0, s, ids.len, &.{}));
++        l.fill = null;
++        keepMarks(s, at, n);
++        return true;
++    }
++
++    /// The store keeps the states at its marks in (at, at + n], the rows the last forward ran.
++    fn keepMarks(s: *lanes.Stream, at: usize, n: usize) void {
++        for (s.reuse.marks) |m| if (m > at and m <= at + n) mark(s, m);
++    }
++
++    fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
++        const self = of(ptr);
++        const l = try self.opening(s);
++        errdefer self.dropLane(s);
++        var at: usize = l.from;
++        while (!try self.chunk(s, l, at, 0)) at = l.fill.?;
++    }
++
++    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream, max_rows: u32) anyerror!bool {
++        const self = of(ptr);
++        const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
++        const l = if (going == null) try self.opening(s) else self.lanes.getPtr(s).?;
++        errdefer self.dropLane(s); // a later pass of the stream opens it again (the lane core releases only a cancel)
++        return self.chunk(s, l, going orelse l.from, max_rows);
++    }
++
++    /// A stream whose prompt pass failed leaves its slot, and its pages go back to the pool (`release` may not come).
++    fn dropLane(self: *Lanes, s: *lanes.Stream) void {
++        if (self.lanes.getPtr(s)) |l| {
++            l.dropRow(self.gpa);
++            self.x.e.unmapPages(l.slot);
++        }
++        _ = self.lanes.remove(s);
++    }
++
++    fn cancelPrefillFn(ptr: *anyopaque, s: *lanes.Stream) !void {
++        const l = of(ptr).lanes.getPtr(s) orelse return;
++        l.fill = null;
++    }
++
++    fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
++        const self = of(ptr);
++        if (position != s.prompt_len) return error.PositionMismatch;
++        const l = self.lanes.getPtr(s) orelse return error.UnknownStream;
++        if (l.first == null and l.first_row.len > 0) {
++            // a grammar stream whose first token the grammar leaves free: the kept row's own draw
++            defer l.dropRow(self.gpa);
++            l.first = self.take(try self.draw(l.first_row, s, position));
++        }
++        return l.first orelse error.NoFirstToken;
++    }
++
++    /// The first token drawn among `mask`'s allowed tokens from the prompt's kept last row (a grammar stream's).
++    fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
++        const self = of(ptr);
++        if (position != s.prompt_len) return error.PositionMismatch;
++        const l = self.lanes.getPtr(s) orelse return error.UnknownStream;
++        if (l.first_row.len == 0) return error.NoFirstToken;
++        defer l.dropRow(self.gpa);
++        const t = try self.drawMasked(l.first_row, mask, s, position);
++        if (self.dumping()) self.dumpRow(l.first_row, mask, s, position, null, t, 4 | @as(u32, @intFromBool(!self.greedyDraw(s, position))) << 1);
++        l.first = self.take(t);
++        return l.first.?;
++    }
++
++    fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
++        _ = .{ ptr, s, feed, position };
++        return error.NotPipelined;
++    }
++
++    fn readFn(ptr: *anyopaque, handle: u64) anyerror!u32 {
++        const self = of(ptr);
++        if (handle >= self.next or self.next - handle > ring) return error.NoSuchToken;
++        return self.drawn[handle % ring];
++    }
++
++    /// The stream's accepted rows sent to the ranks, if a keep is still pending (no draft came after it).
++    fn settle(self: *Lanes, l: *Lane) !void {
++        const n = l.kept orelse return;
++        l.kept = null;
++        try self.x.keep(l.slot, n);
++    }
++
++    /// Every deferred draft run now, in one pass (each its keep, then the blocks; their drafts to the host).
++    fn flush(self: *Lanes) !void {
++        return self.flushWhere(.all);
++    }
++
++    /// `flush` of every deferred draft, or of grammar streams' alone.
++    fn flushWhere(self: *Lanes, which: enum { all, grammar }) !void {
++        var items: [engine.max_segs]engine.DraftItem = undefined;
++        var keeps: [engine.max_segs]usize = undefined;
++        var outs: [engine.max_segs]*[ic.dspark.drafts]u32 = undefined;
++        var m: usize = 0;
++        var it = self.lanes.valueIterator();
++        while (it.next()) |l| {
++            const p = l.pending orelse continue;
++            if (which == .grammar and p.stream.grammar == null) continue;
++            l.pending = null;
++            self.stale(l.slot, p.stream);
++            items[m] = .{ .slot = l.slot, .anchor = p.anchor };
++            keeps[m] = p.n;
++            outs[m] = &l.held;
++            m += 1;
++            if (m == engine.max_segs) {
++                try self.x.draftMany(items[0..m], keeps[0..m], outs[0..m]);
++                m = 0;
++            }
++        }
++        if (m == 1) try self.x.draft(items[0].slot, keeps[0], items[0].anchor, outs[0]) else if (m > 1) try self.x.draftMany(items[0..m], keeps[0..m], outs[0..m]);
++    }
++
++    /// A draft about to run from taps another forward wrote since its stream's last one (it changes no output, only
++    /// what it proposes): counted.
++    fn stale(self: *Lanes, slot: u32, s: *lanes.Stream) void {
++        const st = self.x.e.slots.items[slot] orelse return;
++        if (st.last_fwd == self.x.e.forwards) return;
++        s.stale_drafts += 1;
++        self.x.e.stale_drafts += 1;
++    }
++
++    /// Every window in one forward (a segment each, in slot order: the captured forward's key is the same whatever
++    /// order the lane core sends the streams in, and every op is row-invariant, so a stream's bits do not depend on
++    /// where its rows sit): the pending row, then its held drafts (or host drafts); every row's draw.
++    fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
++        const self = of(ptr);
++        if (self.draft_end) |t| {
++            // the host gap: from the last draft's return to this verify (each drafted window's stream counts it)
++            const gap: u64 = @intCast(@max(0, self.now() - t));
++            self.draft_end = null;
++            self.gaps += 1;
++            self.gap_ns += gap;
++            for (windows) |w| if (w.held > 0) {
++                w.stream.draft_gap_ns += gap;
++                w.stream.draft_gaps += 1;
++            };
++        }
++        if (windows.len > engine.max_segs) return error.TooManyWindows;
++        // deferred drafts of streams this forward does not verify run first (it overwrites the taps they read)
++        {
++            var it = self.lanes.iterator();
++            const others = while (it.next()) |kv| {
++                if (kv.value_ptr.pending == null) continue;
++                for (windows) |w| {
++                    if (w.stream == kv.key_ptr.*) break;
++                } else break true;
++            } else false;
++            if (others) try self.flush();
++        }
++        // the windows in slot order (ord[i]: the window of segment i); row0[j]: window j's first row in the forward
++        var ord: [engine.max_segs]usize = undefined;
++        var row0: [engine.max_segs]usize = undefined;
++        {
++            var slot_of: [engine.max_segs]u32 = undefined;
++            for (windows, 0..) |w, j| {
++                slot_of[j] = (self.lanes.getPtr(w.stream) orelse return error.UnknownStream).slot;
++                var k = j;
++                while (k > 0 and slot_of[ord[k - 1]] > slot_of[j]) : (k -= 1) ord[k] = ord[k - 1];
++                ord[k] = j;
++            }
++        }
++        var segs: [engine.max_segs]engine.Segment = undefined;
++        var ids: [engine.max_segs * ic.state.spec_rows]u32 = undefined;
++        var keeps: [engine.max_segs]ic.follow.Leader.Keep = @splat(.{});
++        var outs: [engine.max_segs]*[ic.dspark.drafts]u32 = undefined;
++        var m: usize = 0; // windows whose drafts their own step makes (in segment order, as the step's walk is)
++        var R: usize = 0;
++        for (ord[0..windows.len], 0..) |wj, i| {
++            const w = windows[wj];
++            const rows = w.rows();
++            if (w.parents != null) return error.TreesNotServed;
++            if (rows > self.widest()) return error.DraftsNotServed;
++            _ = try maskWords(w, self.x.e.vocab());
++            const l = self.lanes.getPtr(w.stream) orelse return error.UnknownStream;
++            if (w.held > l.held_n) return error.NoHeldDrafts;
++            try self.settle(l);
++            const st = self.x.e.slots.items[l.slot] orelse return error.UnknownStream;
++            // a deferred draft keeps its rows first: the window starts past them
++            const pos = if (l.pending) |p| st.last_pos0 + p.n else self.x.e.pos(l.slot);
++            for (w.positions, 0..) |p, r| if (p != pos + 1 + r) return error.PositionMismatch;
++            if (pos + rows > self.x.e.capacity()) return error.PastContext;
++            ids[R] = w.pending;
++            if (l.pending) |p| {
++                if (p.anchor != w.pending) return error.AnchorMismatch;
++                keeps[i] = .{ .n = p.n, .draft = w.held > 0 and w.tokens.len == 0 };
++                if (keeps[i].draft) {
++                    self.stale(l.slot, p.stream);
++                    @memset(ids[R + 1 ..][0..w.held], 0); // made on the device in the step
++                    outs[m] = &l.held;
++                    m += 1;
++                } else @memcpy(ids[R + 1 ..][0..w.tokens.len], w.tokens);
++            } else {
++                const drafts = if (w.held > 0) l.held[0..w.held] else w.tokens;
++                @memcpy(ids[R + 1 ..][0..drafts.len], drafts);
++            }
++            segs[i] = .{ .slot = l.slot, .pos0 = pos, .rows = rows };
++            row0[wj] = R;
++            R += rows;
++        }
++        if (R > engine.head_rows) return error.BadRows;
++        var deferred = false;
++        for (keeps[0..windows.len]) |k| deferred = deferred or k.n > 0 or k.draft;
++        // the rows drawn greedily from the argmax alone bring down no logits (B2 C4); the others (sampled, logprobs,
++        // a grammar's) bring down their own
++        var need: u32 = 0;
++        for (windows, row0[0..windows.len]) |w, r0| for (w.positions, 0..) |p, r| {
++            if (!self.greedyRow(w.stream, p)) need |= @as(u32, 1) << @intCast(r0 + r);
++        };
++        self.x.e.want_logits = need != 0;
++        self.x.e.want_rows = need;
++        defer {
++            self.x.e.want_logits = true;
++            self.x.e.want_rows = engine.all_rows;
++        }
++        if (deferred) {
++            try self.x.forwardDrafted(segs[0..windows.len], ids[0..R], keeps[0..windows.len]);
++            for (windows) |w| self.lanes.getPtr(w.stream).?.pending = null;
++            if (m > 0) try self.x.e.proposals(outs[0..m]); // the drafts the step made, after its head
++        } else try self.x.forwardMany(segs[0..windows.len], ids[0..R], .{ .lo = 0, .n = R });
++        const t0 = self.now();
++        var late: std.heap.ArenaAllocator = .init(self.gpa);
++        defer late.deinit();
++        defer self.dump_flags = 0;
++        for (windows, out, row0[0..windows.len]) |w, *o, r0| {
++            const l = self.lanes.getPtr(w.stream).?;
++            const rows = w.rows();
++            const drafts = if (w.held > 0) l.held[0..w.held] else w.tokens;
++            var masks = w.masks;
++            var masked = rows; // rows with a mask (when there are masks): from row 0
++            if (w.late_masks) {
++                // the grammar walks the pending token and the drafts the step made (on the host since `proposals`)
++                if (w.masks.len > 0 or w.tokens.len > 0 or w.parents != null or w.held == 0) return error.LateWindowShape;
++                const g = w.stream.grammar orelse return error.LateWindowShape;
++                const chain = try late.allocator().alloc(u32, rows);
++                chain[0] = w.pending;
++                @memcpy(chain[1..], drafts);
++                const gw = try g.late(late.allocator(), chain);
++                masks = gw.masks;
++                masked = gw.rows.len;
++                self.late_windows += 1;
++                self.late_free_rows += rows - masked;
++            }
++            const words = if (masks.len == 0) 0 else masks.len / masked;
++            if (words > 0 and (masks.len != masked * words or words * 32 < self.x.e.vocab())) return error.InvalidGrammarMasks;
++            self.dump_flags = if (w.late_masks) 8 else 0;
++            for (0..rows) |r| o.sampled[r] = try self.drawAt(r0 + r, w.stream, w.positions[r], if (words == 0 or r >= masked) &.{} else masks[r * words ..][0..words]);
++            @memcpy(o.drafts[0..drafts.len], drafts);
++            l.held_n = 0;
++        }
++        self.draw_rounds += 1;
++        self.draw_rows += R;
++        self.draw_ns += @intCast(@max(0, self.now() - t0));
++    }
++
++    /// The accepted rows of each window (a chain: rows 0 .. n - 1), sent with the stream's next draft or window.
++    fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
++        const self = of(ptr);
++        for (windows, paths) |w, path| {
++            if (path.len == 0) return error.EmptyPath;
++            for (path, 0..) |r, i| if (r != i) return error.TreesNotServed;
++            const l = self.lanes.getPtr(w.stream) orelse return error.UnknownStream;
++            if (self.x.e.drafter == null) {
++                if (path.len != w.rows()) return error.RollbackNotServed;
++                continue; // windows of one row: nothing to keep
++            }
++            if (l.pending) |p| {
++                if (p.n != path.len) return error.KeepMismatch;
++                continue; // the deferred draft keeps them
++            }
++            l.kept = path.len;
++        }
++    }
++
++    /// The drafter's block for each stream from its accepted rows (or its prompt's last row): the anchor is the token
++    /// after the last kept row; the drafts are held for the stream's next window.
++    fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
++        const self = of(ptr);
++        if (self.x.e.drafter == null) return error.NoDraftHead;
++        var drafted = false;
++        defer if (drafted) {
++            self.draft_end = self.now();
++        };
++        if (requests.len > engine.max_segs) return error.TooManyWindows;
++        var items: [engine.max_segs]engine.DraftItem = undefined;
++        var keeps: [engine.max_segs]usize = undefined;
++        var outs: [engine.max_segs]*[ic.dspark.drafts]u32 = undefined;
++        var m: usize = 0;
++        for (requests) |r| {
++            if (r.lanes != null) return error.TreesNotServed;
++            const l = self.lanes.getPtr(r.stream) orelse return error.UnknownStream;
++            const slot_state = self.x.e.slots.items[l.slot] orelse return error.UnknownStream;
++            const anchor, const n = if (r.rows) |rows| a: {
++                for (rows, 0..) |row, j| if (row != j) return error.TreesNotServed;
++                if (rows.len == 0 or r.follow.len < rows.len) return error.EmptyPath;
++                break :a .{ r.follow[rows.len - 1], rows.len };
++            } else .{ self.value(r.first orelse return error.NoFirstToken), slot_state.last_rows };
++            if (r.position != slot_state.last_pos0 + n + 1) return error.PositionMismatch;
++            l.kept = null;
++            if (r.depth == 0) {
++                try self.x.keep(l.slot, n);
++                l.held_n = 0;
++                continue;
++            }
++            if (slot_state.last_pos0 + n + ic.dspark.block > self.x.e.capacity()) {
++                try self.x.keep(l.slot, n); // too near the end of the context for a block: plain rounds
++                l.held_n = 0;
++                continue;
++            }
++            if (l.pending != null) try self.flush(); // (not expected: a verify consumes it)
++            if (!deferDrafts()) self.stale(l.slot, r.stream); // deferred: counted where it runs
++            if (deferDrafts()) {
++                l.pending = .{ .n = n, .anchor = anchor, .stream = r.stream };
++            } else if (!draftStreams()) {
++                try self.x.draft(l.slot, n, anchor, &l.held);
++            } else {
++                items[m] = .{ .slot = l.slot, .anchor = anchor };
++                keeps[m] = n;
++                outs[m] = &l.held;
++                m += 1;
++            }
++            l.held_n = @min(r.depth, ic.dspark.drafts);
++            drafted = true;
++            self.drafts_made += 1;
++        }
++        // every drafting stream's block in one pass (one header)
++        if (m == 1) try self.x.draft(items[0].slot, keeps[0], items[0].anchor, outs[0]) else if (m > 1) try self.x.draftMany(items[0..m], keeps[0..m], outs[0..m]);
++    }
++
++    /// The host tail since start (one log line): the heads' downloads (the logits, or the argmax rows alone) and the
++    /// verify rounds' draw loops, ms each and rows on average.
++    fn tail(self: *const Lanes) void {
++        const c = self.x.e.counts;
++        const per = struct {
++            fn ms(ns: u64, n: u64) f64 {
++                return if (n == 0) 0 else @as(f64, @floatFromInt(ns)) / 1e6 / @as(f64, @floatFromInt(n));
++            }
++            fn rows(r: u64, n: u64) f64 {
++                return if (n == 0) 0 else @as(f64, @floatFromInt(r)) / @as(f64, @floatFromInt(n));
++            }
++        };
++        std.log.info("inkling2: head tail since start: {d} heads with logits {d:.3} ms ({d:.2} rows), {d} argmax only {d:.3} ms ({d:.2} rows); {d} verify draws {d:.3} ms ({d:.2} rows); {d} masked rows ({d} brought down for a refused argmax), {d:.3} ms each; {d} late-masked windows ({d} rows past the grammar's)", .{ c.heads[1], per.ms(c.head_ns[1], c.heads[1]), per.rows(c.head_rows[1], c.heads[1]), c.heads[0], per.ms(c.head_ns[0], c.heads[0]), per.rows(c.head_rows[0], c.heads[0]), self.draw_rounds, per.ms(self.draw_ns, self.draw_rounds), per.rows(self.draw_rows, self.draw_rounds), self.masked_rows, self.masked_misses, per.ms(self.masked_ns, self.masked_rows), self.late_windows, self.late_free_rows });
++    }
++
++    fn value(self: *const Lanes, feed: be.Feed) u32 {
++        return switch (feed) {
++            .handle => |h| self.drawn[h % ring],
++            .value => |v| v,
++        };
++    }
++
++    /// The drafter's block for the stream's next window, as held (the lane core walks a grammar stream's drafts on
++    /// the host before its window). A grammar stream's deferred draft runs now, with every other grammar stream's
++    /// (their walks come next); the other streams' deferred drafts still run in their verify's step.
++    fn heldFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
++        const self = of(ptr);
++        const l0 = self.lanes.getPtr(s) orelse return error.UnknownStream;
++        if (l0.pending != null) try self.flushWhere(if (s.grammar != null) .grammar else .all);
++        const l = self.lanes.getPtr(s) orelse return error.UnknownStream;
++        if (out.len > l.held_n) return error.NoHeldDrafts;
++        @memcpy(out, l.held[0..out.len]);
++    }
++
++    /// The stream left: its slot is free for the next stream (its state stays allocated on every rank).
++    fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
++        const self = of(ptr);
++        if (self.lanes.getPtr(s)) |l| {
++            l.dropRow(self.gpa);
++            self.x.e.unmapPages(l.slot); // its pages back to the pool (rank 0's; nothing is sent)
++        }
++        _ = self.lanes.remove(s);
++        if (self.lanes.count() == 0 and self.drafts_made > 0)
++            std.log.info("inkling2: drafts since start {d}, stale {d}; host gap from a draft to the next verify {d:.3} ms (mean of {d})", .{ self.drafts_made, self.x.e.stale_drafts, if (self.gaps > 0) @as(f64, @floatFromInt(self.gap_ns)) / 1e6 / @as(f64, @floatFromInt(self.gaps)) else 0, self.gaps });
++        if (self.lanes.count() == 0) self.tail();
++        if (self.lanes.count() == 0) self.x.idle() catch |err| std.log.err("inkling2: the other ranks' idle step: {s}", .{@errorName(err)});
++    }
++};
++
++/// A window's mask words a row (0: no masks), refused before its forward goes out: a mask a row, each covering the
++/// logits' `vocab` columns.
++fn maskWords(w: be.Window, vocab: usize) !usize {
++    if (w.masks.len == 0) return 0;
++    const rows = w.rows();
++    if (w.masks.len % rows != 0) return error.InvalidGrammarMasks;
++    const words = w.masks.len / rows;
++    if (words * 32 < vocab) return error.InvalidGrammarMasks;
++    return words;
++}
++
++/// The first largest value among `mask`'s allowed tokens: `argmax` of the row with the others at -inf (maskRow).
++fn argmaxMasked(logits: []const f32, mask: []const u32) !u32 {
++    if (mask.len * 32 < logits.len) return error.InvalidGrammarMasks;
++    var best: ?usize = null;
++    for (mask, 0..) |bits, w| {
++        var b = bits;
++        while (b != 0) : (b &= b - 1) {
++            const i = w * 32 + @ctz(b);
++            if (i >= logits.len) break;
++            if (best == null or logits[i] > logits[best.?]) best = i;
++        }
++    }
++    return @intCast(best orelse return error.NoAllowedToken);
++}
++
++/// `out` = `logits` with every token `mask` does not allow at -inf; error.NoAllowedToken when it allows none of them.
++fn maskRow(out: []f32, logits: []const f32, mask: []const u32) !void {
++    if (mask.len * 32 < logits.len) return error.InvalidGrammarMasks;
++    const ninf = -std.math.inf(f32);
++    var any: u32 = 0;
++    var i: usize = 0;
++    for (mask) |bits| {
++        if (i >= logits.len) break;
++        const n = @min(32, logits.len - i);
++        any |= bits & if (n == 32) std.math.maxInt(u32) else (@as(u32, 1) << @intCast(n)) - 1;
++        for (0..n) |b| out[i + b] = if (bits >> @intCast(b) & 1 == 1) logits[i + b] else ninf;
++        i += n;
++    }
++    if (any == 0) return error.NoAllowedToken;
++}
++
++test "inkling2 lanes: facts serve no drafts and share rounds between streams" {
++    var e: engine.Engine = undefined;
++    e.drafter = null;
++    var l: Lanes = .{ .x = .{ .e = &e }, .gpa = std.testing.allocator };
++    const f = l.facts();
++    try std.testing.expect(!f.copy_drafts and !f.mtp and f.drafts == 0);
++    // the lane core's shared rounds: width 2 or more, streams exact, several streams' rows in one forward
++    try std.testing.expect(f.exact_width >= 2 and f.streams_exact and f.hidden_rows and f.max_streams == engine.max_segs);
++    try std.testing.expect(f.batch_rows * 1 <= engine.head_rows and f.shared_costs.len > 0);
++    var c = try lanes.Config.init(std.testing.allocator, f, l.widest(), l.widest() - 1);
++    defer c.deinit(std.testing.allocator);
++    try std.testing.expect(c.family_streams and c.batch_streams == engine.max_segs and !c.family_mtp and c.max_copy == 0);
++}
++
++test "inkling2 lanes: with the drafter, windows of the anchor and 7 drafts, priced and primed" {
++    try std.testing.expectEqual(@as(usize, ic.state.spec_rows), tp4_costs.len);
++    try std.testing.expectEqual(@as(usize, ic.dspark.drafts), draft_prior.len);
++    for (tp4_costs[1..], tp4_costs[0 .. tp4_costs.len - 1]) |a, b| try std.testing.expect(a.ms > b.ms and a.width == b.width + 1);
++    for (shared_costs[1..], shared_costs[0 .. shared_costs.len - 1]) |a, b| try std.testing.expect(a.ms > b.ms and a.width > b.width);
++    // the draft is priced once a round: two rows cost the draft more than one, then only the window's own rows
++    try std.testing.expect(tp4_costs[1].ms - tp4_costs[0].ms >= tp4_draft_ms);
++    try std.testing.expectApproxEqAbs(tp4_window_ms[7] - tp4_window_ms[1], tp4_costs[7].ms - tp4_costs[1].ms, 1e-9);
++    // a shared round's widest forward: every stream's widest window, within the head's rows
++    try std.testing.expect(batch_rows <= engine.head_rows and batch_rows >= ic.state.spec_rows);
++    // the context prices: ascending, every window width, the first node today's lone prices; from 32k on every
++    // window and the draft dearer with depth (below that the nodes are within run-to-run noise of each other)
++    try std.testing.expectEqualSlices(f64, &tp4_window_ms, depth_costs[0].window_ms);
++    try std.testing.expectEqual(tp4_draft_ms, depth_costs[0].draft_ms);
++    for (depth_costs[1..], depth_costs[0 .. depth_costs.len - 1]) |a, b| {
++        try std.testing.expect(a.context > b.context and a.window_ms.len == ic.state.spec_rows);
++        if (b.context < 32_768) continue;
++        try std.testing.expect(a.draft_ms > b.draft_ms);
++        for (a.window_ms, b.window_ms) |x, y| try std.testing.expect(x > y);
++    }
++    for (0..ic.state.spec_rows) |d| try std.testing.expectApproxEqAbs(tp4_costs[d].ms, lanes.depth.priceAt(&depth_costs, @intCast(d), 600).?, 1e-9);
++    // shared rounds price depth past a node: up to it a stream's round is the shallow price
++    try std.testing.expect(for (depth_costs) |n| {
++        if (n.context == depth_from) break true;
++    } else false);
++}
++
++test "inkling2 lanes: a mask sets every disallowed token to -inf, the row's last word partial, and refuses a row it empties" {
++    const a = std.testing.allocator;
++    const U = 70; // 2 words and 6 bits, as 200,058 = 6,251 words and 26 bits
++    var logits: [U]f32 = undefined;
++    for (&logits, 0..) |*l, i| l.* = @floatFromInt(i % 7);
++    var out: [U]f32 = undefined;
++    // allowed: 3, 40, 69, and bits past the row (70 .. 95, ids with no logits) that change nothing
++    var mask = [_]u32{ 1 << 3, 1 << 8, (1 << 5) | 0xffff_ffc0 };
++    try maskRow(&out, &logits, &mask);
++    for (out, logits, 0..) |o, l, i| {
++        if (i == 3 or i == 40 or i == 69) try std.testing.expectEqual(l, o) else try std.testing.expect(o == -std.math.inf(f32));
++    }
++    // a mask that allows only ids past the row allows none of the row's tokens
++    mask = .{ 0, 0, 0xffff_ffc0 };
++    try std.testing.expectError(error.NoAllowedToken, maskRow(&out, &logits, &mask));
++    // a mask shorter than the row is refused
++    try std.testing.expectError(error.InvalidGrammarMasks, maskRow(&out, &logits, mask[0..2]));
++    // a window's masks: a row's words each, covering the vocabulary
++    const masks = try a.alloc(u32, 3 * 3);
++    defer a.free(masks);
++    var s: lanes.Stream = undefined;
++    const w: be.Window = .{ .stream = &s, .pending = 1, .held = 0, .tokens = &.{ 2, 3 }, .parents = null, .positions = &.{ 4, 5, 6 }, .masks = masks };
++    try std.testing.expectEqual(@as(usize, 3), try maskWords(w, U));
++    try std.testing.expectError(error.InvalidGrammarMasks, maskWords(w, 97)); // 3 words cover 96 tokens
++    var short = w;
++    short.masks = masks[0..8];
++    try std.testing.expectError(error.InvalidGrammarMasks, maskWords(short, U));
++    short.masks = &.{};
++    try std.testing.expectEqual(@as(usize, 0), try maskWords(short, U));
++}
++
++test "inkling2 lanes: the masked argmax read in place is the argmax of the masked row" {
++    const a = std.testing.allocator;
++    var rng = std.Random.DefaultPrng.init(11);
++    const r = rng.random();
++    const U = 1000;
++    const logits = try a.alloc(f32, U);
++    defer a.free(logits);
++    const out = try a.alloc(f32, U);
++    defer a.free(out);
++    var mask: [(U + 31) / 32]u32 = undefined;
++    for (0..200) |k| {
++        // few distinct values (ties), masks from dense to a single token
++        for (logits) |*x| x.* = @floatFromInt(r.intRangeLessThan(i32, -4, 5));
++        for (&mask) |*m| m.* = if (k % 4 == 0) std.math.maxInt(u32) else r.int(u32) & r.int(u32) & if (k % 4 == 3) r.int(u32) else std.math.maxInt(u32);
++        mask[mask.len - 1] |= 1 << 7; // at least one allowed: id 999
++        try maskRow(out, logits, &mask);
++        try std.testing.expectEqual(lanes.gpu_rule.argmax(out), try argmaxMasked(logits, &mask));
++    }
++    @memset(&mask, 0);
++    mask[mask.len - 1] = 0xffff_ff00; // ids past the row only
++    try std.testing.expectError(error.NoAllowedToken, argmaxMasked(logits, &mask));
++}
++
++/// A Lanes for the host draws alone (no engine forward runs).
++fn hostLanes(e: *engine.Engine) Lanes {
++    e.drafter = null;
++    e.io = std.testing.io;
++    return .{ .x = .{ .e = e }, .gpa = std.testing.allocator };
++}
++
++test "inkling2 lanes: a masked draw is the row's own rule over the masked row: greedy the first largest allowed, sampled the sampler's" {
++    const a = std.testing.allocator;
++    var e: engine.Engine = undefined;
++    var l = hostLanes(&e);
++    defer l.deinit();
++    var rng = std.Random.DefaultPrng.init(7);
++    const r = rng.random();
++    const U = 3000;
++    const logits = try a.alloc(f32, U);
++    defer a.free(logits);
++    for (logits) |*x| x.* = @floatCast(@abs(r.floatNorm(f64)) * 4.0);
++    var mask: [(U + 31) / 32]u32 = undefined;
++    for (&mask) |*m| m.* = r.int(u32) & r.int(u32); // a quarter allowed
++    // a tie between two allowed tokens above the rest of the allowed ones, below the row's best (not allowed)
++    logits[1777] = 40.0;
++    logits[2999] = 40.0;
++    logits[123] = 50.0;
++    mask[1777 / 32] |= @as(u32, 1) << @intCast(1777 % 32);
++    mask[2999 / 32] |= @as(u32, 1) << @intCast(2999 % 32);
++    mask[123 / 32] &= ~(@as(u32, 1) << @intCast(123 % 32));
++    const best = lanes.gpu_rule.argmax(logits);
++    try std.testing.expectEqual(@as(u32, 123), best);
++    var want_best: ?usize = null;
++    for (logits, 0..) |x, i| if (lanes.grammar.allows(&mask, i) and (want_best == null or x > logits[want_best.?])) {
++        want_best = i;
++    };
++    try std.testing.expectEqual(@as(?usize, 1777), want_best);
++    var s = try lanes.Stream.init(a, .{ .id = "masked", .prompt = &.{ 1, 2 }, .max_new = 8 });
++    defer s.deinit(a);
++    try std.testing.expectEqual(@as(u32, @intCast(want_best.?)), try l.drawMasked(logits, &mask, &s, 2));
++    // sampled: the sampler over the masked row (disallowed at -inf), never a disallowed token
++    const masked = try a.alloc(f32, U);
++    defer a.free(masked);
++    try maskRow(masked, logits, &mask);
++    var ref: sample.Sampler = .{ .gpa = a };
++    defer ref.deinit();
++    for ([_]lanes.Sampling{ .{ .seed = 3, .temperature = 0.8, .top_k = 0, .top_p = 0.95 }, .{ .seed = 4, .temperature = 1.0, .top_k = 40, .top_p = 1.0 }, .{ .seed = 5, .temperature = 1.0, .top_k = 0, .top_p = 1.0 } }) |v| {
++        s.sampling = v;
++        for (0..50) |p| {
++            const got = try l.drawMasked(logits, &mask, &s, 2 + p);
++            try std.testing.expect(lanes.grammar.allows(&mask, got));
++            try std.testing.expectEqual(try ref.draw(masked, v, 2 + p), got);
++        }
++    }
++    // a mask that allows every token draws what the row draws unmasked
++    @memset(&mask, std.math.maxInt(u32));
++    s.sampling = null;
++    try std.testing.expectEqual(best, try l.drawMasked(logits, &mask, &s, 2));
++    try std.testing.expect(l.masked_rows == 2 + 150);
++}
++
++test "inkling2 lanes: a grammar stream's first token comes from the kept prompt row, masked or not, and frees it" {
++    const a = std.testing.allocator;
++    var e: engine.Engine = undefined;
++    var l = hostLanes(&e);
++    defer l.deinit();
++    var s = try lanes.Stream.init(a, .{ .id = "first", .prompt = &.{ 1, 2, 3 }, .max_new = 8 });
++    defer s.deinit(a);
++    const row = try a.alloc(f32, 100);
++    for (row, 0..) |*x, i| x.* = @floatFromInt(i);
++    try l.lanes.put(a, &s, .{ .slot = 0, .first_row = row });
++    // the lane core's first_masked: among 7 and 41 the larger
++    var mask: [4]u32 = @splat(0);
++    mask[0] = 1 << 7;
++    mask[1] = 1 << 9;
++    try std.testing.expectError(error.PositionMismatch, Lanes.firstMaskedFn(&l, &s, 2, &mask));
++    const h = try Lanes.firstMaskedFn(&l, &s, 3, &mask);
++    try std.testing.expectEqual(@as(u32, 41), try Lanes.readFn(&l, h));
++    try std.testing.expectEqual(@as(usize, 0), l.lanes.get(&s).?.first_row.len);
++    try std.testing.expectEqual(h, try Lanes.firstFn(&l, &s, 3)); // the same handle after
++    try std.testing.expectError(error.NoFirstToken, Lanes.firstMaskedFn(&l, &s, 3, &mask)); // the row is gone
++    // a grammar that leaves the first token free: `first` draws the kept row's own token
++    const row2 = try a.alloc(f32, 100);
++    for (row2, 0..) |*x, i| x.* = -@as(f32, @floatFromInt(i));
++    l.lanes.getPtr(&s).?.* = .{ .slot = 0, .first_row = row2 };
++    try std.testing.expectEqual(@as(u32, 0), try Lanes.readFn(&l, try Lanes.firstFn(&l, &s, 3)));
++    // a row still kept when the lanes go is freed with them (the testing allocator checks)
++    l.lanes.getPtr(&s).?.first_row = try a.dupe(f32, row2[0..10]);
++}
++
++/// A store of kept states over rank 0's allocator for `reclaimChain` (host tests): the states in the store's order
++/// (least valuable first), each holding its pages once; `protected`: one a queued request will resume (the lane
++/// host's guard); `borrowed`: a resume in flight.
++const FakeStore = struct {
++    a: *ic.pages.Alloc,
++    states: []State,
++
++    const State = struct { ids: []const u32, protected: bool = false, borrowed: bool = false, gone: bool = false };
++
++    fn giveBack(ctx: *anyopaque, restoring: ?*anyopaque, left: *anyopaque, fits: *const fn (*anyopaque) bool, guarded: bool) bool {
++        const f: *FakeStore = @ptrCast(@alignCast(ctx));
++        for (f.states) |*st| {
++            if (fits(left)) return true;
++            if (st.gone or st.borrowed or (guarded and st.protected)) continue;
++            if (restoring) |r| if (@as(*anyopaque, st) == r) continue;
++            for (st.ids) |id| f.a.release(id);
++            st.gone = true;
++        }
++        return fits(left);
++    }
++
++    fn borrowedFn(_: *anyopaque, saved: *anyopaque) bool {
++        const st: *const State = @ptrCast(@alignCast(saved));
++        return st.borrowed;
++    }
++
++    fn hooks(f: *FakeStore) StoreHooks {
++        return .{ .ctx = f, .give_back = giveBack, .borrowed = borrowedFn };
++    }
++
++    /// Admission's protection (`Lanes.reclaimable`): the borrowed states' pages.
++    fn protect(f: *const FakeStore, out: [][]const u32) [][]const u32 {
++        var n: usize = 0;
++        for (f.states) |st| if (!st.gone and st.borrowed) {
++            out[n] = st.ids;
++            n += 1;
++        };
++        return out[0..n];
++    }
++};
++
++test "inkling2 lanes: on an idle server the open frees every page admission counted, states queued requests would resume too (A1 audit D1)" {
++    const gpa = std.testing.allocator;
++    var a = try ic.pages.Alloc.init(gpa, 36);
++    defer a.deinit();
++    // three streams ran (12, 12 and 4 pages) and each kept a state on all its pages, then ended: A will be resumed by
++    // a queued request (the lane host's guard protects it), B nobody needs, C a resume in flight borrows
++    var l: [4]ic.pages.Lease = @splat(.{});
++    defer for (&l) |*x| a.finish(x);
++    var ids: [3][]u32 = undefined;
++    for (&ids, [_]usize{ 12, 12, 4 }, l[0..3]) |*x, n, *lease| {
++        try a.promise(lease, n);
++        try a.cover(lease, n);
++        x.* = try gpa.dupe(u32, lease.ids.items);
++        for (x.*) |id| a.retain(id);
++    }
++    defer for (ids) |x| gpa.free(x);
++    for (l[0..3]) |*x| a.finish(x);
++    try std.testing.expect(a.idle());
++    try std.testing.expectEqual(@as(usize, 8), a.available());
++    var states = [_]FakeStore.State{ .{ .ids = ids[0], .protected = true }, .{ .ids = ids[1] }, .{ .ids = ids[2], .borrowed = true } };
++    var store: FakeStore = .{ .a = &a, .states = &states };
++    const mark = try gpa.alloc(u8, a.total());
++    defer gpa.free(mark);
++
++    // a new request needing 24 pages: admission lets it in (8 free + 24 that only A and B hold; C's 4 protected)
++    const n: usize = 24;
++    var buf: [4][]const u32 = undefined;
++    const reclaimable = a.reclaimable(store.protect(&buf), mark);
++    try std.testing.expectEqual(@as(usize, 24), reclaimable);
++    try std.testing.expect(a.fits(n -| reclaimable));
++
++    // other streams running: the guarded chain gives B back and stops short (A stays for its queued request; the
++    // lane host requeues this one until a running stream ends)
++    const busy = reclaimChain(&a, store.hooks(), null, n, false);
++    try std.testing.expect(!busy.ok and !busy.unguarded);
++    try std.testing.expect(states[1].gone and !states[0].gone and !states[2].gone);
++    try std.testing.expectEqual(@as(usize, 20), a.available());
++    // D1: before the fix this was the open's end on an idle server: LaneMemory, and the lane host, with nothing else
++    // running, failed the request as out of memory
++    try std.testing.expectError(error.LaneMemory, a.promise(&l[3], n));
++
++    // no other stream runs: the chain goes past the guard and A gives its pages back; C (borrowed) never does
++    const idle = reclaimChain(&a, store.hooks(), null, n, true);
++    try std.testing.expect(idle.ok and idle.unguarded);
++    try std.testing.expect(states[0].gone and !states[2].gone);
++    try std.testing.expectEqual(@as(usize, 32), a.available());
++    try a.promise(&l[3], n);
++    try a.cover(&l[3], n);
++    try std.testing.expectEqual(n, l[3].ids.items.len);
++    for (l[3].ids.items) |id| try std.testing.expect(std.mem.indexOfScalar(u32, ids[2], id) == null); // C's pages untouched
++    a.finish(&l[3]);
++    for (ids[2]) |id| a.release(id);
++    try std.testing.expect(a.idle() and a.available() == a.total());
++}
++
++test "inkling2 lanes: the reclaim chain never gives back the state the stream restores, guarded or not" {
++    const gpa = std.testing.allocator;
++    var a = try ic.pages.Alloc.init(gpa, 16);
++    defer a.deinit();
++    var l: ic.pages.Lease = .{};
++    defer a.finish(&l);
++    try a.promise(&l, 10);
++    try a.cover(&l, 10);
++    const ids = try gpa.dupe(u32, l.ids.items);
++    defer gpa.free(ids);
++    for (ids) |id| a.retain(id);
++    a.finish(&l);
++    var states = [_]FakeStore.State{.{ .ids = ids, .protected = true }};
++    var store: FakeStore = .{ .a = &a, .states = &states };
++    const r = reclaimChain(&a, store.hooks(), &states[0], 12, true);
++    try std.testing.expect(!r.ok and r.unguarded and !states[0].gone);
++    try std.testing.expectEqual(@as(usize, 6), a.available());
++    for (ids) |id| a.release(id);
++}

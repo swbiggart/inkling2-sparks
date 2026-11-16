@@ -1,0 +1,316 @@
+From d76dc86b3b7c0e7eee11fd98aa9264d9ad158d15 Mon Sep 17 00:00:00 2001
+From: Scott Biggart <297695+swbiggart@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 01:00:00 -0800
+Subject: [PATCH 7/8] inkling2: build glue: zig build steps for the family, its
+ kernels and tools
+
+8 files (1 new, 7 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
+Part of the engine changes behind Inkling-2-Small TP4 v0.1 (github.com/swbiggart/inkling2-sparks).
+Apply the whole series in order with git am (scripts/build-engine.sh does); only the full series is built and gated.
+---
+ build.zig                      |   1 +
+ zig/build/cuda.zig             |   4 ++
+ zig/build/cuda_engines.zig     |   3 +
+ zig/build/cuda_kernels.zig     |   9 +++
+ zig/build/cuda_server_host.zig |   3 +
+ zig/build/grammar.zig          |   2 +-
+ zig/build/inkling2.zig         | 127 +++++++++++++++++++++++++++++++++
+ zig/build/tp.zig               |  37 +++++++++-
+ 8 files changed, 184 insertions(+), 2 deletions(-)
+ create mode 100644 zig/build/inkling2.zig
+
+diff --git a/build.zig b/build.zig
+index 74f659e4d3b064945e0e045bdcd8f9d43c0a0ce4..c8dba235deeb6cb2065b5d11c1f2f6c4b0729250 100644
+--- a/build.zig
++++ b/build.zig
+@@ -115,6 +115,7 @@ pub fn build(b: *std.Build) void {
+     }
+     @import("zig/build/h3_host.zig").tests(b, target, test_step);
+     @import("zig/build/ling_host.zig").tests(b, target, test_step);
++    @import("zig/build/inkling2.zig").steps(b, target, optimize, test_step);
+     @import("zig/build/digest.zig").steps(b, test_step, draft_ids, build_options);
+     @import("zig/build/flashnext_budget.zig").steps(b, test_step);
+     @import("zig/build/flashnext_batch_host.zig").tests(b, test_step);
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 5aacb5ea49d5d49a7c7e5c77211bd6cb8387a4f4..513bda224fb147dafa219f6b5fa51f811ab64379 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -110,6 +110,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     for (exlr8_build.denseModules(b, target, optimize, exlr8, exlr8_tests[0])) |m| runner.addImport(m.name, m.module);
+     runner.addImport("glm_cuda", glmCuda(b, target, optimize, cuda, mods.core, mods.lanes, mods.heat, mods.api));
+     @import("minimax_cuda.zig").targets(b, target, optimize, strip, cuda, mods.core, mods.lanes, runner);
++    @import("inkling2.zig").cudaTargets(b, target, optimize, strip, cuda);
+     for ([_]struct { []const u8, *std.Build.Module }{ .{ "kolibri1", kolibri1Module(b, target, optimize, cuda, mods.core, mods.lanes) }, .{ "dory", @import("dory.zig").module(b, target, optimize, cuda, mods.core, mods.lanes) } }) |m| runner.addImport(m[0], m[1]);
+     runner.addImport("gemma4_cuda", @import("gemma4_cuda.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
+     runner.addImport("spark25", @import("spark25.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
+@@ -292,6 +293,9 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     @import("rows_host.zig").tests(b, native_modules.api, step);
+     const native = native_modules.engines;
+     b.step("test-cuda-cache-budget-host", "CUDA cache defaults after stream sizing without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"CUDA cache default"} })).step);
++    const inkling2_cuda = b.step("test-inkling2-cuda-host", "The CUDA host registers inkling2; the inkling2 CUDA and serve modules' host tests (no GPU)");
++    inkling2_cuda.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"inkling2 on CUDA"} })).step);
++    @import("inkling2.zig").cudaHostTests(b, cuda, mods.lanes, inkling2_cuda);
+     b.step("test-draft-cuda-host", "CUDA draft source metadata without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"draft sources:"} })).step);
+     @import("cuda_family_host.zig").registerCopyFamilies(b, native, step);
+     const copies = b.step("test-nemotron-copies-host", "Nemotron CUDA copy gates and plain equality without devices");
+diff --git a/zig/build/cuda_engines.zig b/zig/build/cuda_engines.zig
+index 80f037e3d2210c237d48163fc55ad4e79c0b0d46..8ea2b122716bdd3d09a77f9a5919cb13ccae121e 100644
+--- a/zig/build/cuda_engines.zig
++++ b/zig/build/cuda_engines.zig
+@@ -66,6 +66,7 @@ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     const api = qwen35.import_table.get("engine_api").?; // family()'s, so the server and qwen3_5 share one
+     const canon = canonModule(b, target, optimize);
+     const verbs = @import("tp.zig").verbsModule(b, target, optimize);
++    const ink_host = @import("inkling2.zig").module(b, target, optimize);
+     const mod = b.createModule(.{
+         .root_source_file = b.path("zig/src/native/cuda.zig"),
+         .target = target,
+@@ -83,6 +84,8 @@ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+             .{ .name = "glm_cuda", .module = glmCudaShared(b, target, optimize, cuda, core, lanes, heat, api, canon, verbs) },
+             .{ .name = "qwen3_cuda", .module = qwen3Module(b, target, optimize, cuda, core, lanes, api) },
+             .{ .name = "minimax_m3_cuda", .module = @import("minimax_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
++            .{ .name = "inkling2", .module = ink_host },
++            .{ .name = "inkling2_serve", .module = @import("inkling2.zig").serveModule(b, target, optimize, cuda, lanes, ink_host) },
+             .{ .name = "qwen35", .module = qwen35 },
+             .{ .name = "kolibri1", .module = @import("kolibri.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "gemma4_cuda", .module = @import("gemma4_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index c0c8b503336808147778d40df18370af7ee09115..95d10cf15a97668a2609ccf894f0e83f207c816b 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -147,6 +147,15 @@ pub const kernels = [_]Kernel{
+     .{ .name = "glm_index", .flags = &.{"-O3"} }, // a prompt chunk's DSA scores and top-512 pools
+     .{ .name = "minimax_m3", .flags = glue }, // ours: MiniMax-M3.1-Flash's glue (norms, RoPE prep, routing, DSpark, tower RoPE)
+     .{ .name = "minimax_m3_attn", .flags = glue }, // ours: MiniMax-M3.1-Flash's indexer and block-sparse attention
++    // Inkling-2-Small's op groups (families/inkling2/cuda_<group>.zig): one image a group, each lane its own file
++    .{ .name = "inkling2_attn", .flags = glue },
++    .{ .name = "inkling2_conv", .flags = glue },
++    .{ .name = "inkling2_res", .flags = glue },
++    .{ .name = "inkling2_moe", .flags = glue }, // torch's op-by-op roundings: no contraction, IEEE division
++    .{ .name = "inkling2_head", .flags = glue },
++    .{ .name = "inkling2_dspark", .flags = glue }, // the DSpark drafter (mtp.safetensors)
++    .{ .name = "inkling2_fuse", .flags = glue }, // fused stateless neighbours: the same bits as the ops they replace
++    .{ .name = "inkling2_ck", .flags = glue, .arch_specific = true }, // checkpoint-mode experts: block-scaled FP4 / FP8 mma (sm_12xa)
+     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
+     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5
+     .{ .name = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/experts.cu's device code, tensorfold_exl3_experts
+diff --git a/zig/build/cuda_server_host.zig b/zig/build/cuda_server_host.zig
+index f85c933597e540f90c899bd704a15d1ca7a7f39d..ec0cf704acd6f7668315b59e4185ff9a6328aa96 100644
+--- a/zig/build/cuda_server_host.zig
++++ b/zig/build/cuda_server_host.zig
+@@ -30,6 +30,9 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build.Mod
+     eos_policy.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.tokenizer, .filters = &.{"EOS policy:"} })).step);
+     eos_policy.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = kolibri1Module(b, host, .debug, cuda, mods.core, mods.lanes), .filters = &.{"EOS policy:"} })).step);
+     b.step("test-dory-cli-host", "Dory CUDA loop option forwarding and invalid-value refusals").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"--device and --segments:"} })).step);
++    const inkling2_text = b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"Inkling 2"} }));
++    inkling2_text.has_side_effects = true; // TF_INKLING2_DIR may name the release files for the optional check
++    b.step("test-inkling2-text-host", "Inkling 2 typed reply parts, stops, effort line and image refusal on the CPU").dependOn(&inkling2_text.step);
+     b.step("test-dory-chat-host", "Dory chat template, EOS, reasoning split and qwen3_coder call on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"Dory chat:"} })).step);
+     b.step("test-embeddings-protocol-host", "Embedding request and response contracts without an admitted model or GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"embeddings protocol:"} })).step);
+     b.step("test-embeddings-http-host", "Embedding route capability and borrowed request lifetime without a model or GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"embeddings HTTP:"} })).step);
+diff --git a/zig/build/grammar.zig b/zig/build/grammar.zig
+index 8e83bc3f7e4539440e323fd5af691e27ae37c8a8..fba82824fb4ddde889c20b26dd330f4f661eff5b 100644
+--- a/zig/build/grammar.zig
++++ b/zig/build/grammar.zig
+@@ -15,7 +15,7 @@ pub fn option(b: *std.Build) ?[]const u8 {
+ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, dir: ?[]const u8, lanes: *std.Build.Module) void {
+     const step = b.step("grammar", "libtfgrammar (structured output) from an xgrammar " ++ pinned ++ " checkout: -Dxgrammar=DIR");
+     const budget = b.step("test-grammar-budget", "grammar_budget's masks against brute force through a real libtfgrammar: -Dxgrammar=DIR");
+-    const tools = b.step("test-grammar-tools", "tool_grammar's call grammars walked through a real libtfgrammar: -Dxgrammar=DIR");
++    const tools = b.step("test-grammar-tools", "tool_grammar's and Inkling 2's call grammars walked through a real libtfgrammar: -Dxgrammar=DIR");
+     const root = dir orelse {
+         step.dependOn(&b.addFail("zig build grammar needs -Dxgrammar=DIR: " ++ clone).step);
+         budget.dependOn(&b.addFail("zig build test-grammar-budget needs -Dxgrammar=DIR: " ++ clone).step);
+diff --git a/zig/build/inkling2.zig b/zig/build/inkling2.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..f90bf25563793e62e9b6ad26e24ea0f241246580
+--- /dev/null
++++ b/zig/build/inkling2.zig
+@@ -0,0 +1,127 @@
++//! Inkling-2-Small in the build: its host module (no GPU, no core), its host tests, tf-inkling2-plan; its CUDA
++//! module (the forward's op groups over the runtime) and tf-inkling2-cuda, the layer-range runner.
++const std = @import("std");
++
++/// The family module: config, quant manifest, tensor roles, the rank plan, safetensors files and the refusal.
++pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
++    return b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/inkling2.zig"), .target = target, .optimize = optimize });
++}
++
++/// test-inkling2-host (in `test`) and tf-inkling2-plan, the per-rank memory plan and byte ranges.
++pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, test_step: *std.Build.Step) void {
++    const run = b.addRunArtifact(b.addTest(.{ .root_module = module(b, b.graph.host, .debug) }));
++    run.has_side_effects = true; // it writes a temporary folder
++    b.step("test-inkling2-host", "Inkling-2-Small: config, quant manifest, tensor roles and the rank plan against the release's files (no GPU)").dependOn(&run.step);
++    test_step.dependOn(&run.step);
++    const main = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/plan_main.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "inkling2", .module = module(b, target, optimize) }} });
++    const exe = b.addExecutable(.{ .name = "tf-inkling2-plan", .root_module = main });
++    b.installArtifact(exe);
++    b.step("tf-inkling2-plan", "Inkling-2-Small's per-rank memory plan and byte ranges (host tool)").dependOn(&b.addInstallArtifact(exe, .{}).step);
++    const fold_main = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/fold_main.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "inkling2", .module = module(b, target, optimize) }} });
++    const fold = b.addExecutable(.{ .name = "tf-inkling2-fold", .root_module = fold_main });
++    b.installArtifact(fold);
++    b.step("tf-inkling2-fold", "Inkling-2-Small's DSpark head folds from a checkpoint or rank folder (host tool, no GPU)").dependOn(&b.addInstallArtifact(fold, .{}).step);
++}
++
++/// The CUDA module over the runtime and the host module `host`: weights, state, the forward and its op groups.
++pub fn cudaModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, host: *std.Build.Module) *std.Build.Module {
++    return b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{
++        .{ .name = "cuda", .module = cuda },
++        .{ .name = "inkling2", .module = host },
++        .{ .name = "tp", .module = @import("tp.zig").module(b, target, optimize, cuda) }, // TF_INK2_ROCE_MULTI's wire
++    } });
++}
++
++/// The served family (native registry entry and lane backend) over the CUDA module, the lane core and `host`.
++pub fn serveModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, host: *std.Build.Module) *std.Build.Module {
++    return b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/cuda_serve.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{
++        .{ .name = "cuda", .module = cuda },
++        .{ .name = "lanes", .module = lanes },
++        .{ .name = "inkling2", .module = host },
++        .{ .name = "inkling2_cuda", .module = cudaModule(b, target, optimize, cuda, host) },
++    } });
++}
++
++/// tf-inkling2-decode (Linux): the serving engine's decode steps against whole-prompt forwards over the same tokens.
++fn decodeTool(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module, host: *std.Build.Module) void {
++    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/cuda_decode_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{
++        .{ .name = "cuda", .module = cuda },
++        .{ .name = "inkling2", .module = host },
++        .{ .name = "inkling2_cuda", .module = cudaModule(b, target, optimize, cuda, host) },
++    } });
++    const exe = b.addExecutable(.{ .name = "tf-inkling2-decode", .root_module = m });
++    b.installArtifact(exe);
++    b.step("tf-inkling2-decode", "Inkling-2-Small's decode steps (per-stream state) against whole-prompt forwards").dependOn(&b.addInstallArtifact(exe, .{}).step);
++}
++
++/// tf-inkling2-draft (Linux): the DSpark drafter alone on a taps file (the op check against the torch reference).
++fn draftTool(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module, host: *std.Build.Module) void {
++    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/cuda_dspark_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{
++        .{ .name = "cuda", .module = cuda },
++        .{ .name = "inkling2", .module = host },
++        .{ .name = "inkling2_cuda", .module = cudaModule(b, target, optimize, cuda, host) },
++    } });
++    const exe = b.addExecutable(.{ .name = "tf-inkling2-draft", .root_module = m });
++    b.installArtifact(exe);
++    b.step("tf-inkling2-draft", "Inkling-2-Small's DSpark drafter alone on a taps file (op check)").dependOn(&b.addInstallArtifact(exe, .{}).step);
++}
++
++/// tf-inkling2-cuda (Linux): layers [a, b) on one GPU from an oracle prompt file, every layer's rows dumped.
++pub fn cudaTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module) void {
++    const host = module(b, target, optimize);
++    decodeTool(b, target, optimize, strip, cuda, host);
++    draftTool(b, target, optimize, strip, cuda, host);
++    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/cuda_run_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{
++        .{ .name = "cuda", .module = cuda },
++        .{ .name = "inkling2", .module = host },
++        .{ .name = "inkling2_cuda", .module = cudaModule(b, target, optimize, cuda, host) },
++    } });
++    const exe = b.addExecutable(.{ .name = "tf-inkling2-cuda", .root_module = m });
++    b.installArtifact(exe);
++    b.step("tf-inkling2-cuda", "Inkling-2-Small's layers [a, b) on one GPU against the oracle (full mode)").dependOn(&b.addInstallArtifact(exe, .{}).step);
++    attnTool(b, target, optimize, strip, cuda, host);
++    moeTool(b, target, optimize, strip, cuda, host);
++    fuseTool(b, target, optimize, strip, cuda, host);
++}
++
++/// tf-inkling2-attn (Linux): G-attn's ops alone over a captured prompt at several forward sizes.
++fn attnTool(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module, host: *std.Build.Module) void {
++    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/cuda_attn_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{
++        .{ .name = "cuda", .module = cuda },
++        .{ .name = "inkling2", .module = host },
++        .{ .name = "inkling2_cuda", .module = cudaModule(b, target, optimize, cuda, host) },
++    } });
++    const exe = b.addExecutable(.{ .name = "tf-inkling2-attn", .root_module = m });
++    b.installArtifact(exe);
++    b.step("tf-inkling2-attn", "Inkling-2-Small's attention ops alone over a captured prompt at several forward sizes").dependOn(&b.addInstallArtifact(exe, .{}).step);
++}
++
++/// tf-inkling2-moe (Linux): G-moe's route and experts alone on one layer, any rows, several forward sizes.
++fn moeTool(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module, host: *std.Build.Module) void {
++    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/cuda_moe_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{
++        .{ .name = "cuda", .module = cuda },
++        .{ .name = "inkling2", .module = host },
++        .{ .name = "inkling2_cuda", .module = cudaModule(b, target, optimize, cuda, host) },
++    } });
++    const exe = b.addExecutable(.{ .name = "tf-inkling2-moe", .root_module = m });
++    b.installArtifact(exe);
++    b.step("tf-inkling2-moe", "Inkling-2-Small's MoE ops alone on one layer: row invariance across forward sizes").dependOn(&b.addInstallArtifact(exe, .{}).step);
++}
++
++/// tf-inkling2-fuse (Linux): G-fuse's fused ops against the unfused sequences they replace (op check, no weights).
++fn fuseTool(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module, host: *std.Build.Module) void {
++    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/cuda_fuse_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{
++        .{ .name = "cuda", .module = cuda },
++        .{ .name = "inkling2_cuda", .module = cudaModule(b, target, optimize, cuda, host) },
++    } });
++    const exe = b.addExecutable(.{ .name = "tf-inkling2-fuse", .root_module = m });
++    b.installArtifact(exe);
++    b.step("tf-inkling2-fuse", "Inkling-2-Small's fused ops against the unfused sequences (op check, no weights)").dependOn(&b.addInstallArtifact(exe, .{}).step);
++}
++
++/// The CUDA module's host tests (no GPU) in test-inkling2-cuda-host.
++pub fn cudaHostTests(b: *std.Build, cuda: *std.Build.Module, lanes: *std.Build.Module, step: *std.Build.Step) void {
++    const host = b.graph.host;
++    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cudaModule(b, host, .debug, cuda, module(b, host, .debug)) })).step);
++    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = serveModule(b, host, .debug, cuda, lanes, module(b, host, .debug)) })).step);
++}
+diff --git a/zig/build/tp.zig b/zig/build/tp.zig
+index b0a7e21077a76f2c1ca619a86ca3e616ddb8c3a1..b5a6353d5d4f3305453fff94bafd3fa22ff0df41 100644
+--- a/zig/build/tp.zig
++++ b/zig/build/tp.zig
+@@ -14,9 +14,42 @@ pub fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+ 
+ /// verbs.zig as its own module; a compilation that also builds fabric.zig passes this one in (a file has one module).
+ pub fn verbsModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+-    return b.createModule(.{ .root_source_file = b.path("zig/src/fabric/verbs.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    for (memo.vlist[0..memo.n_verbs]) |m| if (m.key.eql(target, optimize, null, null)) return m.mod;
++    const m = b.createModule(.{ .root_source_file = b.path("zig/src/fabric/verbs.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    memo.put(&memo.vlist, &memo.n_verbs, .{ .key = .of(target, optimize, null, null), .mod = m });
++    return m;
+ }
+ 
++/// One verbs and one tp module per target, optimize mode and runtime: families in one binary (GLM, inkling2) share
++/// them, since a file may belong to only one module of a compilation.
++const memo = struct {
++    const Key = struct {
++        arch: std.Target.Cpu.Arch,
++        os: std.Target.Os.Tag,
++        abi: std.Target.Abi,
++        cuda: ?*std.Build.Module,
++        verbs: ?*std.Build.Module,
++        fn of(t: std.Build.ResolvedTarget, o: std.builtin.OptimizeMode, cuda: ?*std.Build.Module, vb: ?*std.Build.Module) Key {
++            _ = o; // the first caller's mode: a family in Debug and one in ReleaseSafe still share one module
++            return .{ .arch = t.result.cpu.arch, .os = t.result.os.tag, .abi = t.result.abi, .cuda = cuda, .verbs = vb };
++        }
++        fn eql(k: Key, t: std.Build.ResolvedTarget, o: std.builtin.OptimizeMode, cuda: ?*std.Build.Module, vb: ?*std.Build.Module) bool {
++            return std.meta.eql(k, of(t, o, cuda, vb));
++        }
++    };
++    const Entry = struct { key: Key, mod: *std.Build.Module };
++    var vlist: [1024]Entry = undefined;
++    var n_verbs: usize = 0;
++    var tlist: [1024]Entry = undefined;
++    var n_tp: usize = 0;
++    fn put(list: *[1024]Entry, n: *usize, e: Entry) void {
++        if (n.* < list.len) { // full: later callers get their own module, as before the memo
++            list[n.*] = e;
++            n.* += 1;
++        }
++    }
++};
++
+ /// The `tp` module over `cuda` (an engine passes its own runtime module); verbs (zig/src/fabric/verbs.zig) for RoCE.
+ pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module) *std.Build.Module {
+     return moduleWith(b, target, optimize, cuda, verbsModule(b, target, optimize));
+@@ -24,9 +57,11 @@ pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
+ 
+ /// Same as `module`, using a verbs module the caller already owns.
+ pub fn moduleWith(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, verbs: *std.Build.Module) *std.Build.Module {
++    for (memo.tlist[0..memo.n_tp]) |e| if (e.key.eql(target, optimize, cuda, verbs)) return e.mod;
+     const m = b.createModule(.{ .root_source_file = b.path("zig/src/fabric/tp/tp.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     m.addImport("cuda", cuda);
+     m.addImport("verbs", verbs);
++    memo.put(&memo.tlist, &memo.n_tp, .{ .key = .of(target, optimize, cuda, verbs), .mod = m });
+     return m;
+ }
+ 

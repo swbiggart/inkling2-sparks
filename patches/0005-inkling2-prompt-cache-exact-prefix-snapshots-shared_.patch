@@ -1,0 +1,1246 @@
+From 4b6c0fe8f7a6c615ec7c19b4f1eea085aa9fef8b Mon Sep 17 00:00:00 2001
+From: Scott Biggart <297695+swbiggart@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 01:00:00 -0800
+Subject: [PATCH 5/8] inkling2: prompt cache: exact prefix snapshots,
+ shared_first rules, store budget
+
+9 files (2 new, 7 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
+Part of the engine changes behind Inkling-2-Small TP4 v0.1 (github.com/swbiggart/inkling2-sparks).
+Apply the whole series in order with git am (scripts/build-engine.sh does); only the full series is built and gated.
+---
+ docs/profiles.md                              |   2 +-
+ zig/src/core/profile.zig                      |   2 +-
+ zig/src/core/prompt_cache.zig                 |  13 +-
+ zig/src/core/prompt_cache_queue_room_test.zig |  30 +-
+ zig/src/core/prompt_cache_reserve.zig         |  67 +-
+ zig/src/core/prompt_rules.zig                 |   3 +
+ zig/src/families/inkling2/cuda_snap.zig       | 801 ++++++++++++++++++
+ zig/src/families/inkling2/cuda_snap_test.zig  | 171 ++++
+ zig/src/native/cuda_snaps.zig                 |   1 +
+ 9 files changed, 1057 insertions(+), 33 deletions(-)
+ create mode 100644 zig/src/families/inkling2/cuda_snap.zig
+ create mode 100644 zig/src/families/inkling2/cuda_snap_test.zig
+
+diff --git a/docs/profiles.md b/docs/profiles.md
+index ea57c78c10718dcfd6f6734bfcf829242b42f1c3..a7c7872ce4e5058dc88a80953b7af8cbca9cc5c5 100644
+--- a/docs/profiles.md
++++ b/docs/profiles.md
+@@ -51,7 +51,7 @@ Coverage includes:
+   with `TENSORFOLD_DORY_KV_PAGES=0` it refuses to load, by both names. With the switch unset, the startup line
+   shows `TENSORFOLD_DORY_KV_PAGES=1 (arithmetic, TF_KV_SHARE)` and kept states carry the same identity as `=1`.
+ - Every CUDA family whose host prompt cache the CUDA host builds (Nemotron, Nemotron Omni, GLM, MiniMax M3, Qwen3.5
+-  dense/MoE, Flash Next, Kolibri-1, Gemma 4, Spark2.5, Dory): `TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS`, exact `1` only.
++  dense/MoE, Flash Next, Kolibri-1, Gemma 4, Spark2.5, Dory, Inkling-2): `TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS`, exact `1` only.
+ - Flash Next on CUDA: `TF_FLASHNEXT_KV_PAGES`, `TF_FLASHNEXT_KV_PAGES_ALL`.
+ - Dory on CUDA: `TENSORFOLD_DORY_KV_PAGES`, full-attention caches in pool pages unless it is exactly `0`; unset,
+   every stream's caches are contiguous and made at open.
+diff --git a/zig/src/core/profile.zig b/zig/src/core/profile.zig
+index 1bde145ac83553c3dca78248e531cf18e8d03bef..87c12bced3233d76c087ff6ef4833a797b7c754d 100644
+--- a/zig/src/core/profile.zig
++++ b/zig/src/core/profile.zig
+@@ -134,7 +134,7 @@ const nemotron: []const []const u8 = &.{ "nemotron_h", "nemotron_h_omni" };
+ const slide_cuda: []const []const u8 = &.{ "nemotron_h", "nemotron_h_omni", "qwen3_5" };
+ const flash: []const []const u8 = &.{"qwen4_exp"};
+ /// The CUDA families whose host prompt cache the generic CUDA host builds (cuda_keep_others_test.zig checks the list).
+-pub const cuda_cache: []const []const u8 = &.{ "nemotron_h", "nemotron_h_omni", "glm5_next", "minimax_m3_vl", "qwen3_5", "qwen3_5_moe", "qwen4_exp", "kolibri1", "gemma4", "gemma4_unified", "spark2_5", "dory" };
++pub const cuda_cache: []const []const u8 = &.{ "nemotron_h", "nemotron_h_omni", "glm5_next", "minimax_m3_vl", "qwen3_5", "qwen3_5_moe", "qwen4_exp", "kolibri1", "gemma4", "gemma4_unified", "spark2_5", "dory", "inkling2" };
+ 
+ pub const entries = [_]Entry{
+     .{ .id = .TF_QWEN_REQUEST_STARTS, .families = qwen, .class = .arithmetic, .syntax = .one, .effect = "Opt into CUDA message-start prompt cuts", .evidence = "#1334; default-off; GB10 six-turn: resumed equals fresh, one reply differs from unset" },
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index c2d88913807687b0ea83fb0991c38bc6696f1a82..c15849822a804bbd2bbcb288a46b9fea60b644ad 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -266,7 +266,7 @@ pub const Store = struct {
+                 s.resumedWithReason(e, prompt, null);
+                 if (fresh_marks) |m| if (m.ptr != l.marks.ptr) a.free(m);
+                 // Restored: this state may go too; a peer restores before it drops.
+-                s.reserve(prompt, @intCast(prompt.len), null, l.marks, spans, @import("prompt_cache_reserve.zig").endpointFor(s, prompt, at, history_len, starts, spans));
++                s.reserve(prompt, @intCast(prompt.len), null, l.marks, spans, @import("prompt_cache_reserve.zig").endpointFor(s, prompt, at, history_len, starts, spans), 0);
+                 return .{ .from = at, .marks = l.marks };
+             } else |err| {
+                 // a refused state is dropped, then the next shorter RAM state is tried before the pass from the start
+@@ -277,7 +277,7 @@ pub const Store = struct {
+         }
+         const marks_ = fresh_marks orelse l.marks;
+         if (fresh_marks != null and l.marks.ptr != marks_.ptr) a.free(l.marks);
+-        s.reserve(prompt, @intCast(prompt.len), null, marks_, spans, @import("prompt_cache_reserve.zig").endpointFor(s, prompt, 0, history_len, starts, spans));
++        s.reserve(prompt, @intCast(prompt.len), null, marks_, spans, @import("prompt_cache_reserve.zig").endpointFor(s, prompt, 0, history_len, starts, spans), 0);
+         return .{ .marks = marks_ };
+     }
+ 
+@@ -338,8 +338,13 @@ pub const Store = struct {
+         if (history_len == 0 and primary == 0) for (marks_) |at| {
+             if (at != s.active_rewind_at) primary = @max(primary, at);
+         };
+-        s.reserve(prompt, born, e, marks_, spans, primary);
+-        const fitted = try @import("prompt_cache_reserve.zig").fitting(s, a, prompt, marks_, spans, e, born, primary);
++        var second: u32 = 0; // rules.shared_first: the longest shared cut planned, with the endpoint
++        if (s.rules.shared_first) for (shared) |w| {
++            const at = if (s.rules.planned) s.startAt(starts, w) else w;
++            if (at != primary and std.mem.indexOfScalar(u32, marks_, at) != null) second = @max(second, at);
++        };
++        s.reserve(prompt, born, e, marks_, spans, primary, second);
++        const fitted = try @import("prompt_cache_reserve.zig").fitting(s, a, prompt, marks_, spans, e, born, primary, second);
+         if (e) |entry| entry.borrowers += 1;
+         return .{ .entry = e, .marks = fitted };
+     }
+diff --git a/zig/src/core/prompt_cache_queue_room_test.zig b/zig/src/core/prompt_cache_queue_room_test.zig
+index bf8b33d2882d8706346df356408844976933e7f7..345cc6ca3a481a0605f230a7123195649e67a57a 100644
+--- a/zig/src/core/prompt_cache_queue_room_test.zig
++++ b/zig/src/core/prompt_cache_queue_room_test.zig
+@@ -39,7 +39,7 @@ test "queued cache: endpoint has priority over a cheaper optional rewind with ex
+     const primary = reserve.endpointFor(&s, &words, 12, 20, &.{}, &.{});
+     try std.testing.expectEqual(@as(u32, 19), primary);
+     const marks = try a.dupe(u32, &.{ 4, 19 });
+-    const fitted = try reserve.fitting(&s, a, &words, marks, &.{}, s.entries.items[0], 20, primary);
++    const fitted = try reserve.fitting(&s, a, &words, marks, &.{}, s.entries.items[0], 20, primary, 0);
+     defer a.free(fitted);
+     try std.testing.expectEqualSlices(u32, &.{19}, fitted);
+ }
+@@ -60,7 +60,7 @@ test "queued cache: branched rewind and multiply borrowed restores cannot promis
+         }
+         defer e.borrowers = 0;
+         s.reservation_guard = .{ .ctx = &f, .needed = idle };
+-        const marks = try reserve.fitting(&s, a, &words, try a.dupe(u32, &.{16}), &.{}, e, 20, 16);
++        const marks = try reserve.fitting(&s, a, &words, try a.dupe(u32, &.{16}), &.{}, e, 20, 16, 0);
+         defer a.free(marks);
+         try std.testing.expectEqual(@as(usize, 0), marks.len);
+         try std.testing.expectEqual(@as(u64, 1), s.counts.trimmed);
+@@ -105,3 +105,29 @@ test "queued cache: begin reserves the warm lookahead endpoint after releasing i
+     try std.testing.expectEqualSlices(u32, &.{19}, plan.marks);
+     try std.testing.expectEqual(@as(u64, 0), s.held);
+ }
++
++test "queued cache: shared_first plans a new shared prompt's end with the endpoint, evicting for both" {
++    for ([_]bool{ false, true }) |first| {
++        var f: Fake = .{ .gpa = a };
++        var s = pc.Store.init(a, f.snapshots(), .{ .min_prompt = 0, .min_gap = 1, .shared_first = first }, 330);
++        defer s.deinit();
++        const old1 = [_]u32{ 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62 };
++        const old2 = [_]u32{ 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82 };
++        _ = f.pass(&s, old1[0..10], .{});
++        try std.testing.expect(s.keep(&old1, 10, null, &.{}, &.{}));
++        _ = f.pass(&s, old2[0..12], .{});
++        try std.testing.expect(s.keep(&old2, 12, null, &.{}, &.{}));
++        try std.testing.expectEqual(@as(u64, 222), s.held);
++        s.reservation_guard = .{ .ctx = &f, .needed = idle };
++        const words = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 };
++        const l = try s.lookupUser(a, &words, 20, 18, 0, 0, &.{8}, &.{}, &.{});
++        defer a.free(l.marks);
++        if (first) {
++            try std.testing.expectEqualSlices(u32, &.{ 8, 18 }, l.marks);
++            try std.testing.expectEqual(@as(usize, 0), s.entries.items.len); // both old states made room
++        } else {
++            try std.testing.expectEqualSlices(u32, &.{18}, l.marks); // the shared cut trimmed: no free room
++            try std.testing.expectEqual(@as(u64, 1), s.counts.trimmed);
++        }
++    }
++}
+diff --git a/zig/src/core/prompt_cache_reserve.zig b/zig/src/core/prompt_cache_reserve.zig
+index 593c782391d6bee433ea70f29d1335be0cbdbf45..57a00ec454f22d38b96d98464eb2d489f59c286d 100644
+--- a/zig/src/core/prompt_cache_reserve.zig
++++ b/zig/src/core/prompt_cache_reserve.zig
+@@ -82,27 +82,12 @@ fn priority(marks: []const u32, endpoint: u32) ?u32 {
+     return null;
+ }
+ 
+-/// A guarded reservation makes room for the endpoint alone; other copies cannot displace a newest state.
+-pub fn reserve(s: *pc.Store, prompt: []const u32, born: u32, from: ?*pc.Entry, marks: []const u32, spans: []const modes.Span, endpoint: u32) void {
++/// A guarded reservation makes room for the endpoint alone (with rules.shared_first, also for `second`, the longest
++/// shared cut, when both can fit); other copies cannot displace a newest state.
++pub fn reserve(s: *pc.Store, prompt: []const u32, born: u32, from: ?*pc.Entry, marks: []const u32, spans: []const modes.Span, endpoint: u32, second: u32) void {
+     if (s.reservation_guard != null) {
+-        const at = priority(marks, endpoint) orelse return;
+-        if (exists(s, prompt, at, spans)) return;
+-        const need = s.family.vtable.bytes(s.family.ptr, at);
+-        if (need > s.budget or s.most == 0) return;
+-        const credit = reclaimable(s, from, prompt, born);
+-        const promised = s.reservation_guard.?.promised;
+-        // Preserve deficits: freeing a state must pay the other jobs' promises before this endpoint can fit.
+-        var bytes: i128 = @as(i128, s.budget) - s.held + credit.bytes - promised.bytes;
+-        var slots: i128 = @as(i128, s.most) - s.entries.items.len + credit.slots - promised.slots;
+-        const can = evictable(s, from, prompt);
+-        if (bytes + can.bytes < need or slots + can.slots < 1) return;
+-        while (bytes < need or slots < 1) {
+-            const i = others.victim(s, from, prompt, born, need, 1) orelse return;
+-            bytes += s.entries.items[i].bytes;
+-            slots += 1;
+-            s.remove(i);
+-            s.counts.evicted += 1;
+-        }
++        if (second != 0 and second != endpoint and reserveFor(s, prompt, born, from, marks, spans, &.{ endpoint, second })) return;
++        _ = reserveFor(s, prompt, born, from, marks, spans, &.{endpoint});
+         return;
+     }
+     var need: u64 = 0;
+@@ -118,24 +103,56 @@ pub fn reserve(s: *pc.Store, prompt: []const u32, born: u32, from: ?*pc.Entry, m
+     }
+ }
+ 
+-/// Select the endpoint first; only interior, rewind and extra shared cuts compete for room after it.
+-pub fn fitting(s: *pc.Store, a: std.mem.Allocator, prompt: []const u32, marks: []const u32, spans: []const modes.Span, from: ?*pc.Entry, born: u32, endpoint: u32) ![]const u32 {
++/// Room made for the priority marks `ps` that are planned and not kept (evicting as the victim order allows), or
++/// false with nothing evicted when they cannot all fit.
++fn reserveFor(s: *pc.Store, prompt: []const u32, born: u32, from: ?*pc.Entry, marks: []const u32, spans: []const modes.Span, ps: []const u32) bool {
++    var need: u64 = 0;
++    var n: usize = 0;
++    for (ps) |p| {
++        const at = priority(marks, p) orelse continue;
++        if (exists(s, prompt, at, spans)) continue;
++        need += s.family.vtable.bytes(s.family.ptr, at);
++        n += 1;
++    }
++    if (n == 0) return true;
++    if (need > s.budget or s.most < n) return false;
++    const credit = reclaimable(s, from, prompt, born);
++    const promised = s.reservation_guard.?.promised;
++    // Preserve deficits: freeing a state must pay the other jobs' promises before this endpoint can fit.
++    var bytes: i128 = @as(i128, s.budget) - s.held + credit.bytes - promised.bytes;
++    var slots: i128 = @as(i128, s.most) - s.entries.items.len + credit.slots - promised.slots;
++    const can = evictable(s, from, prompt);
++    if (bytes + can.bytes < need or slots + can.slots < n) return false;
++    while (bytes < need or slots < n) {
++        const i = others.victim(s, from, prompt, born, need, n) orelse return true;
++        bytes += s.entries.items[i].bytes;
++        slots += 1;
++        s.remove(i);
++        s.counts.evicted += 1;
++    }
++    return true;
++}
++
++/// Select the endpoint first (with rules.shared_first, then `second`, the longest shared cut); only interior, rewind
++/// and extra shared cuts compete for room after them.
++pub fn fitting(s: *pc.Store, a: std.mem.Allocator, prompt: []const u32, marks: []const u32, spans: []const modes.Span, from: ?*pc.Entry, born: u32, endpoint: u32, second: u32) ![]const u32 {
+     if (s.reservation_guard == null) return marks;
+     defer a.free(marks);
+     var out: std.ArrayList(u32) = .empty;
+     errdefer out.deinit(a);
+     var room = future(s, from, prompt, born);
+     const end = priority(marks, endpoint);
+-    if (end) |at| {
++    const end2 = if (second != endpoint) priority(marks, second) else null;
++    for ([2]?u32{ end, end2 }) |first| if (first) |at| {
+         const bytes = if (exists(s, prompt, at, spans)) 0 else s.family.vtable.bytes(s.family.ptr, at);
+         if (bytes == 0 or (bytes <= room.bytes and room.slots > 0)) {
+             try out.append(a, at);
+             room.bytes -= bytes;
+             if (bytes > 0) room.slots -= 1;
+         }
+-    }
++    };
+     for (marks) |at| {
+-        if (end == at) continue;
++        if (end == at or end2 == at) continue;
+         const bytes = if (exists(s, prompt, at, spans)) 0 else s.family.vtable.bytes(s.family.ptr, at);
+         if (bytes == 0 or (bytes <= room.bytes and room.slots > 0)) {
+             try out.append(a, at);
+diff --git a/zig/src/core/prompt_rules.zig b/zig/src/core/prompt_rules.zig
+index c3541f08bbcf1b8fe53baacbb1ca06611fbead58..6b67bae995ea0263dfdce2b1ea5316cf385a9667 100644
+--- a/zig/src/core/prompt_rules.zig
++++ b/zig/src/core/prompt_rules.zig
+@@ -30,4 +30,7 @@ pub const Rules = struct {
+     repeat_keyed: bool = false,
+     /// Keep one before where the prompt parts from the one it resumed (a miss: the longest kept one), however near.
+     fork: bool = false,
++    /// The longest shared cut a pass plans (a system block's end) is placed with the endpoint and may evict as it
++    /// does, so requests on a new shared prompt resume it (and wait for it) even when the store is full.
++    shared_first: bool = false,
+ };
+diff --git a/zig/src/families/inkling2/cuda_snap.zig b/zig/src/families/inkling2/cuda_snap.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..a7c786753d803455e8bfe7cc8f394dce813363b9
+--- /dev/null
++++ b/zig/src/families/inkling2/cuda_snap.zig
+@@ -0,0 +1,801 @@
++//! Inkling-2's prompt cache on the KV page pool (v0.2 stage 2d; the copies of stage 1 are gone): a kept state at N is
++//! the stream's whole pages [0, N / 256) by reference, and a copy of the slot's fixed part and the tail rows in one
++//! slot of a small device arena a rank made at start-up; a resume adopts those pages and copies the fixed part back.
++//! Rank 0 decides every save and restore inside its lane thread and sends it as a step (kinds save and restore,
++//! cuda_follow.zig), so every rank copies the same bytes at the same point of the step sequence, at the same arena
++//! offset; rank 0 alone counts the kept states' page references (cuda_pages.zig retain / release), the other ranks
++//! map whatever ids rank 0's `pages` step sends.
++//!
++//! What a state at N holds, per rank (nothing else is read by a row at or past N):
++//!   global layers   K and V of positions [0, B), B = N - N % 256: the stream's pages ids[0 .. N / 256), referenced
++//!                   (never written again: a stream writes only at or past its position, and a stream that resumes
++//!                   the state writes only past N), and of [B, N) (the tail rows) copied into the slot
++//!   sliding layers  K and V of the last 1,023 positions [N - 1023, N) in position order (restored to p % slots)
++//!   every layer     its four convolutions' 3 input rows (k, v, post-attention, post-MLP)
++//!   DSpark          the drafter's context K and V: its global layer as the target's (pages and tail, stage 2c), its
++//!                   local layers [N - 1024, N) (restored into their rings at p % ring, the rows below 1,024 mirrored)
++//! A resume at N: the stream's table is the state's pages and fresh pages after them (cuda_pages.zig Pool.open with
++//! `adopt`, in place when the next pages are free), and the tail rows land in the first fresh page. Every slot of
++//! the arena is one size (a state's largest copy), so it never fragments: there is no compaction.
++//! A state is taken where a forward ended at N, or (stage 1b) at a mark N inside a prompt chunk [a, a + n): rank 0
++//! sends a `capture` step before the chunk's forward, and each convolution commit of that forward first writes what
++//! the convolution's state would be at N (the commit kernel over the old state and rows a .. N - 1) into a capture
++//! area; the save after the forward takes those rows, and the rest of the state is still intact (global rows [0, N)
++//! are never overwritten; the rings hold 1,023 + 2,048 (target) and 1,024 + 2,048 (drafter) positions, so
++//! [N - 1,024, N) survives a chunk of at most 2,048 rows past N). Every op is row-invariant, so the bytes do not
++//! depend on how [0, N) was chunked and a resume followed by any chunking of the rest gives the cold pass's bits.
++//!
++//! Rank 0 keeps the arena's free extents (slots of one size); every rank keeps what each extent holds (a tag a save),
++//! and a restore whose tag the follower does not hold stops every rank. Followers never allocate after start-up, so
++//! a save cannot fail on one rank alone for want of memory. The window layout (TF_INK2_PAGES=0) keeps no prompts.
++//!
++//! TF_INK2_SNAP_FAULT (tests): `restore:N` refuses rank 0's N-th restore before its header (the lane falls back to a
++//! cold pass); `tag:N` makes a follower's N-th restore find another tag (every rank stops).
++const std = @import("std");
++const cuda = @import("cuda");
++const engine = @import("cuda_engine.zig");
++const state = @import("cuda_state.zig");
++const weights = @import("cuda_weights.zig");
++const attn = @import("cuda_attn.zig");
++const conv = @import("cuda_conv.zig");
++const dspark = @import("cuda_dspark.zig");
++const ops = @import("cuda_ops.zig");
++const follow_ = @import("cuda_follow.zig");
++const pages = @import("cuda_pages.zig");
++
++const Engine = engine.Engine;
++const Mat = ops.Mat;
++const Header = engine.Header;
++const Leader = follow_.Leader;
++const Kind = follow_.Kind;
++const H = weights.hidden;
++const D = weights.head_dim;
++
++/// The arena's unit: every kept state takes a whole number of them.
++pub const granule: u64 = 2 << 20;
++/// Positions a sliding layer's kept state holds: a row reads the 1,023 before its own.
++pub const ring_keep: usize = attn.window - 1;
++/// Positions a local drafter layer's kept state holds: a draft at p reads [p - 1024, p), and p > N after a resume.
++pub const draft_keep: usize = dspark.window;
++
++/// Rank 0's record of one kept state: its arena slot and the pages it references (rank 0's allocation, owned).
++pub const Kept = struct {
++    tag: u32,
++    at: u32,
++    off: u64,
++    bytes: u64,
++    pages: []u32 = &.{},
++};
++
++/// Stage 1b: marks one prompt chunk captures inside it at most (more end chunks, as stage 1 did).
++pub const max_caps = 8;
++
++/// A prompt chunk whose forward captures the convolution rows of the marks inside it (every rank: rank 0 sets it,
++/// followers take it from the `capture` step). `ran`: the forward took it; a save inside the chunk reads capture i.
++pub const Capture = struct {
++    slot: u32 = 0,
++    pos0: usize = 0,
++    rows: usize = 0,
++    n: usize = 0,
++    marks: [max_caps]u32 = undefined,
++    armed: bool = false,
++    ran: bool = false,
++};
++
++/// The convolution rows a state holds (every layer's four 3-row states), in the copies' order.
++pub fn convBytes(layers: anytype) u64 {
++    var n: u64 = 0;
++    for (layers) |l| n += 2 * conv.state_rows * @as(u64, l.hk) * D * 2 + 2 * conv.state_rows * H * 2;
++    return n;
++}
++
++/// The capture area a rank allocates with its arena (out of the cache's budget).
++pub fn capBytes(e: *const Engine) u64 {
++    return max_caps * convBytes(e.w.layers);
++}
++
++/// Marks strictly inside the chunk [at, at + n), ascending, into `out` (at most max_caps); the rows the chunk may run
++/// so that no mark past those is inside it (a chunk with more marks ends at the next one).
++pub const Inside = struct { n: usize, rows: usize };
++
++pub fn inside(marks: []const u32, at: usize, n: usize, out: *[max_caps]u32) Inside {
++    var k: usize = 0;
++    for (marks) |m| if (m > at and m < at + n) {
++        if (k == max_caps) return .{ .n = k, .rows = m - at };
++        out[k] = m;
++        k += 1;
++    };
++    return .{ .n = k, .rows = n };
++}
++
++/// TF_INK2_SNAP_SPLIT=1 (rank 0, A/B): every mark ends a chunk (stage 1), no capture.
++pub fn splitAtMarks() bool {
++    const v = std.c.getenv("TF_INK2_SNAP_SPLIT") orelse return false;
++    return v[0] == '1' and v[1] == 0;
++}
++
++/// The capture hook for the forward of `R` rows of `slot` from `pos0` (cuda_engine.zig forward), when the capture
++/// step armed it for that chunk; it is taken once.
++pub fn forwardHook(e: *Engine, slot: u32, pos0: usize, R: usize) ?@import("cuda_forward.zig").Capture {
++    const p = &e.snap.capture;
++    if (!p.armed) return null;
++    p.armed = false;
++    if (p.slot != slot or p.pos0 != pos0 or p.rows != R) return null;
++    p.ran = true;
++    return .{ .ctx = e, .conv = captureConv };
++}
++
++/// Before the commit of convolution state `conv_state` with rows x (the chunk's, from pos0): each mark m's state,
++/// the commit kernel over (the old state, rows pos0 .. m - 1), into capture i at the convolution's place.
++fn captureConv(ptr: *anyopaque, c: *const ops.Ctx, conv_state: u64, x: Mat) anyerror!void {
++    const e: *Engine = @ptrCast(@alignCast(ptr));
++    const a = &e.snap;
++    const p = &a.capture;
++    const cap = a.cap orelse return error.NoArena;
++    const st = e.slots.items[p.slot] orelse return error.UnknownSlot;
++    var off: u64 = 0;
++    for (st.layers, e.w.layers) |ls, l| {
++        const kv: u64 = conv.state_rows * @as(u64, l.hk) * D * 2;
++        const hh: u64 = conv.state_rows * H * 2;
++        for ([4]u64{ ls.conv_k, ls.conv_v, ls.conv_attn, ls.conv_mlp }, [4]u64{ kv, kv, hh, hh }) |q, n| {
++            if (q == conv_state) {
++                for (p.marks[0..p.n], 0..) |m, i| {
++                    const dst = cap.ptr + i * a.cap_stride + off;
++                    const k = m - p.pos0;
++                    if (k < conv.state_rows) try c.copy(dst, conv_state, @intCast(n)); // rows before the chunk stay
++                    try state.convCommit(c, dst, x.slice(0, k));
++                }
++                return;
++            }
++            off += n;
++        }
++    }
++}
++
++/// Rank 0, before the forward of rows [at, at + n) of `slot`: the marks inside it captured by that forward on every
++/// rank.
++pub fn capture(x: Leader, slot: u32, at: usize, n: usize, marks: []const u32) !void {
++    const e = x.e;
++    if (e.snap.cap == null or marks.len == 0 or marks.len > max_caps) return error.BadCapture;
++    var h: Header = .{ .kind = @intFromEnum(Kind.capture), .slot = slot, .pos0 = at, .rows = @intCast(n), .nseg = @intCast(marks.len) };
++    for (marks, 0..) |m, i| h.tokens[i] = @intCast(m);
++    try x.send(h);
++    setCapture(e, h);
++}
++
++fn setCapture(e: *Engine, h: Header) void {
++    const p = &e.snap.capture;
++    p.* = .{ .slot = h.slot, .pos0 = h.pos0, .rows = h.rows, .n = h.nseg, .armed = true };
++    for (p.marks[0..p.n], h.tokens[0..p.n]) |*m, v| m.* = @intCast(v);
++}
++
++/// The capture that holds slot `slot`'s state at `at` (a mark inside the last forward, which took the capture), or
++/// null.
++fn capturedAt(e: *const Engine, slot: u32, at: usize) ?usize {
++    const p = &e.snap.capture;
++    if (!p.ran or p.slot != slot) return null;
++    const st = e.slots.items[slot] orelse return null;
++    if (st.last_pos0 != p.pos0 or st.last_rows != p.rows or st.pos != p.pos0 + p.rows) return null; // another forward since
++    for (p.marks[0..p.n], 0..) |m, i| if (m == at) return i;
++    return null;
++}
++
++/// A save's flag (Header.head_lo): the convolution rows come from capture (low byte).
++const cap_flag: u32 = 0x200;
++
++/// One layer as the copies see it (cuda_weights.zig Layer has the same two fields).
++pub const LayerShape = struct { hk: u32, global: bool };
++
++/// The global layers' rows a state at `at` copies: the tail past its whole pages.
++pub fn tailRows(at: usize) usize {
++    return at % pages.page_rows;
++}
++
++/// The bytes a state at `at` copies, unrounded: `layers` (anything with hk and global), the drafter's key heads (0:
++/// no drafter); the global layers' rows below the tail are the pages it references.
++pub fn rawBytes(layers: anytype, drafter_hk: usize, at: usize) u64 {
++    var n: u64 = 0;
++    for (layers) |l| {
++        const row: u64 = @as(u64, l.hk) * D * 2;
++        n += 2 * conv.state_rows * row + 2 * conv.state_rows * H * 2;
++        n += 2 * row * @as(u64, if (l.global) tailRows(at) else @min(at, ring_keep));
++    }
++    if (drafter_hk > 0) {
++        const row: u64 = @as(u64, drafter_hk) * D * 2;
++        for (dspark.local) |loc| n += 2 * row * @as(u64, if (loc) @min(at, draft_keep) else tailRows(at));
++    }
++    return n;
++}
++
++pub fn rounded(n: u64) u64 {
++    return (n + granule - 1) / granule * granule;
++}
++
++/// A position whose copy is the largest: full rings (>= 1,024) and the longest tail (255 rows).
++pub const widest_at: usize = 4 * pages.page_rows + pages.page_rows - 1;
++
++/// An arena slot's bytes: the largest copy any state takes (every rank the same: equal head shares), rounded.
++pub fn slotBytes(layers: anytype, drafter_hk: usize) u64 {
++    return rounded(rawBytes(layers, drafter_hk, widest_at));
++}
++
++/// The arena bytes a state at `at` takes on this engine: one slot, whatever `at`.
++pub fn bytes(e: *const Engine, at: usize) u64 {
++    _ = at;
++    return slotBytes(e.w.layers, if (e.drafter) |dr| dr.hk else 0);
++}
++
++/// Free extents of the arena (rank 0): best fit, holes kept sorted and merged. Room for every hole is reserved up
++/// front, so giving an extent back never allocates.
++pub const Extents = struct {
++    pub const Span = struct { off: u64, len: u64 };
++    holes: std.ArrayList(Span) = .empty,
++    size: u64 = 0,
++
++    pub fn init(gpa: std.mem.Allocator, size: u64) !Extents {
++        var x: Extents = .{ .size = size };
++        try x.holes.ensureTotalCapacity(gpa, @intCast(size / granule / 2 + 2));
++        if (size > 0) x.holes.appendAssumeCapacity(.{ .off = 0, .len = size });
++        return x;
++    }
++
++    pub fn deinit(x: *Extents, gpa: std.mem.Allocator) void {
++        x.holes.deinit(gpa);
++    }
++
++    /// The smallest hole that holds `n` bytes (the lowest such on a tie); its first `n` bytes.
++    pub fn take(x: *Extents, n: u64) ?u64 {
++        if (n == 0) return null;
++        var best: ?usize = null;
++        for (x.holes.items, 0..) |h, i| if (h.len >= n and (best == null or h.len < x.holes.items[best.?].len)) {
++            best = i;
++        };
++        const i = best orelse return null;
++        const h = &x.holes.items[i];
++        const off = h.off;
++        if (h.len == n) _ = x.holes.orderedRemove(i) else {
++            h.off += n;
++            h.len -= n;
++        }
++        return off;
++    }
++
++    /// Bytes [off, off + n) free again, merged with the holes beside them.
++    pub fn give(x: *Extents, off: u64, n: u64) void {
++        var i: usize = 0;
++        while (i < x.holes.items.len and x.holes.items[i].off < off) i += 1;
++        const prev = i > 0 and x.holes.items[i - 1].off + x.holes.items[i - 1].len == off;
++        const next = i < x.holes.items.len and off + n == x.holes.items[i].off;
++        if (prev and next) {
++            x.holes.items[i - 1].len += n + x.holes.items[i].len;
++            _ = x.holes.orderedRemove(i);
++        } else if (prev) {
++            x.holes.items[i - 1].len += n;
++        } else if (next) {
++            x.holes.items[i].off = off;
++            x.holes.items[i].len += n;
++        } else x.holes.insertAssumeCapacity(i, .{ .off = off, .len = n });
++    }
++
++    pub fn free(x: *const Extents) u64 {
++        var n: u64 = 0;
++        for (x.holes.items) |h| n += h.len;
++        return n;
++    }
++
++    pub fn largest(x: *const Extents) u64 {
++        var n: u64 = 0;
++        for (x.holes.items) |h| n = @max(n, h.len);
++        return n;
++    }
++};
++
++/// What an extent of the arena holds (every rank): the save that wrote it.
++pub const Held = struct { off: u64, len: u64, tag: u32, at: u32 };
++
++/// One rank's arena: its device bytes, what each extent holds, and (rank 0) the free extents and the last tag.
++pub const Arena = struct {
++    buf: ?cuda.DeviceBuffer = null,
++    size: u64 = 0,
++    extents: Extents = .{},
++    held: std.ArrayList(Held) = .empty,
++    /// Rank 0: the kept states' records (their pages: the reclaim chain's count, cuda_lanes.zig fits).
++    live: std.ArrayList(*Kept) = .empty,
++    tag: u32 = 0,
++    saves: u64 = 0,
++    restores: u64 = 0,
++    /// Stage 1b: `max_caps` states' convolution rows captured inside a prompt chunk (every rank), and the chunk.
++    cap: ?cuda.DeviceBuffer = null,
++    cap_stride: u64 = 0,
++    capture: Capture = .{},
++    captured: u64 = 0,
++
++    pub fn deinit(a: *Arena, gpa: std.mem.Allocator) void {
++        if (a.buf) |*b| b.free();
++        if (a.cap) |*b| b.free();
++        a.extents.deinit(gpa);
++        a.held.deinit(gpa);
++        a.live.deinit(gpa);
++        a.* = .{};
++    }
++
++    /// A save wrote [off, off + len): the states it overlapped are gone.
++    pub fn note(a: *Arena, off: u64, len: u64, tag: u32, at: u32) void {
++        var i: usize = 0;
++        while (i < a.held.items.len) {
++            const h = a.held.items[i];
++            if (h.off < off + len and off < h.off + h.len) _ = a.held.swapRemove(i) else i += 1;
++        }
++        a.held.appendAssumeCapacity(.{ .off = off, .len = len, .tag = tag, .at = at });
++    }
++
++    /// The extent at `off` holds save `tag` of `at` tokens.
++    pub fn holds(a: *const Arena, off: u64, tag: u32, at: u32) bool {
++        for (a.held.items) |h| if (h.off == off) return h.tag == tag and h.at == at;
++        return false;
++    }
++
++    fn forget(a: *Arena, off: u64) void {
++        for (a.held.items, 0..) |h, i| if (h.off == off) {
++            _ = a.held.swapRemove(i);
++            return;
++        };
++    }
++};
++
++/// This rank's arena of `n` bytes (start-up; every rank the same size).
++pub fn arenaInit(e: *Engine, n: u64) !void {
++    if (e.snap.buf != null) return error.ArenaTwice;
++    if (n == 0 or n % granule != 0) return error.BadArena;
++    var a: Arena = .{ .size = n };
++    errdefer a.deinit(e.gpa);
++    a.extents = try Extents.init(e.gpa, n);
++    try a.held.ensureTotalCapacity(e.gpa, @intCast(n / granule + 1));
++    try a.live.ensureTotalCapacity(e.gpa, @intCast(n / granule + 1));
++    a.buf = try cuda.DeviceBuffer.alloc(e.d, @intCast(n));
++    a.cap_stride = convBytes(e.w.layers);
++    a.cap = try cuda.DeviceBuffer.alloc(e.d, @intCast(max_caps * a.cap_stride));
++    e.snap = a;
++    std.log.info("inkling2 rank {d}: prompt cache arena {d:.2} GiB: {d} kept states of {d} MiB (each its pages by reference, its fixed part and tail rows copied)", .{ e.o.rank, gib(n), n / bytes(e, 0), bytes(e, 0) >> 20 });
++}
++
++pub const Dir = enum { out, in };
++
++/// Positions [lo, hi) of a store of `slots` slots (position p at slot p % slots) as at most two runs of slots, in
++/// position order (hi - lo <= slots).
++pub const Runs = struct {
++    pub const Run = struct { slot: usize, len: usize };
++    r: [2]Run = undefined,
++    n: usize = 0,
++};
++
++pub fn ringRuns(slots: usize, lo: usize, hi: usize) Runs {
++    var out: Runs = .{};
++    var p = lo;
++    while (p < hi and out.n < 2) {
++        const s = p % slots;
++        const n = @min(hi - p, slots - s);
++        out.r[out.n] = .{ .slot = s, .len = n };
++        out.n += 1;
++        p += n;
++    }
++    return out;
++}
++
++/// Rows of a prompt chunk from `at`: at most `max`, and it ends at the first of `marks` (ascending) past `at`.
++pub fn rowsTo(marks: []const u32, at: usize, max: usize) usize {
++    for (marks) |m| if (m > at) return @min(max, m - at);
++    return max;
++}
++
++/// The copies between a slot and an arena extent, in one fixed order (so out and in agree), counted without a
++/// context.
++pub const Walk = struct {
++    c: ?*const ops.Ctx,
++    dir: Dir,
++    base: u64,
++    off: u64 = 0,
++
++    fn move(w: *Walk, live: u64, n: u64) !void {
++        if (n == 0) return;
++        if (w.c) |c| switch (w.dir) {
++            .out => try c.copy(w.base + w.off, live, @intCast(n)),
++            .in => try c.copy(live, w.base + w.off, @intCast(n)),
++        };
++        w.off += n;
++    }
++
++    /// Positions [lo, hi) of a store of `slots` slots, `row` bytes each, in position order.
++    pub fn rows(w: *Walk, ptr: u64, slots: usize, row: usize, lo: usize, hi: usize) !void {
++        if (hi < lo or hi - lo > slots) return error.SnapRing;
++        const runs = ringRuns(slots, lo, hi);
++        for (runs.r[0..runs.n]) |r| try w.move(ptr + r.slot * row, r.len * row);
++    }
++
++    /// `rows` for a mirrored ring (cuda_dspark.zig Caches: position p at row p % slots, and rows below `mirror` again
++    /// at row + slots): a restore also writes each restored row below `mirror` to its mirror, from the same arena
++    /// bytes (the arena holds each position once).
++    pub fn mirrored(w: *Walk, ptr: u64, slots: usize, row: usize, lo: usize, hi: usize, mirror: usize) !void {
++        const off0 = w.off;
++        try w.rows(ptr, slots, row, lo, hi);
++        const c = w.c orelse return;
++        if (w.dir != .in) return;
++        var p = lo;
++        while (mirrorRun(slots, mirror, p, hi)) |m| {
++            try c.copy(ptr + (m.row + slots) * row, w.base + off0 + (m.p - lo) * row, @intCast(m.n * row));
++            p = m.p + m.n;
++        }
++    }
++};
++
++/// The next run of positions in [p, hi) whose ring rows (p % slots) lie below `mirror`: its first position, row and
++/// length, or null.
++pub fn mirrorRun(slots: usize, mirror: usize, p0: usize, hi: usize) ?struct { p: usize, row: usize, n: usize } {
++    var p = p0;
++    while (p < hi) {
++        const r = p % slots;
++        if (r >= mirror) {
++            p += slots - r;
++            continue;
++        }
++        return .{ .p = p, .row = r, .n = @min(hi - p, mirror - r) };
++    }
++    return null;
++}
++
++/// `conv_src` (a save inside the last forward): the convolution rows come from that capture, laid out in this order.
++fn walk(e: *Engine, c: ?*const ops.Ctx, dir: Dir, slot: u32, at: usize, base: u64, conv_src: ?u64) !u64 {
++    if (slot >= e.slots.items.len) return error.UnknownSlot;
++    const st = e.slots.items[slot] orelse return error.UnknownSlot;
++    if (at == 0 or at > st.context) return error.BadSnapPosition;
++    if (conv_src != null and dir != .out) return error.BadCapture;
++    var w: Walk = .{ .c = c, .dir = dir, .base = base };
++    var cp: u64 = conv_src orelse 0;
++    for (st.layers, e.w.layers) |ls, l| {
++        const cols: usize = @as(usize, l.hk) * D;
++        for ([4]u64{ ls.conv_k, ls.conv_v, ls.conv_attn, ls.conv_mlp }, [4]usize{ cols, cols, H, H }) |q, n| {
++            const len = conv.state_rows * n * 2;
++            try w.move(if (conv_src != null) cp else q, len);
++            cp += len;
++        }
++        if (l.global) {
++            // a global layer on pages: the tail rows [B, at) (the pages below B are the state's by reference)
++            if (!ls.kv.paged()) return error.CacheNeedsPages;
++            if (at > st.limit()) return error.PastPages;
++            const lo = at - tailRows(at);
++            var keys = state.RowRuns.of(ls.kv, st.ids, lo, at);
++            while (try keys.next()) |r| try w.move(r.k, r.n * cols * 2);
++            var values = state.RowRuns.of(ls.kv, st.ids, lo, at);
++            while (try values.next()) |r| try w.move(r.v, r.n * cols * 2);
++        } else {
++            const lo = at -| ring_keep;
++            try w.rows(ls.kv.k, ls.kv.slots, cols * 2, lo, at);
++            try w.rows(ls.kv.v, ls.kv.slots, cols * 2, lo, at);
++        }
++    }
++    if (e.drafter) |dr| {
++        if (slot >= dr.caches.items.len) return error.UnknownSlot;
++        const cs = &(dr.caches.items[slot] orelse return error.UnknownSlot);
++        if (at > dr.context) return error.BadSnapPosition;
++        // a local layer is a mirrored ring of cs.wrap(i) positions (lane M), or position-indexed (wrap 0)
++        for (dspark.local, 0..) |loc, i| {
++            if (!loc) {
++                // the global layer on pages (stage 2c) as the target's: the tail rows, the rest by reference
++                const kv = cs.pagedKv(st.ids.len) orelse return error.CacheNeedsPages;
++                if (at > st.limit()) return error.PastPages;
++                const lo = at - tailRows(at);
++                var keys = state.RowRuns.of(kv, st.ids, lo, at);
++                while (try keys.next()) |r| try w.move(r.k, r.n * cs.row);
++                var values = state.RowRuns.of(kv, st.ids, lo, at);
++                while (try values.next()) |r| try w.move(r.v, r.n * cs.row);
++                continue;
++            }
++            const lo = at -| draft_keep;
++            const ring = cs.wrap(i);
++            if (ring > 0) {
++                try w.mirrored(cs.keys(i), ring, cs.row, lo, at, dspark.window);
++                try w.mirrored(cs.values(i), ring, cs.row, lo, at, dspark.window);
++            } else {
++                try w.rows(cs.keys(i), cs.context, cs.row, lo, at);
++                try w.rows(cs.values(i), cs.context, cs.row, lo, at);
++            }
++        }
++    }
++    return w.off;
++}
++
++fn ctx(e: *Engine) ops.Ctx {
++    return .{ .d = e.d, .stream = e.stream, .k = &e.k, .gemms = &e.gemms, .scratch = &e.scratch };
++}
++
++/// The copies of `at` tokens' state in direction `dir` between slot `slot` and the arena at `off` (on the engine's
++/// stream, after the slot's forwards and before its next).
++fn copy(e: *Engine, dir: Dir, slot: u32, at: usize, off: u64, cap_i: ?usize) !void {
++    const conv_src: ?u64 = if (cap_i) |i| (e.snap.cap orelse return error.NoArena).ptr + i * e.snap.cap_stride else null;
++    const buf = e.snap.buf orelse return error.NoArena;
++    const n = try walk(e, null, dir, slot, at, 0, null);
++    if (n != rawBytes(e.w.layers, if (e.drafter) |dr| dr.hk else 0, at)) return error.SnapLayout;
++    if (off % granule != 0 or off + rounded(n) > e.snap.size) return error.SnapOutside;
++    const c = ctx(e);
++    _ = try walk(e, &c, dir, slot, at, buf.ptr + off, conv_src);
++}
++
++/// Slot `slot` (its forwards so far ended at `at`) copied into the arena at `off`.
++pub fn copyOut(e: *Engine, slot: u32, at: usize, off: u64) !void {
++    try copy(e, .out, slot, at, off, null);
++}
++
++/// Slot `slot`'s state at `at` into the arena at `off`: its forwards ended at `at`, or (`cap_i`) `at` is a mark inside
++/// the last forward and capture cap_i holds its convolution rows.
++pub fn copyOutFrom(e: *Engine, slot: u32, at: usize, off: u64, cap_i: ?usize) !void {
++    try copy(e, .out, slot, at, off, cap_i);
++}
++
++/// The arena at `off` copied into slot `slot`, which then stands at `at` as if its own forwards had ended there.
++pub fn copyIn(e: *Engine, slot: u32, at: usize, off: u64) !void {
++    try copy(e, .in, slot, at, off, null);
++    const st = e.slots.items[slot].?;
++    st.pos = at;
++    st.last_pos0 = at;
++    st.last_rows = 0; // no keep or draft before the next forward
++    st.kept_inputs = false;
++    st.last_row0 = 0;
++    st.last_fwd = 0; // the taps are not this slot's
++    e.rows = 0; // no head over another slot's rows
++    e.head_n = 0;
++    try control(e, slot, at);
++}
++
++/// TF_INK2_SNAP_CONTROL (negative controls of the resume gate, every rank): after each restore, one piece of the
++/// state it restored is overwritten (finite bytes), so the warm run must differ: `ring` the oldest kept ring position
++/// of every sliding layer (at >= 1023), `conv` every layer's oldest post-MLP convolution row (at >= 3), `draft` the
++/// drafter's global layer's keys at positions [0, 16).
++fn control(e: *Engine, slot: u32, at: usize) !void {
++    const v = std.mem.span(std.c.getenv("TF_INK2_SNAP_CONTROL") orelse return);
++    const c = ctx(e);
++    const st = e.slots.items[slot].?;
++    const byte: u8 = 0x3c;
++    const view = struct {
++        fn fill(cx: *const ops.Ctx, p: u64, n: usize, b: u8) !void {
++            const d: cuda.DeviceBuffer = .{ .d = cx.d, .ptr = p, .len = n, .borrowed = true };
++            try d.fill8(b, cx.stream.handle);
++        }
++    };
++    if (std.mem.eql(u8, v, "ring") and at >= ring_keep) {
++        for (st.layers, e.w.layers) |ls, l| if (!l.global) {
++            const row: usize = @as(usize, l.hk) * D * 2;
++            try view.fill(&c, ls.kv.k + ((at - ring_keep) % ls.kv.slots) * row, row, byte);
++        };
++    } else if (std.mem.eql(u8, v, "conv") and at >= conv.state_rows) {
++        for (st.layers) |ls| try view.fill(&c, ls.conv_mlp, H * 2, byte);
++    } else if (std.mem.eql(u8, v, "draft")) {
++        // on pages positions [0, 16) are the first rows of the slot's first page
++        if (e.drafter) |dr| if (dr.caches.items[slot]) |cs| try view.fill(&c, if (cs.pg) |pg| pg.k + @as(u64, st.ids[0]) * pg.page * 2 else cs.keys(2), @min(at, 16) * cs.row, 0x47); // bf16 51,000: large, finite
++    }
++}
++
++/// Tests: every byte of slot `slot`'s state (and its drafter caches) set to `byte`; not its rollback table (the
++/// slot's own pointers, made once at its start), nor its first `shared` pages (a kept state's, adopted: other
++/// streams and states read them).
++fn poison(e: *Engine, slot: u32, byte: u8, shared: usize) !void {
++    const st = e.slots.items[slot] orelse return error.UnknownSlot;
++    for (st.own.items) |b| if (b.ptr != st.keep_table and b.ptr != st.table) try b.fill8(byte, e.stream.handle);
++    // on the pool: the slot's own mapped pages in every region
++    if (e.pool) |p| if (st.paged() and st.mapped > shared) try pages.fillIn(e.d, e.stream, p.place(), p.regions, st.ids[shared..st.mapped], byte);
++    if (e.drafter) |dr| if (dr.caches.items[slot]) |cs| try cs.buf.fill8(byte, e.stream.handle);
++}
++
++/// A restore's test flag (Header.head_lo): poison the slot with the low byte first.
++const poison_flag: u32 = 0x100;
++
++/// What rank 0 checks before a save's header: the slot's forwards ended at `at` and none is rolled back pending.
++pub fn savable(e: *Engine, slot: u32, at: usize) !*state.State {
++    if (slot >= e.slots.items.len) return error.UnknownSlot;
++    const st = e.slots.items[slot] orelse return error.UnknownSlot;
++    if (at == 0 or st.pos != at or st.last_pos0 + st.last_rows != st.pos or st.last_rows == 0) return error.NotAtMark;
++    return st;
++}
++
++const Fault = struct {
++    var restores: u64 = 0;
++    var tags: u64 = 0;
++
++    /// TF_INK2_SNAP_FAULT=`name`:N names this call (the N-th of its kind).
++    fn hit(comptime name: []const u8, count: *u64) bool {
++        const v = std.mem.span(std.c.getenv("TF_INK2_SNAP_FAULT") orelse return false);
++        const colon = std.mem.indexOfScalar(u8, v, ':') orelse return false;
++        if (!std.mem.eql(u8, v[0..colon], name)) return false;
++        const n = std.fmt.parseInt(u64, v[colon + 1 ..], 10) catch return false;
++        count.* += 1;
++        if (count.* != n) return false;
++        std.log.warn("inkling2: TF_INK2_SNAP_FAULT {s}:{d} induced", .{ name, n });
++        return true;
++    }
++};
++
++/// Rank 0, start-up: the arena of `budget` bytes less the capture area (rounded down to a whole number of slots) on
++/// every rank; the other ranks sleep again after. Returns the arena's bytes (the store's budget). The window layout
++/// (TF_INK2_PAGES=0) keeps none: 0.
++pub fn arena(x: Leader, budget: u64) !u64 {
++    if (!x.e.paged) {
++        std.log.info("inkling2: no prompt cache: the window layout (TF_INK2_PAGES=0) keeps no prompts (they live on the KV page pool)", .{});
++        return 0;
++    }
++    const slot = bytes(x.e, 0);
++    const n = (budget -| capBytes(x.e)) / slot * slot;
++    if (n == 0) return 0;
++    try arenaInit(x.e, n);
++    if (x.e.o.world > 1) {
++        try x.send(.{ .kind = @intFromEnum(Kind.arena), .pos0 = n });
++        try x.idle();
++    }
++    return n; // the store's budget: the capture area and the bytes past the last granule are set aside
++}
++
++/// Rank 0: slot `slot`'s state at `at` kept into `k`, on every rank (`k` stays registered until `drop`): its whole
++/// pages referenced (rank 0's count), its fixed part and tail rows copied into a free slot of the arena;
++/// error.CacheFull before any rank moves.
++pub fn save(x: Leader, slot: u32, at: usize, k: *Kept) !void {
++    const e = x.e;
++    const a = &e.snap;
++    if (a.buf == null) return error.NoArena;
++    const p = e.pool orelse return error.CacheNeedsPages;
++    const al = if (p.alloc) |*al| al else return error.NotLeader;
++    const ci = capturedAt(e, slot, at);
++    const st = if (ci == null) try savable(e, slot, at) else e.slots.items[slot].?;
++    if (at > st.limit()) return error.PastPages;
++    const n = bytes(e, at);
++    const off = a.extents.take(n) orelse return error.CacheFull;
++    errdefer a.extents.give(off, n);
++    const held = try e.gpa.dupe(u32, st.ids[0 .. at / pages.page_rows]);
++    errdefer e.gpa.free(held);
++    try a.live.ensureUnusedCapacity(e.gpa, 1);
++    a.tag +%= 1;
++    if (a.tag == 0) a.tag = 1;
++    k.* = .{ .tag = a.tag, .at = @intCast(at), .off = off, .bytes = n, .pages = held };
++    try x.send(.{ .kind = @intFromEnum(Kind.save), .slot = slot, .rows = k.at, .pos0 = off, .token = k.tag, .head_lo = if (ci) |i| cap_flag | @as(u32, @intCast(i)) else 0 });
++    copyOutFrom(e, slot, at, off, ci) catch |err| return x.stop(err);
++    for (held) |id| al.retain(id);
++    if (ci != null) a.captured += 1;
++    a.note(off, n, k.tag, k.at);
++    a.live.appendAssumeCapacity(k);
++    a.saves += 1;
++}
++
++/// What rank 0 checks before a restore's header: the extent still holds `k`, the slot's table starts with its pages
++/// (adopted: Pool.open), and the slot can stand at its position.
++pub fn restorable(e: *Engine, slot: u32, k: Kept) !void {
++    if (!e.snap.holds(k.off, k.tag, k.at)) return error.SnapshotStale;
++    const st = try e.bind(slot);
++    if (k.at == 0 or k.at >= st.context) return error.SnapshotNotPrefix;
++    if (k.at >= st.limit()) return error.PastPages; // on the pool: the slot's stream holds no page past the state
++    if (st.mapped < k.pages.len or !std.mem.eql(u32, st.ids[0..k.pages.len], k.pages)) return error.NotAdopted;
++    if (Fault.hit("restore", &Fault.restores)) return error.InducedFault;
++}
++
++/// Rank 0: slot `slot` set to kept state `k` on every rank (its next forward starts at k.at): its table must start
++/// with the state's pages (the lanes' open adopts them; tooling on the tool pool: adopted here, with fresh pages to
++/// the slot's whole context). `poison_byte` (tests): the slot's every byte but the adopted pages set to it first.
++pub fn restore(x: Leader, slot: u32, k: Kept, poison_byte: ?u8) !void {
++    if (x.e.tool_pool) {
++        if (!x.e.snap.holds(k.off, k.tag, k.at)) return error.SnapshotStale;
++        _ = try x.openPages(slot, x.e.pool.?.entries, k.pages);
++    }
++    try restorable(x.e, slot, k);
++    const h: Header = .{ .kind = @intFromEnum(Kind.restore), .slot = slot, .rows = k.at, .pos0 = k.off, .token = k.tag, .head_lo = if (poison_byte) |b| poison_flag | b else 0 };
++    try x.send(h);
++    apply(x.e, h) catch |err| return x.stop(err);
++}
++
++fn apply(e: *Engine, h: Header) !void {
++    _ = try e.bind(h.slot); // a follower's slot may not have run yet
++    if (h.head_lo & poison_flag != 0) try poison(e, h.slot, @truncate(h.head_lo), h.rows / pages.page_rows);
++    try copyIn(e, h.slot, h.rows, h.pos0);
++    e.snap.restores += 1;
++}
++
++/// Rank 0: kept state `k` dropped: its extent free for later saves, its pages' references gone (a page no stream
++/// holds is free again). Nothing is sent: a follower's record of it is overwritten by the next save there, and a
++/// restore is only ever sent for a state rank 0 holds.
++pub fn drop(x: Leader, k: *Kept) void {
++    const e = x.e;
++    const a = &e.snap;
++    a.forget(k.off);
++    a.extents.give(k.off, k.bytes);
++    if (e.pool) |p| if (p.alloc) |*al| {
++        for (k.pages) |id| al.release(id);
++        p.show(); // /health's counts (B3): an evicted state's pages may be free now
++    };
++    if (k.pages.len > 0) e.gpa.free(k.pages);
++    k.pages = &.{};
++    for (a.live.items, 0..) |q, i| if (q == k) {
++        _ = a.live.swapRemove(i);
++        break;
++    };
++}
++
++/// Rank 0: the pages of kept states the reclaim chain may not drop (`borrowed`: a resume in flight), for
++/// Pool.reclaimable; at most `out.len`.
++pub fn protectedPages(e: *const Engine, ctx_: *anyopaque, borrowed: *const fn (*anyopaque, *anyopaque) bool, out: [][]const u32) [][]const u32 {
++    var n: usize = 0;
++    for (e.snap.live.items) |k| {
++        if (n == out.len) break;
++        if (borrowed(ctx_, k)) {
++            out[n] = k.pages;
++            n += 1;
++        }
++    }
++    return out[0..n];
++}
++
++/// A rank other than 0: the save, restore, arena and capture steps.
++pub fn follow(e: *engine.Engine, h: Header) !void {
++    switch (std.enums.fromInt(Kind, h.kind) orelse return error.BadStep) {
++        .arena => try arenaInit(e, h.pos0),
++        .capture => setCapture(e, h),
++        .save => {
++            const n = bytes(e, h.rows);
++            try copyOutFrom(e, h.slot, h.rows, h.pos0, if (h.head_lo & cap_flag != 0) @as(usize, h.head_lo & 0xff) else null);
++            e.snap.note(h.pos0, n, h.token, h.rows);
++            e.snap.saves += 1;
++        },
++        .restore => {
++            const tag = if (Fault.hit("tag", &Fault.tags)) h.token +% 1 else h.token;
++            if (!e.snap.holds(h.pos0, tag, h.rows)) {
++                std.log.err("inkling2 rank {d}: rank 0 restores save {d} ({d} tokens) at arena offset {d}, which this rank does not hold", .{ e.o.rank, h.token, h.rows, h.pos0 });
++                return error.SnapTagMismatch;
++            }
++            try apply(e, h);
++        },
++        else => return error.BadStep,
++    }
++}
++
++fn gib(b: u64) f64 {
++    return @as(f64, @floatFromInt(b)) / (1 << 30);
++}
++
++/// Every field of a slot's state is either copied (state) or rewritten before it is read again (scratch), named
++/// here; a new field fails the build until it is classified (a resume must not silently miss state).
++const Census = struct { state: []const []const u8, scratch: []const []const u8 };
++
++const census_state: Census = .{
++    .state = &.{ "layers", "pos", "last_pos0", "last_rows", "kept_inputs" },
++    // the slot's allocation, the same in every slot (keep_table: its rollback table, of this slot's buffers); the last
++    // forward's taps row and count, rewritten by the next forward (a restore leaves no taps to draft from)
++    // place, table, ids, mapped: where the slot's global layers live (on pages: the stream's own pages, mapped when it
++    // opened; a state's rows are copied into them, never its page ids); run, ring_on_run, last_one, moves, ones, flip:
++    // whether those pages are one run and which kernels a one-row forward takes on them (the slot's, not the state's)
++    .scratch = &.{ "gpa", "first", "own", "bytes", "context", "keep_table", "keep_entries", "last_row0", "last_fwd", "place", "table", "ids", "mapped", "run", "ring_on_run", "last_one", "moves", "ones", "flip" },
++};
++const census_layer: Census = .{
++    .state = &.{ "kv", "conv_k", "conv_v", "conv_attn", "conv_mlp" },
++    // one verify window's convolution inputs, rewritten by the next forward (a restore sets last_rows = 0: no keep)
++    .scratch = &.{"hist"},
++};
++const census_caches: Census = .{
++    .state = &.{"buf"},
++    // the slot's shape: positions, a local layer's ring (mirrored below dspark.window), bytes a position; on pages
++    // where its global layer lives (the slot's pages, walked as the target's global layers are)
++    .scratch = &.{ "context", "ring", "row", "pg" },
++};
++
++fn censusCheck(comptime T: type, comptime c: Census) void {
++    @setEvalBranchQuota(10000);
++    inline for (@typeInfo(T).@"struct".field_names) |name| {
++        var known = false;
++        for (c.state) |n| known = known or std.mem.eql(u8, n, name);
++        for (c.scratch) |n| known = known or std.mem.eql(u8, n, name);
++        if (!known) @compileError("inkling2 prompt cache: " ++ @typeName(T) ++ "." ++ name ++ " is neither copied nor named scratch (cuda_snap.zig census)");
++    }
++}
++
++comptime {
++    censusCheck(state.State, census_state);
++    censusCheck(state.LayerState, census_layer);
++    censusCheck(dspark.Caches, census_caches);
++}
++
++test {
++    _ = @import("cuda_snap_test.zig");
++}
+diff --git a/zig/src/families/inkling2/cuda_snap_test.zig b/zig/src/families/inkling2/cuda_snap_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..813a30d8d18a616668eab8c778bbba2f6f354342
+--- /dev/null
++++ b/zig/src/families/inkling2/cuda_snap_test.zig
+@@ -0,0 +1,171 @@
++//! Host tests (no GPU) of the prompt cache's copies (cuda_snap.zig): the bytes a state takes, the ring's runs in
++//! position order, the arena's best-fit extents and what each holds, the cut planner, and the step kinds.
++const std = @import("std");
++const snap = @import("cuda_snap.zig");
++const follow = @import("cuda_follow.zig");
++const engine = @import("cuda_engine.zig");
++
++const t = std.testing;
++
++/// Inkling-2-Small at W ranks: 48 layers, every sixth global, 8 / W key heads each.
++fn shape(world: u32) [48]snap.LayerShape {
++    var s: [48]snap.LayerShape = undefined;
++    for (&s, 0..) |*l, i| l.* = .{ .hk = 8 / world, .global = (i + 1) % 6 == 0 };
++    return s;
++}
++
++fn gibOf(b: u64) f64 {
++    return @as(f64, @floatFromInt(b)) / (1 << 30);
++}
++
++test "inkling2 prompt cache on pages: a state's copy at W = 4, plain and with DSpark (the design's slots)" {
++    const s = shape(4);
++    // the global layers' whole pages are referenced: only the tail past them is copied (8,192 B a position: 8
++    // global layers, K and V of 2 heads), beside 40 rings of 1,023 positions and 2.67 MiB of convolutions
++    try t.expectEqual(@as(u64, 40 * 1024 * 1023 + 48 * 58368), snap.rawBytes(&s, 0, 2048));
++    try t.expectEqual(@as(u64, 8192 * 100 + 40 * 1024 * 1023 + 48 * 58368), snap.rawBytes(&s, 0, 2048 + 100));
++    try t.expectEqual(snap.rawBytes(&s, 0, 131072 + 255), snap.rawBytes(&s, 0, 1024 + 255));
++    // one slot fits every state: 46 MiB plain, 50 MiB with DSpark (its rings and its global layer's tail)
++    try t.expectEqual(@as(u64, 46 << 20), snap.slotBytes(&s, 0));
++    try t.expectEqual(@as(u64, 50 << 20), snap.slotBytes(&s, 2));
++    for ([_]usize{ 1, 255, 256, 1023, 1024, 2047, 2048, 3039, 131071, 1048575 }) |at| {
++        try t.expect(snap.rawBytes(&s, 0, at) <= snap.slotBytes(&s, 0));
++        try t.expect(snap.rawBytes(&s, 2, at) <= snap.slotBytes(&s, 2));
++        try t.expectEqual(at % 256, snap.tailRows(at));
++    }
++    // below the windows every sliding layer holds every position, a global layer its tail
++    try t.expectEqual(@as(u64, 40 * 1024 * 100 + 8 * 1024 * 100 + 48 * 58368), snap.rawBytes(&s, 0, 100));
++    try t.expectEqual(@as(u64, 40 * 1024 * 100 + 8 * 1024 * 100 + 48 * 58368 + 5 * 1024 * 100), snap.rawBytes(&s, 2, 100));
++}
++
++test "inkling2 prompt cache: ring positions are copied in position order, wrapped runs and all" {
++    var w: snap.Walk = .{ .c = null, .dir = .out, .base = 0 };
++    // 3,071 slots; [2,477, 3,500) wraps at 3,071
++    try w.rows(0, 3071, 1024, 3500 - 1023, 3500);
++    try t.expectEqual(@as(u64, 1023 * 1024), w.off);
++    const runs = snap.ringRuns(3071, 3500 - 1023, 3500);
++    try t.expectEqual(@as(usize, 2), runs.n);
++    try t.expectEqual([2]usize{ 2477, 594 }, .{ runs.r[0].slot, runs.r[0].len });
++    try t.expectEqual([2]usize{ 0, 429 }, .{ runs.r[1].slot, runs.r[1].len });
++    const one = snap.ringRuns(3071, 100, 1123);
++    try t.expectEqual(@as(usize, 1), one.n);
++    try t.expectEqual([2]usize{ 100, 1023 }, .{ one.r[0].slot, one.r[0].len });
++    // a whole lap ending on the boundary is one run
++    const lap = snap.ringRuns(3071, 2048, 3071);
++    try t.expectEqual(@as(usize, 1), lap.n);
++}
++
++test "inkling2 prompt cache: the arena's extents, best fit with merging (slots of one size never fragment)" {
++    const g = snap.granule;
++    var x = try snap.Extents.init(t.allocator, 10 * g);
++    defer x.deinit(t.allocator);
++    const a = x.take(2 * g).?;
++    const b = x.take(3 * g).?;
++    const c = x.take(1 * g).?;
++    try t.expectEqual([3]u64{ 0, 2 * g, 5 * g }, .{ a, b, c });
++    try t.expectEqual(@as(u64, 4 * g), x.free());
++    try t.expect(x.take(5 * g) == null); // refused: no hole holds it
++    x.give(a, 2 * g); // holes: [0, 2) and [6, 10)
++    try t.expectEqual(@as(u64, 0), x.take(2 * g).?); // best fit: the 2-granule hole, not the bigger one
++    x.give(0, 2 * g);
++    x.give(b, 3 * g); // [0, 5) merged
++    try t.expectEqual(@as(usize, 2), x.holes.items.len);
++    x.give(c, g); // [0, 10) whole again
++    try t.expectEqual(@as(usize, 1), x.holes.items.len);
++    try t.expectEqual(@as(u64, 10 * g), x.largest());
++    // a full arena gives back in any order
++    var parts: [10]u64 = undefined;
++    for (&parts) |*p| p.* = x.take(g).?;
++    try t.expect(x.take(g) == null);
++    for ([_]usize{ 3, 7, 0, 9, 5, 1, 8, 2, 6, 4 }) |i| x.give(parts[i], g);
++    try t.expectEqual(@as(usize, 1), x.holes.items.len);
++    try t.expectEqual(@as(u64, 10 * g), x.free());
++}
++
++test "inkling2 prompt cache: a save overwrites what its extent overlapped; a restore checks offset, tag and length" {
++    const g = snap.granule;
++    var a: snap.Arena = .{ .size = 8 * g };
++    defer a.held.deinit(t.allocator);
++    try a.held.ensureTotalCapacity(t.allocator, 9);
++    a.note(0, 2 * g, 1, 500);
++    a.note(2 * g, 2 * g, 2, 700);
++    try t.expect(a.holds(0, 1, 500) and a.holds(2 * g, 2, 700));
++    try t.expect(!a.holds(0, 2, 500) and !a.holds(0, 1, 501) and !a.holds(g, 1, 500));
++    a.note(g, 2 * g, 3, 900); // overlaps both
++    try t.expect(!a.holds(0, 1, 500) and !a.holds(2 * g, 2, 700) and a.holds(g, 3, 900));
++    try t.expectEqual(@as(usize, 1), a.held.items.len);
++}
++
++test "inkling2 prompt cache: the lane's chunks end at every mark and start at the resume point" {
++    const marks = [_]u32{ 600, 2048, 2100, 5000 };
++    try t.expectEqual(@as(usize, 600), snap.rowsTo(&marks, 0, 2048));
++    try t.expectEqual(@as(usize, 1448), snap.rowsTo(&marks, 600, 2048));
++    try t.expectEqual(@as(usize, 52), snap.rowsTo(&marks, 2048, 2048));
++    try t.expectEqual(@as(usize, 2048), snap.rowsTo(&marks, 2100, 2048));
++    try t.expectEqual(@as(usize, 852), snap.rowsTo(&marks, 4148, 2048));
++    try t.expectEqual(@as(usize, 7), snap.rowsTo(&marks, 5000, 7));
++    try t.expectEqual(@as(usize, 2048), snap.rowsTo(&.{}, 3, 2048));
++    // a pass from 0 with these marks: every mark is a chunk start, no chunk is wider than 2,048 rows
++    var at: usize = 0;
++    var starts: std.ArrayList(usize) = .empty;
++    defer starts.deinit(t.allocator);
++    while (at < 6000) {
++        try starts.append(t.allocator, at);
++        at += @min(6000 - at, snap.rowsTo(&marks, at, 2048));
++    }
++    for (marks) |m| try t.expect(std.mem.indexOfScalar(usize, starts.items, m) != null);
++    try t.expectEqualSlices(usize, &.{ 0, 600, 2048, 2100, 4148, 5000 }, starts.items);
++}
++
++test "inkling2 prompt cache: the save, restore and arena steps follow the draft step and fit the header" {
++    try t.expectEqual(@as(u32, 9), @intFromEnum(follow.Kind.save));
++    try t.expectEqual(@as(u32, 10), @intFromEnum(follow.Kind.restore));
++    try t.expectEqual(@as(u32, 11), @intFromEnum(follow.Kind.arena));
++    try t.expectEqual(@as(u32, 12), @intFromEnum(follow.Kind.move));
++    try t.expectEqual(@as(u32, 13), @intFromEnum(follow.Kind.capture));
++    const h: engine.Header = .{ .kind = @intFromEnum(follow.Kind.restore), .slot = 3, .rows = 131071, .pos0 = 40 << 30, .token = 0xffff_fffe };
++    var back: engine.Header = undefined;
++    @memcpy(std.mem.asBytes(&back), std.mem.asBytes(&h));
++    try t.expectEqual(h, back);
++}
++
++test "a mirrored ring's restore writes every row below the mirror once more, and nothing else" {
++    const slots = 3072;
++    const mirror = 1024;
++    for ([_]usize{ 1, 500, 1023, 1024, 1025, 2047, 3071, 3072, 3073, 4000, 6143, 6144, 9000, 131071 }) |at| {
++        const lo = at -| 1024;
++        var seen: [slots]u8 = @splat(0);
++        var p = lo;
++        while (snap.mirrorRun(slots, mirror, p, at)) |m| {
++            try t.expect(m.p >= p and m.n > 0 and m.p + m.n <= at);
++            for (m.p..m.p + m.n, 0..) |q, i| {
++                try t.expectEqual(q % slots, m.row + i);
++                seen[q % slots] += 1;
++            }
++            p = m.p + m.n;
++        }
++        for (lo..at) |q| try t.expectEqual(@as(u8, if (q % slots < mirror) 1 else 0), seen[q % slots]);
++    }
++}
++
++test "marks inside a chunk: at most max_caps captured, the chunk ends at the next" {
++    var out: [snap.max_caps]u32 = undefined;
++    const marks = [_]u32{ 1, 2, 3, 8, 9, 1000, 1023, 1024, 2047, 2048, 2049, 3039 };
++    const a = snap.inside(&marks, 0, 2048, &out);
++    try t.expectEqual(@as(usize, 8), a.n);
++    try t.expectEqual(@as(usize, 2047), a.rows); // the ninth ends the chunk, kept after it
++    try t.expectEqualSlices(u32, marks[0..8], out[0..8]);
++    const b = snap.inside(&marks, 2047, 993, &out);
++    try t.expectEqual(@as(usize, 3), b.n);
++    try t.expectEqual(@as(usize, 993), b.rows);
++    try t.expectEqualSlices(u32, &.{ 2048, 2049, 3039 }, out[0..3]);
++    // a mark on the chunk's end is not inside it; none at its start either
++    const c = snap.inside(&.{ 2048, 4096 }, 2048, 2048, &out);
++    try t.expectEqual(@as(usize, 0), c.n);
++    try t.expectEqual(@as(usize, 2048), c.rows);
++}
++
++test "the capture area: every layer's four convolution states, as a state's" {
++    const s = shape(4);
++    try t.expectEqual(snap.convBytes(&s), snap.rawBytes(&s, 0, 0));
++}
+diff --git a/zig/src/native/cuda_snaps.zig b/zig/src/native/cuda_snaps.zig
+index a0f1685a30721346258ca7eed02cd1a5a21af76b..7ee88c3ac67308b169016f31c1ac3dc793888f01 100644
+--- a/zig/src/native/cuda_snaps.zig
++++ b/zig/src/native/cuda_snaps.zig
+@@ -8,6 +8,7 @@ pub fn cacheRules(comptime F: type) api.prompt_cache.Rules {
+     if (@hasDecl(F, "snap_lookahead")) rules.lookahead = F.snap_lookahead;
+     if (@hasDecl(F, "warm_quiet")) rules.warm = .waits;
+     if (@hasDecl(F, "snap_fork")) rules.fork = F.snap_fork; // opt-in, a family at a time after its device check
++    if (@hasDecl(F, "snap_shared_first")) rules.shared_first = F.snap_shared_first;
+     if (@hasDecl(F, "snap_tail")) rules.tail = if (@import("core").profile.lookup(F.snap_tail)) |v| std.mem.eql(u8, v, "1") else false;
+     if (@hasDecl(F, "snap_grid")) {
+         rules.planned = true;
