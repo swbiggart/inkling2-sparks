@@ -1,0 +1,10 @@
+# /etc/default/inkling2-fabric: read by inkling2-fabric.sh (and its systemd unit). install.sh writes it.
+# This host's number on the fabric: rank + 1 (1..4). It is the last octet of both addresses.
+FABRIC_HOST=1
+# The netdevs of the switch-facing port's two PCIe halves, half 0 then half 1. On a GB10 host with the cable in
+# cage 0 these are enp1s0f0np0 (HCA rocep1s0f0) and enP2p1s0f0np0 (HCA roceP2p1s0f0).
+FABRIC_DEVS="enp1s0f0np0 enP2p1s0f0np0"
+# Two /24s, one a half, as their first three octets. Any two unused private /24s work, the same on all four hosts.
+# 198.18.0.0/15 is reserved for network benchmarking and never routed, which suits an isolated fabric.
+FABRIC_NETS="198.18.0 198.18.1"
+FABRIC_MTU=9000

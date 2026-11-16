@@ -1,0 +1,43 @@
+# One rank of Inkling-2-Small at TP4, as a container. The same file runs on all four hosts; setup.sh --container
+# writes the two files next to it on each host:
+#   .env       this rank's settings: RANK, IMAGE, the host folders (MODEL, PLAN, DATA, RUN), HTTP and serve flags
+#              (CONTEXT, PARALLEL, PROMPT_CACHE_GIB, DECODE_SHARE: from release-defaults.sh), and the user the rank runs as
+#   rank.env   the server's environment, the same as the host install's (rank.sh env): NCCL over the fabric
+#              (bootstrap at rank 0's fabric address) and the release settings of release-defaults.sh (checkpoint
+#              mode, split experts, DSpark, the RoCE wire, the memory reserve, the digest manifest); only
+#              LD_LIBRARY_PATH and TF_TP_KERNEL_IMAGE point into the image (/opt/inkling2)
+# Start rank 0 first (it holds NCCL's bootstrap and serves HTTP), then ranks 1-3; setup.sh --container start does
+# that and waits until all four have loaded. By hand, in this folder on each host: docker compose up -d.
+# The host folders are mounted at the same paths, so the paths in rank.env hold inside the container too.
+name: inkling2-rank${RANK:?set RANK in .env}
+services:
+  rank:
+    image: ${IMAGE:?set IMAGE in .env}
+    container_name: inkling2-rank${RANK}
+    network_mode: host          # NCCL's sockets and the RoCE devices use the host's fabric ports
+    ipc: host
+    user: "${RUN_UID:-0}:${RUN_GID:-0}"
+    init: true
+    restart: "no"               # a rank that ends stops the other three; start all four again with setup.sh
+    stop_grace_period: 60s
+    devices:
+      - /dev/infiniband:/dev/infiniband
+    ulimits:
+      memlock: -1               # RDMA registers pinned memory
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    env_file: [rank.env]
+    volumes:
+      - ${MODEL:?}:${MODEL}:ro
+      - ${PLAN:?}:${PLAN}:ro
+      - ${DATA:?}:${DATA}:ro
+      - ${RUN:?}:${RUN}
+    command: >-
+      serve ${MODEL} --backend cuda --tp 4 --rank ${RANK} --context ${CONTEXT:?} --parallel ${PARALLEL:?}
+      --prompt-cache-gib ${PROMPT_CACHE_GIB:?} --decode-share ${DECODE_SHARE:?} --host ${HTTP_HOST:-127.0.0.1} --port ${HTTP_PORT:-8890} ${EXTRA_ARGS:-}

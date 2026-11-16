@@ -1,0 +1,68 @@
+# hosts.conf for setup.sh: copy to a private file (cp hosts.conf.example my-sparks.conf), fill in, then
+#   ./setup.sh my-sparks.conf --release URL|TARBALL|DIR [--container]
+# Sourced by bash on the machine that runs setup.sh. setup.sh writes the server's config from it
+# (my-sparks.serve.conf, beside this file); start.sh, stop.sh, status.sh and check.sh take that one.
+
+# ssh names of the four hosts, in rank order (rank 0 serves HTTP). Key-based ssh from this machine to each.
+HOSTS=(rank0-host rank1-host rank2-host rank3-host)
+
+# The install folder on every host (the same path on all four; setup.sh creates it): bin/, lib/, plan/, data/,
+# recipe/, serve/ (logs), model-split/ (the weights, unless WEIGHTS_DIR), container/ (with --container).
+ROOT=/path/on/hosts/inkling2
+
+# The release: an http(s) URL of the release tarball (its .sha256 next to it), a local tarball, or an unpacked
+# release folder. --release on the command line wins.
+RELEASE=""
+RELEASE_SHA256=""                  # only if there is no .sha256 next to the tarball
+
+# Weights. Leave WEIGHTS_DIR empty to fetch each rank's bytes from Hugging Face (pinned revision) into MODEL_DIR
+# (about 95 GiB a host). Set WEIGHTS_DIR to reuse rank folders already on the hosts (the same path on all four, made
+# by inkling2_rank_copy.py for this release's ranges): setup.sh verifies them in place and never writes there.
+WEIGHTS_DIR=""
+MODEL_DIR=""                       # default $ROOT/model-split (MODEL_DIRNAME in release-defaults.sh)
+# Or build each rank's folder from a full Inkling-2-Small checkpoint you already have, instead of Hugging Face:
+# HOST:/path (HOST an ssh name: one of the four, or another Linux host with python3 on the switch) or /path on this
+# machine. setup.sh first checks it against the pinned revision (weights/checkpoint-files.tsv: every file, its size,
+# its Hugging Face hash; any difference is refused), then serves it read only on its fabric address(es) to the four
+# ranks' fabric addresses while the ranks copy their bytes (a free ephemeral port; the server ends with the step).
+# The folders are byte for byte the ones the download makes. --checkpoint on the command line wins.
+CHECKPOINT=""
+CHECKPOINT_ADDR=""                 # only if its fabric address(es) are not in the ranks' subnets (comma-separated)
+CHECKPOINT_PORT=0                  # 0: a free ephemeral port (as NCCL's listeners); a fixed port for a firewall rule
+
+# The fabric (fabric/README.md): each host's switch-facing 200G port, its two PCIe halves.
+FABRIC_DEVS=(enp1s0f0np0 enP2p1s0f0np0)
+FABRIC_HCAS=(rocep1s0f0 roceP2p1s0f0)
+FABRIC_SPEED=200000                # Mb/s each half must report
+FABRIC_MTU=9000
+FABRIC_GID=3                       # the RoCE v2 GID index (NCCL_IB_GID_INDEX)
+FABRIC_NETS="198.18.0 198.18.1"    # the two /24s, only for --fabric-install (a host is rank + 1 on both)
+
+# NCCL bootstraps at rank 0's address on SOCKET_IFNAME (default the first fabric port; MASTER default: that
+# address). Keeping the bootstrap on the fabric keeps it clear of LAN firewalls: NCCL's listeners bind random
+# ephemeral ports. Rank 0 also takes NCCL_PORT + 1 (liveness). Pick ports nothing else uses.
+NCCL_PORT=29551
+SOCKET_IFNAME=""
+MASTER=""
+
+# HTTP on rank 0 (keep 127.0.0.1 unless the endpoint should be reachable from the network) and serve flags.
+HTTP_HOST=127.0.0.1
+HTTP_PORT=8890
+EXTRA_ARGS=""                      # more serve flags, the same on every rank
+# The release's CONTEXT, PARALLEL, memory reserve, prompt cache, DSpark, XROWS and RoCE wire are in
+# release-defaults.sh. To differ from them on this install, set the same variable here (e.g. CONTEXT=32768).
+# CONTEXT is the one knob: the streams that fit at it run at once (PARALLEL=auto), at most MAX_STREAMS (4; up to 8);
+# CONTEXT is also the largest request: CONTEXT=524288 serves a 524,288-token request (one stream, DSpark by depth);
+# CONTEXT=1048576 (1M) serves one plain stream.
+
+# Opt-in settings (recipe/inkling2-tp4/docs/SETTINGS.md), added to every rank's environment, e.g. OPT_ENV=(TF_INK2_GRAPH=0).
+OPT_ENV=()
+
+# --libs: a folder on this machine with libnccl.so.2, libcublas.so.13 and libcublasLt.so.13. Empty: the release's
+# lib/ if it has one, else NVIDIA's pinned wheels from PyPI, fetched on each host.
+LIBS_DIR=""
+
+# --container: the CUDA runtime image the serving image is built on (the build's CUDA 13.3 user space), pinned by the
+# digest of its linux/arm64 manifest as gated. Leave it unset to use the pinned one (setup.sh); a tag without a digest
+# builds on whatever the tag points at today (not the gated image).
+#BASE_IMAGE=nvcr.io/nvidia/cuda:13.3.1-runtime-ubuntu24.04@sha256:585155539dd4ff2ab653ee59d812aae81a9406a5804596d516c06e3a5719eb26

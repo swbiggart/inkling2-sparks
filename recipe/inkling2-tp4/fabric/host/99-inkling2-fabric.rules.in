@@ -1,0 +1,5 @@
+# /etc/udev/rules.d/99-inkling2-fabric.rules (template: install.sh fills in @MAC0@ and @MAC1@, the two fabric
+# netdevs' MAC addresses). When the mlx5 driver recreates a fabric port after a cable change, run the fabric unit
+# again so the port gets its MTU and address back. A reboot is still needed to restore the transmit rate.
+ACTION=="add", SUBSYSTEM=="net", ATTR{address}=="@MAC0@", RUN+="/usr/bin/systemctl --no-block restart inkling2-fabric.service"
+ACTION=="add", SUBSYSTEM=="net", ATTR{address}=="@MAC1@", RUN+="/usr/bin/systemctl --no-block restart inkling2-fabric.service"

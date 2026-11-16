@@ -1,0 +1,13 @@
+[Unit]
+Description=Inkling-2 TP4 fabric: the switch-facing 200G port on both PCIe halves (MTU, addresses, ARP)
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/default/inkling2-fabric
+ExecStart=/usr/local/sbin/inkling2-fabric.sh
+
+[Install]
+WantedBy=multi-user.target

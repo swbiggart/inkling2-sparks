@@ -1,0 +1,813 @@
+{
+ "about": "Inkling-2 TP4 realistic prompt set (16 rows: 5 chat, 5 code, 6 agentic with tools). Authored for this recipe; no outside text. Run with tools/inkling2_bench.py prompts.",
+ "prompts": [
+  {
+   "name": "chat-city-transit",
+   "category": "chat",
+   "messages": [
+    {
+     "role": "user",
+     "content": "I'm on a city council committee and we must choose between a bus rapid transit line and a light rail line along a 14 km corridor with about 60,000 daily riders expected. Write a thorough briefing for the committee: how each option works, capital and operating costs in rough ranges, construction disruption, rider experience, land-use effects, how the choice could be phased, the risks of each, and a recommendation with the conditions under which you would change it. Use headings and aim for about 1,800 words."
+    }
+   ]
+  },
+  {
+   "name": "chat-sourdough-guide",
+   "category": "chat",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Write a complete beginner's guide to baking sourdough bread at home: making and keeping a starter from scratch day by day, the ingredients and tools, a full schedule for a first loaf with timings, what each stage does (autolyse, bulk fermentation, shaping, cold retard, baking), how to read the dough, and a long troubleshooting section for at least ten common problems. Be detailed and practical."
+    }
+   ]
+  },
+  {
+   "name": "chat-history-printing",
+   "category": "chat",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Explain to a curious high-school student how the spread of movable-type printing changed Europe between 1450 and 1650: the technology itself, the economics of a print shop, literacy, religion, science, politics and language. Give concrete examples, describe the chain of cause and effect, and end with three questions for a class discussion and a short answer to each. Write it as a long, engaging essay."
+    }
+   ],
+   "thinking": true
+  },
+  {
+   "name": "chat-budget-plan",
+   "category": "chat",
+   "messages": [
+    {
+     "role": "user",
+     "content": "My partner and I earn a combined 7,400 a month after tax, pay 2,100 in rent, have 18,000 in student loans at 5.5 %, a car loan of 9,000 at 7 %, 4,000 in savings and want to buy a home in about four years. Build us a detailed financial plan: a monthly budget table, an emergency fund target, which debt to pay first and why, how much to save for a deposit each month, what to do if one of us loses income, and a year-by-year timeline with the numbers worked out. Explain each step."
+    }
+   ],
+   "thinking": true
+  },
+  {
+   "name": "chat-trip-itinerary",
+   "category": "chat",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Plan a 12-day trip through northern Italy for two people who like food, hiking and small towns, travelling by train only, in early October, on a mid-range budget. Give a day-by-day itinerary with where to stay, how to get between places with approximate journey times, two hikes with their distances and difficulty, what to eat in each region, a packing list and a budget estimate per day. Be specific and thorough."
+    }
+   ]
+  },
+  {
+   "name": "code-rate-limiter",
+   "category": "code",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Implement a production-quality token-bucket rate limiter in Python for an asyncio web service: a RateLimiter class with per-key buckets, burst and refill settings, an async acquire with timeout, cleanup of idle keys, thread-safety notes, full type hints and docstrings. Then write a complete pytest test suite covering refill timing (with a fake clock), bursts, timeouts, concurrency and idle cleanup, and finish with a short usage example for an aiohttp handler."
+    }
+   ]
+  },
+  {
+   "name": "code-sql-migration",
+   "category": "code",
+   "messages": [
+    {
+     "role": "user",
+     "content": "We have a PostgreSQL table orders(id bigserial, customer_email text, status text, total_cents int, created_at timestamptz) with 40 million rows. Write a complete, safe zero-downtime migration plan and the SQL to: add a customers table, backfill it from distinct emails in batches, add orders.customer_id with a foreign key, switch the application over, and drop customer_email. Include the batch backfill as a PL/pgSQL procedure, the index creation done concurrently, locking considerations at each step, verification queries, and the rollback for every step."
+    }
+   ],
+   "thinking": true
+  },
+  {
+   "name": "code-rust-parser",
+   "category": "code",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Write a small arithmetic expression parser and evaluator in Rust without external crates: a tokenizer, a Pratt parser supporting + - * / ^ (right-associative), unary minus, parentheses, integer and floating-point literals, variables and function calls like max(a, b) and sqrt(x), with good error messages that point at the column. Provide the full code split into modules, an evaluation environment, and a thorough set of unit tests, then explain the design decisions."
+    }
+   ]
+  },
+  {
+   "name": "code-review-js",
+   "category": "code",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Review this JavaScript module and then rewrite it properly with explanations of every change:\n\n```js\nvar cache = {}\nfunction getUser(id, cb) {\n  if (cache[id]) cb(cache[id])\n  fetch('/api/users/' + id).then(function(r) { return r.json() }).then(function(u) {\n    cache[id] = u\n    cb(u)\n  })\n}\nfunction getUsers(ids, cb) {\n  var out = []\n  for (var i = 0; i < ids.length; i++) {\n    getUser(ids[i], function(u) { out.push(u); if (out.length == ids.length) cb(out) })\n  }\n}\nmodule.exports = { getUser, getUsers }\n```\n\nList every bug and risk (ordering, double callbacks, errors, cache growth, concurrency), then give a modern TypeScript version with async/await, in-flight request deduplication, an LRU cache with TTL, cancellation, typed errors and a complete test file using vitest with mocked fetch."
+    }
+   ]
+  },
+  {
+   "name": "code-go-worker-pool",
+   "category": "code",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Write a Go package for a bounded worker pool that processes jobs from a channel with context cancellation, per-job timeouts, retries with exponential backoff and jitter, graceful shutdown that drains in-flight work, and metrics counters (processed, failed, retried, in flight). Include the full package code with documentation comments, an example main program, and table-driven tests that use a fake clock and cover cancellation, retries and shutdown. Explain the concurrency design and its trade-offs at the end."
+    }
+   ],
+   "thinking": true
+  },
+  {
+   "name": "agent-fix-failing-test",
+   "category": "agentic",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful software agent working in a user's repository. Use the tools when you need facts; explain your reasoning and give complete results."
+    },
+    {
+     "role": "user",
+     "content": "The CI job for our Python package fails. Find out why and fix it."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "run_shell",
+        "arguments": "{\"command\": \"python -m pytest -x -q\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "F\n=================================== FAILURES ===================================\n__________________________ test_parse_duration_hours __________________________\n\n    def test_parse_duration_hours():\n>       assert parse_duration('2h30m') == 9000\nE       AssertionError: assert 150 == 9000\n\ntests/test_durations.py:14: AssertionError\n1 failed, 37 passed in 1.84s\nexit code 1"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "read_file",
+        "arguments": "{\"path\": \"src/timekit/durations.py\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_2",
+     "content": "import re\n\n_UNITS = {'s': 1, 'm': 60, 'h': 60}\n_PART = re.compile(r'(\\d+)([smh])')\n\n\ndef parse_duration(text: str) -> int:\n    \"\"\"Parse '1h20m5s' style durations into seconds.\"\"\"\n    total = 0\n    for value, unit in _PART.findall(text):\n        total += int(value) * _UNITS[unit] // 60 if unit == 'h' else int(value) * _UNITS[unit]\n    return total\n"
+    },
+    {
+     "role": "user",
+     "content": "Explain the bug in detail, write the corrected module with input validation (empty strings, unknown units, repeated units, whitespace, days 'd'), add a complete test file covering all of it, and describe how you would prevent this class of bug in future, including a property-based test."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "run_shell",
+      "description": "Run a shell command in the project's checkout and return stdout, stderr and the exit code.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a text file from the project's checkout.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "write_file",
+      "description": "Write a text file in the project's checkout (replaces it).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "content": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "path",
+        "content"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "agent-data-report",
+   "category": "agentic",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a data analyst agent. Query the database with the tools, then write clear reports for managers."
+    },
+    {
+     "role": "user",
+     "content": "Why did revenue drop last quarter? Dig in."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "run_sql",
+        "arguments": "{\"query\": \"SELECT region, quarter, SUM(revenue) AS revenue, COUNT(DISTINCT customer_id) AS customers FROM sales WHERE quarter IN ('Q2','Q3') GROUP BY region, quarter ORDER BY region, quarter\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "region,quarter,revenue,customers\nEast,Q2,1840000,2210\nEast,Q3,1795000,2185\nNorth,Q2,1320000,1640\nNorth,Q3,1012000,1290\nSouth,Q2,980000,1405\nSouth,Q3,1003000,1422\nWest,Q2,2150000,2630\nWest,Q3,2087000,2602"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "run_sql",
+        "arguments": "{\"query\": \"SELECT product_line, quarter, SUM(revenue) AS revenue, AVG(discount_pct) AS avg_discount FROM sales WHERE region = 'North' AND quarter IN ('Q2','Q3') GROUP BY product_line, quarter\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_2",
+     "content": "product_line,quarter,revenue,avg_discount\nHardware,Q2,610000,4.1\nHardware,Q3,402000,9.8\nServices,Q2,455000,2.0\nServices,Q3,441000,2.2\nSubscriptions,Q2,255000,0.0\nSubscriptions,Q3,169000,0.0"
+    },
+    {
+     "role": "user",
+     "content": "Write the full report for the leadership meeting: an executive summary, the analysis region by region and product line by product line with the numbers and percentage changes worked out, the most likely explanations and how confident you are in each, the further queries you would run (write the SQL), the charts you would include, and concrete recommendations with owners and timelines."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "run_sql",
+      "description": "Run a read-only SQL query on the analytics database and return the rows as CSV.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "make_chart",
+      "description": "Render a chart from CSV data.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "csv": {
+         "type": "string"
+        },
+        "kind": {
+         "type": "string",
+         "enum": [
+          "bar",
+          "line",
+          "scatter"
+         ]
+        },
+        "title": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "csv",
+        "kind"
+       ]
+      }
+     }
+    }
+   ],
+   "thinking": true
+  },
+  {
+   "name": "agent-trip-booking",
+   "category": "agentic",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a travel assistant. Use the tools to look things up, then give the traveller a complete plan."
+    },
+    {
+     "role": "user",
+     "content": "I need to get from Lyon to Zurich on 14 March for a conference that starts at 9:00 on the 15th and ends at 17:00 on the 17th. Find trains and a hotel under 220 a night near the main station, and check the weather."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "search_trains",
+        "arguments": "{\"from\": \"Lyon Part-Dieu\", \"to\": \"Zurich HB\", \"date\": \"14 March\"}"
+       }
+      },
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "search_hotels",
+        "arguments": "{\"city\": \"Zurich\", \"check_in\": \"14 March\", \"check_out\": \"17 March\", \"max_price\": 220}"
+       }
+      },
+      {
+       "id": "call_3",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Zurich\", \"date\": \"15 March\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "07:04 -> 11:56 via Geneva, 1 change, 89\n10:34 -> 15:26 via Geneva, 1 change, 76\n13:04 -> 18:02 via Basel, 2 changes, 64\n16:34 -> 21:26 via Geneva, 1 change, 92"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_2",
+     "content": "Hotel Limmat Court, 0.4 km from Zurich HB, 198 a night, breakfast included, rating 8.6\nStation Lodge, 0.2 km, 214 a night, no breakfast, rating 8.1\nAltstadt Rooms, 1.1 km, 165 a night, breakfast 18 extra, rating 8.9"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_3",
+     "content": "15 March: 4 to 11 C, showers in the morning, clearing later; 16 March: 2 to 9 C, dry; 17 March: 5 to 13 C, sunny"
+    },
+    {
+     "role": "user",
+     "content": "Compare all the options in detail and give me the complete plan: the train you recommend and why, a backup if it is cancelled, the hotel choice with a cost breakdown for three nights, what to pack for that weather, how to get from the station to a venue near ETH Zurich by tram, a day-by-day schedule, and a checklist for the night before departure."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search_trains",
+      "description": "Search train connections between two stations on a date.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "from": {
+         "type": "string"
+        },
+        "to": {
+         "type": "string"
+        },
+        "date": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "from",
+        "to",
+        "date"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "search_hotels",
+      "description": "Search hotels in a city for a date range.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "check_in": {
+         "type": "string"
+        },
+        "check_out": {
+         "type": "string"
+        },
+        "max_price": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city",
+        "check_in",
+        "check_out"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Weather forecast for a city on a date.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "date": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city",
+        "date"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "agent-support-triage",
+   "category": "agentic",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a support engineer agent for a SaaS invoicing product. Use the tools to investigate, then act."
+    },
+    {
+     "role": "user",
+     "content": "We had a spike of tickets about duplicate invoice emails this morning. Investigate and draft replies."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "search_tickets",
+        "arguments": "{\"query\": \"duplicate invoice email\", \"status\": \"open\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "T-4812 'Customers got the same invoice three times' (opened 08:12)\nT-4815 'Duplicate emails for invoice INV-2291' (08:20)\nT-4821 'Why are my clients receiving two copies?' (08:41)\nT-4830 'Invoice reminder sent twice, client annoyed' (09:05)"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "get_ticket",
+        "arguments": "{\"id\": \"T-4812\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_2",
+     "content": "From: ops@greenleaf.example\nSince the maintenance window last night (02:00-02:40), every invoice we send is delivered 2-3 times. Our email log shows identical message ids within a few seconds. We use the webhook integration with retries enabled. This is embarrassing with our clients; please fix ASAP.\n---\nInternal note (on-call): mail worker restarted twice during the window; queue 'outbound-mail' shows redeliveries after visibility timeout."
+    },
+    {
+     "role": "user",
+     "content": "Write a full incident analysis (timeline, the most likely root cause given the visibility-timeout redeliveries and the webhook retries, why the message ids are identical, the blast radius, how to confirm it with specific queries or log searches), the immediate mitigation, the long-term fix with idempotency keys explained step by step, and then draft a personalised reply for each of the four tickets."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search_tickets",
+      "description": "Search the support ticket system.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        },
+        "status": {
+         "type": "string",
+         "enum": [
+          "open",
+          "closed",
+          "any"
+         ]
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_ticket",
+      "description": "Fetch one support ticket with its full thread.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "id": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "id"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "post_reply",
+      "description": "Post a reply on a ticket.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "id": {
+         "type": "string"
+        },
+        "body": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "id",
+        "body"
+       ]
+      }
+     }
+    }
+   ],
+   "thinking": true
+  },
+  {
+   "name": "agent-refactor-plan",
+   "category": "agentic",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful software agent working in a user's repository. Use the tools when you need facts; explain your reasoning and give complete results."
+    },
+    {
+     "role": "user",
+     "content": "Our Flask app's single 3,000-line app.py is unmaintainable. Look at it and plan a refactor."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "run_shell",
+        "arguments": "{\"command\": \"wc -l app.py && grep -n '^def \\\\|^@app.route\\\\|^class ' app.py | head -60\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "3012 app.py\n41:class Config:\n88:def get_db():\n102:def close_db(e=None):\n120:@app.route('/login', methods=['GET', 'POST'])\n121:def login():\n190:@app.route('/logout')\n231:@app.route('/projects')\n232:def projects():\n310:@app.route('/projects/<int:pid>')\n402:@app.route('/projects/<int:pid>/tasks', methods=['POST'])\n520:@app.route('/api/tasks/<int:tid>', methods=['PATCH', 'DELETE'])\n700:def send_digest_emails():\n812:def render_pdf_report(pid):\n990:@app.route('/admin/users')\n1105:def billing_webhook():\n1380:def sync_calendar(user):\n1702:def compute_burndown(pid):\n2210:def import_csv(path):\n2600:@app.route('/reports/<int:pid>.pdf')\nexit code 0"
+    },
+    {
+     "role": "user",
+     "content": "Write the complete refactoring plan: the target package layout with blueprints, services and repositories, which functions move where and why, how to introduce an application factory and configuration per environment, how to move from raw SQL to SQLAlchemy gradually, the order of steps so the app keeps working after each one, the tests to add before each move, and show the code for the application factory, one blueprint, one service and its tests."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "run_shell",
+      "description": "Run a shell command in the project's checkout and return stdout, stderr and the exit code.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a text file from the project's checkout.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "write_file",
+      "description": "Write a text file in the project's checkout (replaces it).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "content": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "path",
+        "content"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "agent-shell-cleanup",
+   "category": "agentic",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful software agent working in a user's repository. Use the tools when you need facts; explain your reasoning and give complete results."
+    },
+    {
+     "role": "user",
+     "content": "The build server's disk is almost full. Find out what is using the space and propose a cleanup."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "run_shell",
+        "arguments": "{\"command\": \"df -h / && du -xh --max-depth=2 /var /home /opt 2>/dev/null | sort -rh | head -15\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "Filesystem      Size  Used Avail Use% Mounted on\n/dev/nvme0n1p2  470G  452G   18G  97% /\n212G\t/var\n188G\t/var/lib\n141G\t/var/lib/docker\n47G\t/var/lib/jenkins\n96G\t/home\n81G\t/home/ci\n31G\t/opt\n24G\t/var/log\n22G\t/opt/toolchains\n19G\t/var/log/journal\nexit code 0"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "run_shell",
+        "arguments": "{\"command\": \"docker system df && ls -la /home/ci | head -20\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_2",
+     "content": "TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE\nImages          412       23        118.4GB   102.9GB (86%)\nContainers      57        4         6.2GB     5.9GB (95%)\nLocal Volumes   88        12        15.1GB    11.7GB (77%)\nBuild Cache     1904      0         21.3GB    21.3GB\ntotal 84211\ndrwxr-xr-x 14 ci ci 4096 .\ndrwxr-xr-x  3 ci ci 4096 .cache\ndrwxr-xr-x  2 ci ci 4096 workspace-old-2025\ndrwxr-xr-x  9 ci ci 4096 workspace\nexit code 0"
+    },
+    {
+     "role": "user",
+     "content": "Write the full cleanup plan with the exact commands for each step, what each command removes and the risk of each, the order to run them in, how much space each step should free given the numbers above, how to verify nothing needed was deleted, and then a maintenance setup that stops this from happening again: a cron or systemd timer, journald limits, Docker garbage collection settings and a disk usage alert, with the configuration files written out in full."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "run_shell",
+      "description": "Run a shell command in the project's checkout and return stdout, stderr and the exit code.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a text file from the project's checkout.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "write_file",
+      "description": "Write a text file in the project's checkout (replaces it).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "content": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "path",
+        "content"
+       ]
+      }
+     }
+    }
+   ],
+   "thinking": true
+  }
+ ]
+}

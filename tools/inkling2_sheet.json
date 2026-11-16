@@ -1,0 +1,40 @@
+{
+ "source": "checkpoint safetensors headers + config.json (inkling2_bench.py sheet)",
+ "checkpoint_bytes": {
+  "experts": 376090779968,
+  "router": 169943040,
+  "unembed": 1852637184,
+  "embed": 1852637184,
+  "dense": 9435064320,
+  "drafter": 3423420768,
+  "vision": 655386624
+ },
+ "layers": 48,
+ "global_layers": 8,
+ "local_layers": 40,
+ "sliding_window": 1024,
+ "n_routed_experts": 384,
+ "experts_per_token": 8,
+ "expert_layers": 48,
+ "expert_bytes": 20404230.684027776,
+ "hidden_size": 4608,
+ "vocab_size": 201024,
+ "kv_bytes_per_token_layer": 4096,
+ "per_rank": {
+  "dense": "split",
+  "experts": "split",
+  "unembed": "split",
+  "router": "replicated_fp32",
+  "drafter": "split"
+ },
+ "distinct_experts": [
+  8,
+  13.4,
+  18.0,
+  22.2,
+  26.1,
+  29.7,
+  33.0,
+  36.2
+ ]
+}
