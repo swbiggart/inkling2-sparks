@@ -1,0 +1,33 @@
+Inkling-2-Small on 4x DGX Spark: exact TP4 (inkling2-sparks)
+Copyright 2026 Scott Biggart
+
+This repository is a recipe for TensorFold (https://github.com/ashhart/TensorFold, Apache License 2.0): the recipe in
+recipe/inkling2-tp4/, the tools in tools/, the build and release scripts in scripts/, and patches/, a series of changes
+to TensorFold at the commit named in ENGINE_COMMIT that adds the Inkling-2 family. This work is licensed under the
+Apache License, Version 2.0 (LICENSE). Outside code it includes keeps its own license and notice; it is listed, with
+the sources this work follows, in THIRD_PARTY_NOTICES.md, and the license texts are in LICENSES/.
+
+The patches modify TensorFold, and tools/bench_*.py other than tools/bench_dspark.py, and
+tools/bench_prompts.json, are TensorFold's files, unmodified (tools/inkling2_bench.py and its files are ours). TensorFold's NOTICE reads:
+
+  TensorFold
+  Copyright 2026 TensorFold contributors
+  https://github.com/ashhart/TensorFold
+
+  TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.0.
+  Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
+  MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
+  THIRD_PARTY_NOTICES.md.
+
+The Inkling-2-Small release assets bundle NVIDIA NCCL 2.30.7 (Copyright (c) 2015-2026 NVIDIA CORPORATION &
+AFFILIATES; Apache License 2.0 and BSD 3-Clause, LICENSES/NCCL-LICENSE.txt) and NVIDIA cuBLAS / cuBLASLt 13.1.1.3
+(proprietary, redistributed unmodified under the NVIDIA CUDA Toolkit EULA, LICENSES/NVIDIA-CUDA-EULA.txt) in lib/,
+unmodified, with their license texts. They are not covered by the Apache License of this work.
+
+The assets also carry lib/libtfgrammar.so (structured output), built from TensorFold's zig/src/grammar/tf_grammar.cc
+and the C++ sources of xgrammar v0.2.8 (Copyright (c) 2024 by XGrammar Contributors, Apache License 2.0), with the
+headers of dlpack (Apache License 2.0) and picojson (BSD 2-Clause License, Copyright 2009-2010 Cybozu Labs, Inc. and
+2011-2014 Kazuho Oku). Their licenses are in LICENSES/ and lib/; xgrammar's notice is LICENSES/xgrammar-NOTICE.txt.
+
+Inkling-2-Small is Thinking Machines' model (Apache License 2.0). This project is not affiliated with or endorsed by
+Thinking Machines.
