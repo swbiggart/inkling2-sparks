@@ -180,9 +180,10 @@ echo CONTEXT=524288 >> my-sparks.conf
 
 What is checked at this length: the decode check at 524,000 positions (W=2: one prefill, then 64 decode steps whose
 logits equal one prompt forward over the same positions bit for bit); drafted replies equal plain ones at about
-520,000 tokens on the four GB10s; the server's greedy replies equal the oracle's; a request of exactly 524,288 tokens
-is admitted with its pages and one token more is refused by name. A prompt this long takes most of an hour to fill,
-and the server streams nothing before the first token, so clients need a read timeout of an hour or more.
+520,000 tokens on the four GB10s; the server's greedy replies on the recorded oracle prompts equal the oracle's; a
+request of exactly 524,288 tokens is admitted with its pages and one token more is refused by name. A prompt this
+long takes most of an hour to fill, and the server streams nothing before the first token, so clients need a read
+timeout of an hour or more.
 
 ## Measuring your install
 

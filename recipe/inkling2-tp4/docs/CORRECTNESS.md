@@ -9,8 +9,9 @@ Every gate of the release, with its hash, method and build. The summary is in th
 - **Decode equals the whole-prompt forward.** Each decode step's logits equal the same row of the whole-prompt
   forward at the same world size (W=4), bit for bit, across all 48 layers, with the KV cache on the page pool in
   whatever pages a stream gets.
-- **Greedy equals the oracle.** Greedy replies equal the checkpoint-mode oracle's (the checkpoint run through
-  Transformers' Inkling-2 modules in PyTorch, with the experts quantized as the checkpoint specifies) token for token.
+- **Greedy equals the oracle on the recorded prompts.** On the two recorded prompts (59 tokens), greedy replies equal
+  the checkpoint-mode oracle's (the checkpoint run through Transformers' Inkling-2 modules in PyTorch, with the experts
+  quantized as the checkpoint specifies) token for token.
 - **The ranks agree.** Every rank computes the same logits and the same token; ranks with different settings, builds
   or weight digests refuse to start.
 - **Drafting never changes output.** Drafted replies equal plain ones token for token, at every depth and with the
@@ -23,6 +24,10 @@ What this does and does not say about W=4 against one rank: the experts (the spl
 copies of the table's rows) are bit-equal to a one-rank run. The attention partials of the four ranks are summed in a
 fixed rank order, the same on every rank and every run, and can differ from a one-rank run in the last bits. The
 release does not claim that the whole model at W=4 equals W=1.
+
+What it does and does not say against the oracle: the kernels round where the oracle does but sum in their own fixed
+order, so a reply can depart from the oracle's at a near-tie (the structured-output cases at the end record
+such departures). The oracle gate shows equality on its recorded prompts, not on every prompt.
 
 ## Gates on the release build
 

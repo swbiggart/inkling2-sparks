@@ -177,8 +177,9 @@ build, is in [docs/CORRECTNESS.md](recipe/inkling2-tp4/docs/CORRECTNESS.md)):
 - **Decode equals the whole-prompt forward.** Each decode step's logits equal the same row of the whole-prompt
   forward at the same world size (W=4), bit for bit, across all 48 layers (80/80, `f35e48068f72e8a9`; 64/64 after a
   130,944-token prompt, `1556b802e179e958`), with the KV cache on the page pool in any page order.
-- **Greedy equals the oracle.** Greedy replies equal the checkpoint-mode oracle's (the checkpoint run through
-  Transformers' Inkling-2 modules in PyTorch, with the experts quantized as the checkpoint specifies) token for token.
+- **Greedy equals the oracle on the recorded prompts.** On the two recorded prompts (59 tokens), greedy replies equal
+  the checkpoint-mode oracle's (the checkpoint run through Transformers' Inkling-2 modules in PyTorch, with the experts
+  quantized as the checkpoint specifies) token for token.
 - **The ranks agree** (ranks with different settings, builds or weight digests refuse to start). **Drafting never
   changes output** (drafted replies equal plain ones token for token, at every depth the depth rule prices).
   **Concurrent equals alone** at 1, 2 and 4 streams and beside a deep stream, and **a cached prompt equals a cold
@@ -191,7 +192,10 @@ build, is in [docs/CORRECTNESS.md](recipe/inkling2-tp4/docs/CORRECTNESS.md)):
 
 The experts (the split MoE) and the embedding (bit copies) are bit-equal to a one-rank run. The attention partials of
 the four ranks are summed in a fixed rank order and can differ from a one-rank run in the last bits, so the whole model
-at W=4 is not claimed to equal W=1.
+at W=4 is not claimed to equal W=1. Nor are replies claimed to equal the oracle's in general: the kernels round where
+the oracle does but sum in their own fixed order, so a reply can depart from the oracle at a near-tie. Exact here
+means the checkpoint's weights and quantization unchanged and replies that do not depend on timing, drafting, caching
+or concurrency, not equality to PyTorch's arithmetic.
 
 ## Settings you may change
 
