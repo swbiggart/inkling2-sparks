@@ -8,13 +8,6 @@ by Scott Biggart · [@woolsey](https://x.com/woolsey)
 ![Version v0.1](https://img.shields.io/badge/version-v0.1-blue)
 ![License Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-green)
 
-Exact means the checkpoint's own weights and quantization, unchanged, and replies that do not depend on timing,
-drafting, caching or concurrency; what is checked, and what is not claimed, is under [Correctness](#correctness).
-
-Inkling-2-Small is [Thinking Machines'](https://thinkingmachines.ai) model, released under the Apache License 2.0 on
-[Hugging Face](https://huggingface.co/thinkingmachines/Inkling-2-Small); this recipe only serves it, and its weights are
-theirs. This project is not affiliated with or endorsed by Thinking Machines.
-
 Serve `thinkingmachines/Inkling-2-Small`, exact to the checkpoint's own weights, split four ways (tensor parallel, TP4)
 across four DGX Spark-class GB10 hosts on one 200G switch. `tensorfold-native` runs an OpenAI- and Anthropic-compatible
 HTTP API on rank 0, which samples and drives the other three ranks. DSpark speculative decoding is on by default and
@@ -23,6 +16,13 @@ calls to about 70.2 tok/s; four streams together reach about 100.7 tok/s; a repe
 streams share one KV page pool sized from the hosts' free memory, so one setting, `CONTEXT`, says how long a request may
 be (up to the model's 1,048,576 tokens), and the server runs as many streams as fit (at most four by default). One
 command (`setup.sh`, on the hosts or with a pinned `--container`) installs, starts and checks everything.
+
+Inkling-2-Small is [Thinking Machines'](https://thinkingmachines.ai) model, released under the Apache License 2.0 on
+[Hugging Face](https://huggingface.co/thinkingmachines/Inkling-2-Small); this recipe only serves it, and its weights are
+theirs. This project is not affiliated with or endorsed by Thinking Machines.
+
+Exact means the checkpoint's own weights and quantization, unchanged, and replies that do not depend on timing,
+drafting, caching or concurrency; what is checked, and what is not claimed, is under [Correctness](#correctness).
 
 ## What it is
 
