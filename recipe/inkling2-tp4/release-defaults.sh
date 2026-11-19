@@ -91,6 +91,10 @@ release_env() {
     TF_INK2_XROWS="$XROWS"
     TF_INK2_MAX_STREAMS="$MAX_STREAMS"
     TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB"
+    # every stream's convolutions and their commits in one launch a site in shared rounds (segs): the same bits
+    TF_INK2_FUSE=attn,mlp,route,proj,conv,segs
+    # the experts' unit shapes for calls of 9-16 rows (shape 3 elsewhere): measured faster at those rows, the same bits
+    TF_INK2_CK_SHAPEW='4,3,3,3,3;5,3,3,3,3'
   )
   if [ "$ROCE_MULTI" = 1 ]; then
     release_envs+=(TF_INK2_ROCE_MULTI=1 TF_TP_ROCE_HCA="$hca" TF_TP_PORT="$TP_PORT" TF_TP_KERNEL_IMAGE="$fatbin"

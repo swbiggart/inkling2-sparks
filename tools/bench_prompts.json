@@ -1,18 +1,82 @@
 [
- {"name": "quicksort-raw", "kind": "completion", "prompt": "def quicksort(xs):\n    \"\"\"Sort a list with quicksort.\"\"\"\n"},
- {"name": "rust-reverse-words", "kind": "chat", "prompt": "Write a Rust function that reverses the words of a sentence, with a unit test."},
- {"name": "multiply-17-23", "kind": "chat", "prompt": "What is 17 times 23? Show the steps."},
- {"name": "sleep-tips", "kind": "chat", "prompt": "Give me three tips for sleeping better."},
- {"name": "js-debounce-raw", "kind": "completion", "prompt": "// A JavaScript debounce helper with a cancel method\nfunction debounce(fn, ms) {\n"},
- {"name": "linear-equation", "kind": "chat", "prompt": "Solve for x: 3x + 7 = 31, then check the answer by substitution, and explain each step to a student who is new to algebra."},
- {"name": "fishing-village", "kind": "chat", "prompt": "Describe a quiet morning in a small fishing village."},
- {"name": "sql-left-join", "kind": "chat", "prompt": "Explain what a SQL LEFT JOIN returns compared with an INNER JOIN, with a tiny example table."},
- {"name": "rectangle", "kind": "chat", "prompt": "A rectangle is 12 cm by 7 cm. Find its area, its perimeter and the length of its diagonal."},
- {"name": "dinner-idea", "kind": "chat", "prompt": "Hi! What should I cook tonight with rice, eggs and spinach?"},
- {"name": "c-primes-raw", "kind": "completion", "prompt": "#include <stdio.h>\n\n/* Print the first n prime numbers. */\nint main(void) {\n"},
- {"name": "prime-221", "kind": "chat", "prompt": "Is 221 a prime number? Explain."},
- {"name": "heist-story", "kind": "chat", "prompt": "Summarize the plot of a heist story you invent, in five sentences, ending with a twist that the reader could have guessed from the second sentence."},
- {"name": "bash-line-count", "kind": "chat", "prompt": "Write a bash one-liner that counts the lines of every .py file under the current directory and prints the total."},
- {"name": "sum-1-250", "kind": "chat", "prompt": "Compute the sum of the integers from 1 to 250."},
- {"name": "blue-sky", "kind": "chat", "prompt": "Why is the sky blue? Answer for a ten-year-old."}
+ {
+  "name": "quicksort-raw",
+  "kind": "completion",
+  "prompt": "\"\"\"Sorting helpers.\n\nThis module implements quicksort three ways: a simple recursive version that builds new lists,\nan in-place version with Lomuto partitioning, and an in-place version with a median-of-three pivot\nand insertion sort for short ranges. Each function has a docstring and doctest examples, and the\nmodule ends with a small self-test that compares all three against sorted() on random lists.\n\"\"\"\n\nimport random\n\n\ndef quicksort(xs):\n    \"\"\"Sort a list with quicksort and return a new list.\n\n    >>> quicksort([3, 1, 2])\n    [1, 2, 3]\n    \"\"\"\n"
+ },
+ {
+  "name": "rust-reverse-words",
+  "kind": "chat",
+  "prompt": "Write a Rust function that reverses the order of the words in a sentence while keeping the whitespace between them intact, and explain the design: how it splits the string, how it handles Unicode, punctuation and repeated spaces, and its time and memory cost. Then write a full test module with at least six unit tests covering empty input, a single word, leading and trailing spaces, tabs and non-ASCII words, and explain what each test checks."
+ },
+ {
+  "name": "multiply-17-23",
+  "kind": "chat",
+  "prompt": "What is 17 times 23? Work it out step by step in three different ways: the standard long multiplication algorithm, splitting 23 into 20 + 3 with the distributive law, and the difference-of-squares trick around 20. Explain every step in full sentences for a student who finds mental arithmetic hard, check that all three methods agree, and finish with a short paragraph on when each method is the most useful."
+ },
+ {
+  "name": "sleep-tips",
+  "kind": "chat",
+  "prompt": "Give me three tips for sleeping better. For each tip, write a full paragraph explaining why it works, what the research says about it in plain language, how to start doing it this week, and the most common mistakes people make with it. End with a sample evening routine that puts all three tips together, hour by hour, from dinner to lights out."
+ },
+ {
+  "name": "js-debounce-raw",
+  "kind": "completion",
+  "prompt": "/**\n * Timing helpers for UI code.\n *\n * debounce(fn, ms, options) delays fn until ms have passed without a new call; options.leading\n * calls it on the first call instead, options.maxWait forces a call at least every maxWait ms.\n * The returned function has cancel() and flush() methods. throttle(fn, ms) is built on debounce.\n * Every helper is documented with JSDoc, and the file ends with a set of example usages.\n */\n\n// A JavaScript debounce helper with a cancel method\nfunction debounce(fn, ms, options = {}) {\n"
+ },
+ {
+  "name": "linear-equation",
+  "kind": "chat",
+  "prompt": "Solve for x: 3x + 7 = 31. Explain each step to a student who is new to algebra: what an equation is, why we may do the same thing to both sides, how to undo the addition and then the multiplication, and how to check the answer by substitution. Then solve two similar practice equations, 5x - 4 = 21 and 2x + 9 = 3, the same careful way, and finish with a short list of the mistakes beginners most often make."
+ },
+ {
+  "name": "fishing-village",
+  "kind": "chat",
+  "prompt": "Describe a quiet morning in a small fishing village in four or five long paragraphs: the harbour before dawn, the boats going out, the market opening, the people in the cafe, and the village as the sun climbs. Use concrete sounds, smells and small details, and follow one old fisherman and one child through the morning."
+ },
+ {
+  "name": "sql-left-join",
+  "kind": "chat",
+  "prompt": "Explain what a SQL LEFT JOIN returns compared with an INNER JOIN. Build two tiny example tables, customers and orders, with a few rows each, show both queries, and print the full result table of each query as text. Then explain row by row why each row appears or not, what the NULLs mean, how a WHERE condition on the right table can silently turn a LEFT JOIN into an INNER JOIN, and how to write it correctly."
+ },
+ {
+  "name": "rectangle",
+  "kind": "chat",
+  "prompt": "A rectangle is 12 cm by 7 cm. Find its area, its perimeter and the length of its diagonal, explaining each formula, why it works and each step of the arithmetic, including how to simplify and approximate the square root. Then answer three follow-up questions the same careful way: what happens to each value if both sides are doubled, what square has the same perimeter, and what square has the same area."
+ },
+ {
+  "name": "dinner-idea",
+  "kind": "chat",
+  "prompt": "Hi! What should I cook tonight with rice, eggs and spinach? Suggest three different dinners. For each one give the full ingredient list with amounts for two people, numbered step-by-step instructions with times and heat levels, and a tip for making it taste better. Finish with which of the three is quickest and which keeps best for lunch tomorrow."
+ },
+ {
+  "name": "c-primes-raw",
+  "kind": "completion",
+  "prompt": "/*\n * primes.c: print prime numbers.\n *\n * Usage: primes N [METHOD]\n *   Prints the first N primes, one per line. METHOD is \"trial\" (trial division by the primes found\n *   so far) or \"sieve\" (a sieve of Eratosthenes that grows its bound until it holds N primes).\n *   Both methods are implemented below with comments, and main() checks its arguments, reports\n *   errors on stderr and prints the time each method took.\n */\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <time.h>\n\n/* Print the first n prime numbers. */\n"
+ },
+ {
+  "name": "prime-221",
+  "kind": "chat",
+  "prompt": "Is 221 a prime number? Explain how to decide it step by step: what a prime number is, why it is enough to test divisors up to the square root, which primes need testing here and the result of each division. Then factor 221 completely, check the factors by multiplying them back, and explain the same test for 223 and 225 as two more worked examples."
+ },
+ {
+  "name": "heist-story",
+  "kind": "chat",
+  "prompt": "Write the full plot of a heist story you invent, in about eight paragraphs: introduce the crew of four and what each one is good at, the target and why it seems impossible, the plan, the night of the heist with the two things that go wrong, and an ending with a twist that the reader can trace back to a small clue planted in the first paragraph."
+ },
+ {
+  "name": "bash-line-count",
+  "kind": "chat",
+  "prompt": "Write a bash one-liner that counts the lines of every .py file under the current directory, including subfolders, and prints a total. Then explain every part of the command in detail, show what it prints on a small example tree, and give three improved versions: one that handles file names with spaces and newlines safely, one that skips hidden folders and virtual environments, and one that sorts the files by line count. Explain the trade-offs of each."
+ },
+ {
+  "name": "sum-1-250",
+  "kind": "chat",
+  "prompt": "Compute the sum of the integers from 1 to 250. Explain three ways to get it: adding in pairs the way the young Gauss is said to have done, the formula n(n + 1) / 2 with a proof of why it works, and a short Python loop that checks it. Show every step of the arithmetic, then use the same ideas to find the sum of the even numbers from 2 to 250 and the sum of the integers from 101 to 250."
+ },
+ {
+  "name": "blue-sky",
+  "kind": "chat",
+  "prompt": "Why is the sky blue? Answer for a ten-year-old in several paragraphs: what sunlight is made of, what happens when light meets the tiny molecules of air, why blue light is scattered more than red, why sunsets are orange and red, and why the sky on the Moon is black. Add a simple experiment with a glass of water, milk and a flashlight that shows the same effect at home, with steps."
+ }
 ]

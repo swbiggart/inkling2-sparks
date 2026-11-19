@@ -364,7 +364,8 @@ def sweep(a):
         if (n, "dspark") in shas and (n, "plain") in shas:
             for r in doc["decode"]:
                 if r["streams"] == n:
-                    r["exact_vs_other_mode"] = same_digests(shas[(n, "dspark")], shas[(n, "plain")])
+                    d_, p_ = shas[(n, "dspark")], shas[(n, "plain")]  # stream i against stream i: the prompts differ by stream
+                    r["exact_vs_other_mode"] = len(d_) == len(p_) and all(same_digests([x], [y]) for x, y in zip(d_, p_))
     wl = [] if a.workloads == "none" else [w for w in WORKLOADS if a.workloads == "all" or w["name"] in a.workloads.split(",")]
     wsha = {}
     for w in wl:
