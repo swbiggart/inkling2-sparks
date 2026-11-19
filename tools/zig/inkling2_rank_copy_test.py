@@ -375,6 +375,25 @@ class RankCopyTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("check: 3 of 3 held runs", out)
 
+    def test_serve_binds_loopback_unless_told(self):
+        bound = []
+
+        class Stub:
+            def __init__(self, address, handler):
+                bound.append(address)
+                self.server_address = (address[0], 4321)
+
+            def serve_forever(self):
+                raise KeyboardInterrupt
+
+        with mock.patch.object(rc, "Server", Stub):
+            code, out = self.tool("serve", "--root", self.src, "--port", 0)
+            self.assertEqual((code, bound[-1]), (0, ("127.0.0.1", 0)), out)
+            self.assertIn("on 127.0.0.1:4321;", out)
+            code, out = self.tool("serve", "--root", self.src, "--port", 0, "--bind", "0.0.0.0")
+            self.assertEqual((code, bound[-1]), (0, ("0.0.0.0", 0)), out)
+            self.assertIn("on 0.0.0.0:4321;", out)
+
 
 if __name__ == "__main__":
     unittest.main()

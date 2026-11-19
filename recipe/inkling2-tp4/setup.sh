@@ -350,7 +350,7 @@ stage_release() {
   if [ -f "${d}/plan/inkling2-digests-w4.tsv" ]; then cp -p "${d}/plan/inkling2-digests-w4.tsv" "${stage}/plan/"
   elif [ -f "${d}/ranges/inkling2-digests-w4-split.tsv" ]; then cp -p "${d}/ranges/inkling2-digests-w4-split.tsv" "${stage}/plan/inkling2-digests-w4.tsv"
   else die "the release has no digest manifest (plan/inkling2-digests-w4.tsv)"; fi
-  [ -d "${d}/data" ] && { mkdir -p "${stage}/data"; cp -p "${d}"/data/* "${stage}/data/"; }
+  [ -d "${d}/data" ] && { mkdir -p "${stage}/data"; cp -pR "${d}/data/." "${stage}/data/"; }
   [ -d "${d}/lib" ] && { mkdir -p "${stage}/lib"; cp -p "${d}"/lib/* "${stage}/lib/"; }
   mkdir -p "${stage}/doc"
   for f in LICENSE NOTICE THIRD_PARTY_NOTICES.md LICENSES; do

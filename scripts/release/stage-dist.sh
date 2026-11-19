@@ -25,7 +25,7 @@ for d in lib plan data; do
   for f in "${src}/${d}/"*; do
     case $(basename "${f}") in LICENSE-*|NOTICE-*) continue;; esac  # build-assets.sh writes lib/'s licence copies itself
     [ -e "${dist}/${d}/$(basename "${f}")" ] && continue          # a libtfgrammar.so build-engine.sh made
-    cp -p "${f}" "${dist}/${d}/"
+    cp -pR "${f}" "${dist}/${d}/"                                 # data/ holds folders (ext/, so-cases/)
   done
 done
 echo "staged lib/ plan/ data/ from ${rel} into ${dist}"

@@ -237,6 +237,28 @@ EOF
     no "bench check: real remote half: exit ${brc}: $(printf '%s\n' "${bout}" | grep -E 'rank 0|check:' | tr '\n' ' ')"
 fi
 
+# ---------------------------------------------------------------- bench.sh from the release tarball's layout (repository only)
+# The paths scripts/release/build-assets.sh packs (--list), laid out from this checkout as the tarball holds them: bench.sh
+# must find tools/inkling2_bench.py and the files it copies or reads beside it, and run the tool (ledger --help).
+ba=${here}/../../../scripts/release/build-assets.sh
+if [ -f "${ba}" ] && [ -f "${here}/../bench.sh" ]; then
+  top=$(cd "${here}/../../.." && pwd)
+  T=${w}/tarball/tensorfold-inkling2-tp4-test
+  mkdir -p "${T}"
+  paths=()
+  while IFS= read -r p; do paths+=("${p}"); done < <(bash "${ba}" --list)
+  (cd "${top}" && tar -cf - "${paths[@]}") | tar -x -C "${T}"
+  printf 'HOSTS=(h0 h1 h2 h3)\nHTTP_PORT=8890\nROOT=/nonexistent/ink\nBIN=/nonexistent/ink/bin/tensorfold-native\nDECODE_BIN=/nonexistent/ink/bin/tf-inkling2-decode\nMODEL=/nonexistent/ink/model\nLIBS=/nonexistent/ink/lib\nRUN=/nonexistent/ink/run\nFABRIC_HCAS=(hca0)\nAPI_KEY=k\n' > "${w}/tarball/conf.sh"
+  out=$(cd "${w}" && bash "${T}/recipe/inkling2-tp4/bench.sh" "${w}/tarball/conf.sh" ledger --help 2>&1); rc=$?
+  miss=""
+  for f in inkling2_bench.py inkling2_prompts.json bench_prompts.json inkling2_sheet.json; do
+    [ -f "${T}/tools/${f}" ] || miss="${miss} ${f}"
+  done
+  [ ${rc} = 0 ] && [[ ${out} == *"usage: inkling2_bench.py ledger"* ]] && [ -z "${miss}" ] &&
+    ok "bench.sh from the release tarball's layout: tools/ holds the bench tool and its files, ledger --help exit 0" ||
+    no "bench.sh from the release tarball's layout: exit ${rc}, missing:${miss:- none}: $(printf '%s\n' "${out}" | tail -1)"
+fi
+
 # ---------------------------------------------------------------- tools/inkling2_bench.py: incomplete replies fail (repository only)
 bt=${here}/../../../tools/tests/test_inkling2_bench.py
 if [ -f "${bt}" ]; then

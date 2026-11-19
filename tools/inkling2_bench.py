@@ -609,7 +609,7 @@ def sheet(a):
            # unembed split by vocab, router logits in fp32 on every rank, the drafter split over the ranks)
            "per_rank": {"dense": "split", "experts": "split", "unembed": "split", "router": "replicated_fp32",
                         "drafter": "split"},
-           # distinct experts R rows route to (a layer, measured on the oracle; phase5 dspark notes), R = 1..8
+           # distinct experts R rows route to (a layer, measured on the oracle), R = 1..8
            "distinct_experts": [8, 13.4, 18.0, 22.2, 26.1, 29.7, 33.0, 36.2]}
     write(out, a.out)
     return 0

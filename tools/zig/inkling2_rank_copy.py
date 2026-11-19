@@ -7,7 +7,10 @@ only the byte ranges the rank loads, at their original offsets, with holes elsew
 the tensors the runner loads (`model.llm.*` by default). The small files (config, quantization manifest, index,
 tokenizer, template) are copied whole.
 
-  serve  --root MODEL --port P --allow IP[,IP...]      on the host that holds the checkpoint (read-only)
+  serve  --root MODEL --port P --allow IP[,IP...] [--bind ADDR]
+                                                        on the host that holds the checkpoint (read-only); binds
+                                                        127.0.0.1 unless --bind names the address the ranks reach
+                                                        (0.0.0.0: every interface)
   bench  --server HOST:P --gib N [--jobs J]             link speed from the server, nothing written
   fetch  --server HOST:P | --http URL  --ranges RANK.tsv --dest DIR [--jobs J] [--prefix model.llm. ...]
                                                         --http: range requests on URL/<file> (a Hugging Face
@@ -185,7 +188,7 @@ def serve(a):
     srv.files = sorted(files)
     srv.shards = set(shards)
     srv.allow = set(x for x in (a.allow or "").split(",") if x)
-    print(f"serving {len(shards)} shards and {len(files)} files from {root} on {a.bind}:{a.port}; allow {sorted(srv.allow) or 'any'}", flush=True)
+    print(f"serving {len(shards)} shards and {len(files)} files from {root} on {a.bind}:{srv.server_address[1]}; allow {sorted(srv.allow) or 'any'}", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -942,7 +945,7 @@ def main(argv=None):
     s = sub.add_parser("serve")
     s.add_argument("--root", required=True)
     s.add_argument("--port", type=int, required=True)
-    s.add_argument("--bind", default="0.0.0.0")
+    s.add_argument("--bind", default="127.0.0.1", help="address to listen on (default 127.0.0.1, this host only)")
     s.add_argument("--allow", default="")
     b = sub.add_parser("bench")
     b.add_argument("--server", required=True)
