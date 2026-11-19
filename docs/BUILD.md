@@ -9,26 +9,28 @@ The release binaries are TensorFold's native engine with the Inkling-2 family: u
 | Patch | What it adds or changes |
 | --- | --- |
 | `0001` family | the Inkling-2 family (`zig/src/families/inkling2/`: config, plan and weights, the tensor-parallel CUDA runner with the KV page pool, the decode tool), its server text layer, structured output and chat-template additions, `/health`'s `kv`, and the native engine's family hooks |
-| `0002` kernels | the CUDA kernels (`zig/kernels/cuda/inkling2_*.cu`: attention, MoE, convolution, head, residual, fused, checkpoint mode) and their launch wrappers |
-| `0003` batching | the lanes core for several streams a decode step and interleaved prefill |
-| `0004` DSpark | the drafter kernel and runner, the native fold tool `tf-inkling2-fold`, the draft depth rule |
+| `0002` kernels | the CUDA kernels (`zig/kernels/cuda/inkling2_*.cu`: attention, MoE, convolution, head, residual, fused, checkpoint mode) and their launch wrappers; the fp32 attention core (`inkling2_kx*`, after kortexa-ai's `tf_ik_attention`), its checks (`tf-inkling2-attn`: the kernel forms, CUDA graphs, rare inputs) and its float64 reference (`zig/src/core/relbias_attention_ref.zig`); the decode steps' merged launches (projections, the bf16 router, convolution state commits); the MXFP8 quantizer for the drafter's MLP projections (`zig/src/cuda/mxfp8.zig`) |
+| `0003` batching | the lanes core for several streams a decode step and interleaved prefill; the lone stream's draft cut (`zig/src/core/lanes/windows.zig`, `cuda_lanes.zig`) |
+| `0004` DSpark | the drafter kernel and runner (its global-layer attention packed by key head, its MLP projections loaded as MXFP8), the native fold tool `tf-inkling2-fold`, the draft depth rule |
 | `0005` prompt cache | exact prefix snapshots, the `shared_first` rules, the store budget (upstream core edits) |
-| `0006` tooling | the checkpoint-mode oracle and checks (`tools/zig/inkling2_*.py`, PyTorch), template and tokenizer parity |
+| `0006` tooling | the checkpoint-mode oracle and checks (`tools/zig/inkling2_*.py`, PyTorch; `--attn fp32` for the fp32 reference, `inkling2_margins.py` and `inkling2_tokengate.py` for the token gate), template and tokenizer parity |
 | `0007` build glue | `zig build` steps for the family, its kernels and tools |
 | `0008` notices | the Inkling-2 credits in `NOTICE` and `THIRD_PARTY_NOTICES.md` (in the fork's wording: the recipe and release scripts are in this repository), and the license texts they cite |
 
 Applied with `git am --committer-date-is-author-date` and the committer `scripts/build-engine.sh` sets, the series gives
-commit `dee0906d3d18db50231d63c3112b5bf19942c210`, tree `bef143dea5d7866559f69e617fd408bbc9104d5d`
+commit `c55b38d7931b63f26d3cca5a80bfacca3088e053`, tree `ef76388571d6410e2db157861489da85c14fe082`
 ([`patches/APPLIED_TREE`](../patches/APPLIED_TREE)). That is the engine branch
-[`inkling2-sparks-v0.1`](https://github.com/swbiggart/TensorFold-upstream/tree/inkling2-sparks-v0.1) of our TensorFold
+[`inkling2-sparks-v0.2`](https://github.com/swbiggart/TensorFold-upstream/tree/inkling2-sparks-v0.2) of our TensorFold
 fork, at commit
-[`dee0906d3d18db50231d63c3112b5bf19942c210`](https://github.com/swbiggart/TensorFold-upstream/tree/dee0906d3d18db50231d63c3112b5bf19942c210),
+[`c55b38d7931b63f26d3cca5a80bfacca3088e053`](https://github.com/swbiggart/TensorFold-upstream/tree/c55b38d7931b63f26d3cca5a80bfacca3088e053),
 and the release branch's tree restricted to the engine's paths, except that `NOTICE` and `THIRD_PARTY_NOTICES.md` say
-where the recipe lives. The branch never moves; a later version gets its own branch.
+where the recipe lives. The branch never moves; a later version gets its own branch (v0.1's engine is
+[`inkling2-sparks-v0.1`](https://github.com/swbiggart/TensorFold-upstream/tree/inkling2-sparks-v0.1), commit
+`dee0906d3`).
 
 Other ids you may meet: the tarball's `VERSION` names the `source commit` of this repository it was packed from (the
-container image is tagged with it). The tarball's binaries are the gated build, compiled from the same engine source
-as the fork commit above (only `NOTICE` and `THIRD_PARTY_NOTICES.md`, which are not compiled, differ).
+container image is tagged with it). The tarball's binaries are the gated build, compiled from the same engine source as
+the fork commit above (only `NOTICE` and `THIRD_PARTY_NOTICES.md`, which are not compiled, differ).
 
 ## The toolchain
 
@@ -62,8 +64,8 @@ It copies `tensorfold-native`, `tf-inkling2-decode`, `tf-inkling2-plan`, `tf-ink
 ## Reproduction check (v0.1)
 
 On an x86-64 Linux build machine with Docker, from nothing: a fresh clone of
-`https://github.com/ashhart/TensorFold` at `223da7659`, `git am` of the eight patches (commit `dee0906d3`, tree
-`bef143dea5d7`, as above), a fresh clone of xgrammar at `97787376` (tag v0.2.8, with `3rdparty/dlpack`), the toolchain
+`https://github.com/ashhart/TensorFold` at `223da7659`, `git am` of v0.1's eight patches (commit `dee0906d3`, tree
+`bef143dea5d7`), a fresh clone of xgrammar at `97787376` (tag v0.2.8, with `3rdparty/dlpack`), the toolchain
 image built from the Dockerfile, an empty Zig cache; 463 s of build. Compared with the v0.1 release's `bin/` and
 `lib/libtfgrammar.so` (the binaries every v0.1 gate ran):
 
@@ -102,16 +104,14 @@ binaries, the recipe and tools at a commit of this repository, and the engine so
 the binaries and the bundled libraries):
 
 ```
-scripts/release/stage-dist.sh tensorfold-inkling2-tp4-v0.1-aarch64-sm121.tar.gz build/dist
-scripts/release/build-assets.sh build/dist --engine-src build/engine-src --version v0.1
+scripts/release/stage-dist.sh tensorfold-inkling2-tp4-v0.2-aarch64-sm121.tar.gz build/dist
+scripts/release/build-assets.sh build/dist --engine-src build/engine-src --version v0.2
 ```
 
-Checked for v0.1: the release asset `tensorfold-inkling2-tp4-v0.1-aarch64-sm121.tar.gz` (sha256
-`27d4eff27404b7b3bc5b7eb0d3aa3fb2c2890879499851593cf51dc8a9bcfedb`) is this script's output at commit `836c1a0` of this repository with the gated build's
-`bin/` and `lib/`, the release's `plan/` and `data/`, and the engine source above. Against the tarball every release
-gate ran on (the same binaries, libraries, plan and data), its 129 members are the same except `VERSION`,
-`SHA256SUMS`, the Markdown files, `NOTICE` (the fork's wording) and four recipe files changed after that run
-(`bench.sh`, `setup.sh`, `setup/lib.sh`, `setup/test-lib.sh`); the fresh-install gates (host, container, checkpoint
-copy) ran again on the asset itself. A tarball made from rebuilt binaries would differ in `bin/tensorfold-native` and
-`bin/tf-inkling2-decode` as described above.
+Checked for v0.2: the release asset `tensorfold-inkling2-tp4-v0.2-aarch64-sm121.tar.gz` (sha256
+`4aa5a3f0a5639435320b354b7d16893c824c85987ff2bf28f9b2bc9b801470be`) is this script's output at commit `25bf4f3f123d` of
+this repository with the gated build's `bin/` and `lib/`, the release's `plan/` and `data/`, and the engine source
+above. Against the tarball every release gate ran on (the same binaries, libraries, plan and data), its 131 files are
+the same except `VERSION`, `SHA256SUMS`, the Markdown files (8) and `NOTICE` (the fork's wording). A tarball made from
+rebuilt binaries would differ in `bin/tensorfold-native` and `bin/tf-inkling2-decode` as described above.
 
