@@ -15,8 +15,10 @@ keeps its MIT notice in [`LICENSES/MIT.txt`](LICENSES/MIT.txt).
 
 - `patches/*.patch` are changes to TensorFold at the commit in `ENGINE_COMMIT`; their context lines are TensorFold's.
 - `tools/bench_openai.py`, `bench_cache.py`, `bench_concurrent.py`, `bench_args.py`, `bench_auth.py`,
-  `bench_evidence.py`, `bench_metrics.py`, `bench_stream.py`, `bench_thinking.py`, `bench_timing.py` and
-  `bench_prompts.json` are TensorFold's files at that commit, unmodified (`tools/bench_dspark.py` is ours and uses them).
+  `bench_evidence.py`, `bench_metrics.py`, `bench_stream.py`, `bench_thinking.py` and `bench_timing.py` are TensorFold's
+  files at that commit, unmodified (`tools/bench_dspark.py` is ours and uses them).
+- `tools/bench_prompts.json` is TensorFold's file with its prompts reworded for longer replies (changed for v0.2, by
+  `patches/`).
 - `LICENSE` is TensorFold's copy of the Apache License 2.0.
 
 ## Inkling-2-Small
@@ -72,6 +74,27 @@ Foundation, MIT License (see [the license text](LICENSES/TokenSpeed-MIT.txt)). T
   `execution/drafter/dflash.py`, including `Inkling2MTPHead.refresh_fold` and the bf16 `RotaryEmbedding` cache),
   under the same copyright and license.
 
+**kortexa-ai's TensorFold fork** ([kortexa-ai/TensorFold](https://github.com/kortexa-ai/TensorFold), by francip, commit
+`e2614fe`), Apache License 2.0 (see [the license text](LICENSES/Apache-2.0.txt)); its `NOTICE` is TensorFold's own,
+reproduced in `NOTICE`. The Inkling-2 attention core is adapted from its `tf_ik_attention` kernel. Each file below keeps
+the Apache-2.0 header, names that source and commit, and says that it was modified:
+
+- `zig/kernels/cuda/inkling2_kx_common.cuh` is `zig/kernels/cuda/inkling2_common.cuh` at `e2614fe`, with that header
+  added and nothing else changed.
+- `zig/kernels/cuda/inkling2_kx_attention.cuh` is `zig/kernels/cuda/inkling2_attention.cuh` at `e2614fe`, with its
+  include renamed to `inkling2_kx_common.cuh` and the kernel renamed `tf_ik_attention_e2614fe`. The engine never runs
+  it; `tf-inkling2-attn` runs it as a control.
+- `zig/kernels/cuda/inkling2_kx_fp32.cuh`, the attention the engine runs, keeps the per-row arithmetic of
+  `inkling2_attention.cuh` and `inkling2_attention_decode.cuh` (Q·K on `mma.sync` with fp32 accumulation, fp32 scores
+  and online softmax over 64-key tiles, P·V as three bf16 parts of fp32 P, the multiplier form of the attention sink,
+  one bf16 rounding at the output) and the relative-bias arithmetic of `inkling2_heads.cuh`. Modified: one tile body
+  for every form, with ring and paged keys, the position read on the device for CUDA graphs and scalar kernel
+  arguments; keys outside a block's range loaded as zero; subnormal q, K, V elements and P parts flushed per element;
+  a row with a non-finite input recomputed alone (never its whole block); NaN outputs stored as one canonical value;
+  exception counters; column splits; fixed S-key splits on the global layers and on the sliding-window layers with an
+  ordered fp32 merge, and a walk over the splits for long prompt chunks; the query heads that share a key/value head
+  packed into one tile; the relative-bias table in one launch.
+
 ### Numerics and behaviour followed
 
 These files reimplement another project's math or behaviour. They copy none of its code, and the project is not
@@ -96,6 +119,11 @@ included.
   vision tensor names in `roles.zig` follow TokenSpeed's `inkling2_mtp.py` and `inkling2_vision.py`.
   `tools/zig/inkling2_ref_check.py --tokenspeed TS_DIR` runs TokenSpeed's own `block_scaled.py` from a checkout the
   user supplies, unmodified (its unused imports stubbed); it is not copied or shipped.
+- **kortexa-ai's TensorFold fork** (the copyright and license above). The fp32 attention reference and checks follow
+  the arithmetic of `tf_ik_attention` at `e2614fe` and copy none of its code: `tools/zig/inkling2_ref.py`,
+  `inkling2_op_ref.py` and `inkling2_margins.py` (`--attn fp32`, in PyTorch); `zig/src/core/relbias_attention_ref.zig`
+  (float64 ranges of its fast path and its per-row path, and of the split form); the argument layout of the control
+  launch in `zig/src/families/inkling2/cuda_attn.zig` (`InklingAttention`).
 - **Four Over Six** ([mit-han-lab/fouroversix](https://github.com/mit-han-lab/fouroversix); J. Cook, J. Guo, G. Xiao,
   Y. Lin, S. Han, "Four Over Six: More Accurate NVFP4 Quantization with Adaptive Block Scaling",
   [arXiv:2512.02010](https://arxiv.org/abs/2512.02010)). The checkpoint's `scale_selection_rule: fouroversix_mae`
@@ -195,11 +223,14 @@ conditions on TensorFold; they are credited by name.
   published speeds and findings (fp32 reductions in decode, a CUDA graph for each batch size, the draft block width)
   were planning reference points.
 - **0xSero's inkling2-exl3** ([0xSero/inkling2-exl3](https://github.com/0xSero/inkling2-exl3), MIT License). Ideas
-  only: `/health`'s KV capacity and admission report (`server/status_routes.zig` `kv`, in the engine patches), and the
+  only: `/health`'s KV capacity and admission report (`server/status_routes.zig` `kv`, in the engine patches); the
   measuring process behind `recipe/inkling2-tp4/bench.sh` and `tools/inkling2_bench.py` (a one-command speed sweep with
   JSON out and a check command, a fixed realistic prompt set measured on the server's clock and at temperature 0.7 too,
-  a speed ledger against a bandwidth floor, concurrent needle sessions). No code was copied; the prompts
-  (`tools/inkling2_prompts.json`) and the needle text are our own.
+  a speed ledger against a bandwidth floor, concurrent needle sessions); and FP8 weight-only projections for the DSpark
+  drafter, whose MLP projections run from an FP8 copy of the checkpoint's bf16 drafter weights (theirs: e4m3 with a
+  scale per row; ours: MXFP8, e4m3 with a power-of-two scale per 32 values, quantized at start-up by the quantizer the
+  engine patches add to `zig/src/cuda/mxfp8.zig` and loaded in `zig/src/families/inkling2/cuda_dspark.zig`). No code
+  was copied; the prompts (`tools/inkling2_prompts.json`) and the needle text are our own.
 - **BertholomusAI's four-Spark TensorFold recipes**
   ([deepseek-v4.1-tensorfold-tp4-4xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10),
   [mistral-large-4-tensorfold-tp4-4xgb10](https://github.com/bertholomus/mistral-large-4-tensorfold-tp4-4xgb10),

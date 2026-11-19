@@ -7,8 +7,9 @@ to TensorFold at the commit named in ENGINE_COMMIT that adds the Inkling-2 famil
 Apache License, Version 2.0 (LICENSE). Outside code it includes keeps its own license and notice; it is listed, with
 the sources this work follows, in THIRD_PARTY_NOTICES.md, and the license texts are in LICENSES/.
 
-The patches modify TensorFold, and tools/bench_*.py other than tools/bench_dspark.py, and
-tools/bench_prompts.json, are TensorFold's files, unmodified (tools/inkling2_bench.py and its files are ours). TensorFold's NOTICE reads:
+The patches modify TensorFold, and tools/bench_*.py other than tools/bench_dspark.py are TensorFold's files,
+unmodified; tools/bench_prompts.json is TensorFold's file with its prompts reworded for longer replies, changed for
+v0.2 by patches/ (tools/inkling2_bench.py and its files are ours). TensorFold's NOTICE reads:
 
   TensorFold
   Copyright 2026 TensorFold contributors
@@ -18,6 +19,12 @@ tools/bench_prompts.json, are TensorFold's files, unmodified (tools/inkling2_ben
   Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
   MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
   THIRD_PARTY_NOTICES.md.
+
+The Inkling-2 attention core in patches/ follows the fp32 attention arithmetic of
+tf_ik_attention in kortexa-ai's TensorFold fork (https://github.com/kortexa-ai/TensorFold,
+by francip) at commit e2614fe, Apache License 2.0. Files adapted from it keep their
+Apache-2.0 header, name that source and commit, and say that they were modified. That
+fork's NOTICE is TensorFold's own, quoted above.
 
 The Inkling-2-Small release assets bundle NVIDIA NCCL 2.30.7 (Copyright (c) 2015-2026 NVIDIA CORPORATION &
 AFFILIATES; Apache License 2.0 and BSD 3-Clause, LICENSES/NCCL-LICENSE.txt) and NVIDIA cuBLAS / cuBLASLt 13.1.1.3
