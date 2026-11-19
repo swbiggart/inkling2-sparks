@@ -1,40 +1,47 @@
-From 5b3f013c20638993c6c19f7b7c1171d642498228 Mon Sep 17 00:00:00 2001
+From bddb9b73ba9e0d25cfc570698bafda6055a63112 Mon Sep 17 00:00:00 2001
 From: Scott Biggart <297695+swbiggart@users.noreply.github.com>
-Date: Mon, 16 Nov 2026 01:00:00 -0800
+Date: Tue, 17 Nov 2026 19:30:00 -0800
 Subject: [PATCH 6/8] inkling2: tooling: checkpoint-mode oracle and checks,
  template and tokenizer parity
 
-26 files (24 new, 2 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
-Part of the engine changes behind Inkling-2-Small TP4 v0.1 (github.com/swbiggart/inkling2-sparks).
+32 files (29 new, 3 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
+Part of the engine changes behind Inkling-2-Small TP4 v0.2 (github.com/swbiggart/inkling2-sparks).
 Apply the whole series in order with git am (scripts/build-engine.sh does); only the full series is built and gated.
 ---
- tools/zig/inkling2_attn_check.py              |  223 +++
+ tools/bench_prompts.json                      |   96 +-
+ tools/tests/test_inkling2_tokengate.py        |  379 ++++
+ tools/zig/inkling2_attn_check.py              |  388 ++++
  tools/zig/inkling2_chain.py                   |  132 ++
- tools/zig/inkling2_ck_check.py                |  177 +++
- tools/zig/inkling2_compare.py                 |  387 +++++
- tools/zig/inkling2_dspark_ref.py              |  483 ++++++
+ tools/zig/inkling2_ck_check.py                |  177 ++
+ tools/zig/inkling2_compare.py                 |  387 ++++
+ tools/zig/inkling2_dspark_ref.py              |  483 +++++
  tools/zig/inkling2_f64.py                     |  248 +++
- tools/zig/inkling2_g1.py                      |  300 ++++
+ tools/zig/inkling2_g1.py                      |  300 +++
  tools/zig/inkling2_greedy.py                  |  112 ++
  tools/zig/inkling2_inventory.py               |   68 +
+ tools/zig/inkling2_margins.py                 |  395 ++++
+ tools/zig/inkling2_margins_test.py            |   31 +
  tools/zig/inkling2_mask_dump.py               |  118 ++
  tools/zig/inkling2_moe_check.py               |  215 +++
- tools/zig/inkling2_op_ref.py                  |  512 +++++++
+ tools/zig/inkling2_op_ref.py                  |  529 ++++++
  tools/zig/inkling2_rank.sh                    |   35 +
- tools/zig/inkling2_ref.py                     | 1338 +++++++++++++++++
- tools/zig/inkling2_ref_check.py               |  748 +++++++++
+ tools/zig/inkling2_ref.py                     | 1613 +++++++++++++++++
+ tools/zig/inkling2_ref_check.py               |  748 ++++++++
  tools/zig/inkling2_res_check.py               |  226 +++
  tools/zig/inkling2_structured/README.md       |   27 +
  .../inkling2_structured/so_json_object.json   |  216 +++
- .../inkling2_structured/so_json_schema.json   |  392 +++++
- .../inkling2_structured/so_long_string.json   |  397 +++++
- .../so_thinking_schema.json                   |  434 ++++++
- .../inkling2_structured/so_tool_named.json    |  396 +++++
- .../inkling2_structured/so_tool_required.json |  507 +++++++
- tools/zig/inkling2_tensors.py                 |   91 ++
+ .../inkling2_structured/so_json_schema.json   |  392 ++++
+ .../inkling2_structured/so_long_string.json   |  397 ++++
+ .../so_thinking_schema.json                   |  434 +++++
+ .../inkling2_structured/so_tool_named.json    |  396 ++++
+ .../inkling2_structured/so_tool_required.json |  507 ++++++
+ tools/zig/inkling2_tensors.py                 |   91 +
+ tools/zig/inkling2_tokengate.py               |  217 +++
+ tools/zig/inkling2_tolerance.py               |  194 ++
  tools/zig/template_parity.py                  |   31 +-
  tools/zig/tokenizer_parity.py                 |   17 +-
- 26 files changed, 7823 insertions(+), 7 deletions(-)
+ 32 files changed, 9576 insertions(+), 23 deletions(-)
+ create mode 100644 tools/tests/test_inkling2_tokengate.py
  create mode 100644 tools/zig/inkling2_attn_check.py
  create mode 100644 tools/zig/inkling2_chain.py
  create mode 100644 tools/zig/inkling2_ck_check.py
@@ -44,6 +51,8 @@ Apply the whole series in order with git am (scripts/build-engine.sh does); only
  create mode 100644 tools/zig/inkling2_g1.py
  create mode 100644 tools/zig/inkling2_greedy.py
  create mode 100644 tools/zig/inkling2_inventory.py
+ create mode 100644 tools/zig/inkling2_margins.py
+ create mode 100644 tools/zig/inkling2_margins_test.py
  create mode 100644 tools/zig/inkling2_mask_dump.py
  create mode 100644 tools/zig/inkling2_moe_check.py
  create mode 100644 tools/zig/inkling2_op_ref.py
@@ -59,18 +68,510 @@ Apply the whole series in order with git am (scripts/build-engine.sh does); only
  create mode 100644 tools/zig/inkling2_structured/so_tool_named.json
  create mode 100644 tools/zig/inkling2_structured/so_tool_required.json
  create mode 100644 tools/zig/inkling2_tensors.py
+ create mode 100644 tools/zig/inkling2_tokengate.py
+ create mode 100644 tools/zig/inkling2_tolerance.py
 
+diff --git a/tools/bench_prompts.json b/tools/bench_prompts.json
+index da5c99e80749edb93560c7331e353d80e94d1ace..5f578a72f09d11187f8f1f35e166666fdf35725b 100644
+--- a/tools/bench_prompts.json
++++ b/tools/bench_prompts.json
+@@ -1,18 +1,82 @@
+ [
+- {"name": "quicksort-raw", "kind": "completion", "prompt": "def quicksort(xs):\n    \"\"\"Sort a list with quicksort.\"\"\"\n"},
+- {"name": "rust-reverse-words", "kind": "chat", "prompt": "Write a Rust function that reverses the words of a sentence, with a unit test."},
+- {"name": "multiply-17-23", "kind": "chat", "prompt": "What is 17 times 23? Show the steps."},
+- {"name": "sleep-tips", "kind": "chat", "prompt": "Give me three tips for sleeping better."},
+- {"name": "js-debounce-raw", "kind": "completion", "prompt": "// A JavaScript debounce helper with a cancel method\nfunction debounce(fn, ms) {\n"},
+- {"name": "linear-equation", "kind": "chat", "prompt": "Solve for x: 3x + 7 = 31, then check the answer by substitution, and explain each step to a student who is new to algebra."},
+- {"name": "fishing-village", "kind": "chat", "prompt": "Describe a quiet morning in a small fishing village."},
+- {"name": "sql-left-join", "kind": "chat", "prompt": "Explain what a SQL LEFT JOIN returns compared with an INNER JOIN, with a tiny example table."},
+- {"name": "rectangle", "kind": "chat", "prompt": "A rectangle is 12 cm by 7 cm. Find its area, its perimeter and the length of its diagonal."},
+- {"name": "dinner-idea", "kind": "chat", "prompt": "Hi! What should I cook tonight with rice, eggs and spinach?"},
+- {"name": "c-primes-raw", "kind": "completion", "prompt": "#include <stdio.h>\n\n/* Print the first n prime numbers. */\nint main(void) {\n"},
+- {"name": "prime-221", "kind": "chat", "prompt": "Is 221 a prime number? Explain."},
+- {"name": "heist-story", "kind": "chat", "prompt": "Summarize the plot of a heist story you invent, in five sentences, ending with a twist that the reader could have guessed from the second sentence."},
+- {"name": "bash-line-count", "kind": "chat", "prompt": "Write a bash one-liner that counts the lines of every .py file under the current directory and prints the total."},
+- {"name": "sum-1-250", "kind": "chat", "prompt": "Compute the sum of the integers from 1 to 250."},
+- {"name": "blue-sky", "kind": "chat", "prompt": "Why is the sky blue? Answer for a ten-year-old."}
++ {
++  "name": "quicksort-raw",
++  "kind": "completion",
++  "prompt": "\"\"\"Sorting helpers.\n\nThis module implements quicksort three ways: a simple recursive version that builds new lists,\nan in-place version with Lomuto partitioning, and an in-place version with a median-of-three pivot\nand insertion sort for short ranges. Each function has a docstring and doctest examples, and the\nmodule ends with a small self-test that compares all three against sorted() on random lists.\n\"\"\"\n\nimport random\n\n\ndef quicksort(xs):\n    \"\"\"Sort a list with quicksort and return a new list.\n\n    >>> quicksort([3, 1, 2])\n    [1, 2, 3]\n    \"\"\"\n"
++ },
++ {
++  "name": "rust-reverse-words",
++  "kind": "chat",
++  "prompt": "Write a Rust function that reverses the order of the words in a sentence while keeping the whitespace between them intact, and explain the design: how it splits the string, how it handles Unicode, punctuation and repeated spaces, and its time and memory cost. Then write a full test module with at least six unit tests covering empty input, a single word, leading and trailing spaces, tabs and non-ASCII words, and explain what each test checks."
++ },
++ {
++  "name": "multiply-17-23",
++  "kind": "chat",
++  "prompt": "What is 17 times 23? Work it out step by step in three different ways: the standard long multiplication algorithm, splitting 23 into 20 + 3 with the distributive law, and the difference-of-squares trick around 20. Explain every step in full sentences for a student who finds mental arithmetic hard, check that all three methods agree, and finish with a short paragraph on when each method is the most useful."
++ },
++ {
++  "name": "sleep-tips",
++  "kind": "chat",
++  "prompt": "Give me three tips for sleeping better. For each tip, write a full paragraph explaining why it works, what the research says about it in plain language, how to start doing it this week, and the most common mistakes people make with it. End with a sample evening routine that puts all three tips together, hour by hour, from dinner to lights out."
++ },
++ {
++  "name": "js-debounce-raw",
++  "kind": "completion",
++  "prompt": "/**\n * Timing helpers for UI code.\n *\n * debounce(fn, ms, options) delays fn until ms have passed without a new call; options.leading\n * calls it on the first call instead, options.maxWait forces a call at least every maxWait ms.\n * The returned function has cancel() and flush() methods. throttle(fn, ms) is built on debounce.\n * Every helper is documented with JSDoc, and the file ends with a set of example usages.\n */\n\n// A JavaScript debounce helper with a cancel method\nfunction debounce(fn, ms, options = {}) {\n"
++ },
++ {
++  "name": "linear-equation",
++  "kind": "chat",
++  "prompt": "Solve for x: 3x + 7 = 31. Explain each step to a student who is new to algebra: what an equation is, why we may do the same thing to both sides, how to undo the addition and then the multiplication, and how to check the answer by substitution. Then solve two similar practice equations, 5x - 4 = 21 and 2x + 9 = 3, the same careful way, and finish with a short list of the mistakes beginners most often make."
++ },
++ {
++  "name": "fishing-village",
++  "kind": "chat",
++  "prompt": "Describe a quiet morning in a small fishing village in four or five long paragraphs: the harbour before dawn, the boats going out, the market opening, the people in the cafe, and the village as the sun climbs. Use concrete sounds, smells and small details, and follow one old fisherman and one child through the morning."
++ },
++ {
++  "name": "sql-left-join",
++  "kind": "chat",
++  "prompt": "Explain what a SQL LEFT JOIN returns compared with an INNER JOIN. Build two tiny example tables, customers and orders, with a few rows each, show both queries, and print the full result table of each query as text. Then explain row by row why each row appears or not, what the NULLs mean, how a WHERE condition on the right table can silently turn a LEFT JOIN into an INNER JOIN, and how to write it correctly."
++ },
++ {
++  "name": "rectangle",
++  "kind": "chat",
++  "prompt": "A rectangle is 12 cm by 7 cm. Find its area, its perimeter and the length of its diagonal, explaining each formula, why it works and each step of the arithmetic, including how to simplify and approximate the square root. Then answer three follow-up questions the same careful way: what happens to each value if both sides are doubled, what square has the same perimeter, and what square has the same area."
++ },
++ {
++  "name": "dinner-idea",
++  "kind": "chat",
++  "prompt": "Hi! What should I cook tonight with rice, eggs and spinach? Suggest three different dinners. For each one give the full ingredient list with amounts for two people, numbered step-by-step instructions with times and heat levels, and a tip for making it taste better. Finish with which of the three is quickest and which keeps best for lunch tomorrow."
++ },
++ {
++  "name": "c-primes-raw",
++  "kind": "completion",
++  "prompt": "/*\n * primes.c: print prime numbers.\n *\n * Usage: primes N [METHOD]\n *   Prints the first N primes, one per line. METHOD is \"trial\" (trial division by the primes found\n *   so far) or \"sieve\" (a sieve of Eratosthenes that grows its bound until it holds N primes).\n *   Both methods are implemented below with comments, and main() checks its arguments, reports\n *   errors on stderr and prints the time each method took.\n */\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <time.h>\n\n/* Print the first n prime numbers. */\n"
++ },
++ {
++  "name": "prime-221",
++  "kind": "chat",
++  "prompt": "Is 221 a prime number? Explain how to decide it step by step: what a prime number is, why it is enough to test divisors up to the square root, which primes need testing here and the result of each division. Then factor 221 completely, check the factors by multiplying them back, and explain the same test for 223 and 225 as two more worked examples."
++ },
++ {
++  "name": "heist-story",
++  "kind": "chat",
++  "prompt": "Write the full plot of a heist story you invent, in about eight paragraphs: introduce the crew of four and what each one is good at, the target and why it seems impossible, the plan, the night of the heist with the two things that go wrong, and an ending with a twist that the reader can trace back to a small clue planted in the first paragraph."
++ },
++ {
++  "name": "bash-line-count",
++  "kind": "chat",
++  "prompt": "Write a bash one-liner that counts the lines of every .py file under the current directory, including subfolders, and prints a total. Then explain every part of the command in detail, show what it prints on a small example tree, and give three improved versions: one that handles file names with spaces and newlines safely, one that skips hidden folders and virtual environments, and one that sorts the files by line count. Explain the trade-offs of each."
++ },
++ {
++  "name": "sum-1-250",
++  "kind": "chat",
++  "prompt": "Compute the sum of the integers from 1 to 250. Explain three ways to get it: adding in pairs the way the young Gauss is said to have done, the formula n(n + 1) / 2 with a proof of why it works, and a short Python loop that checks it. Show every step of the arithmetic, then use the same ideas to find the sum of the even numbers from 2 to 250 and the sum of the integers from 101 to 250."
++ },
++ {
++  "name": "blue-sky",
++  "kind": "chat",
++  "prompt": "Why is the sky blue? Answer for a ten-year-old in several paragraphs: what sunlight is made of, what happens when light meets the tiny molecules of air, why blue light is scattered more than red, why sunsets are orange and red, and why the sky on the Moon is black. Add a simple experiment with a glass of water, milk and a flashlight that shows the same effect at home, with steps."
++ }
+ ]
+diff --git a/tools/tests/test_inkling2_tokengate.py b/tools/tests/test_inkling2_tokengate.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce40b9786929824f93d9f59ef6687c917ee7c842
+--- /dev/null
++++ b/tools/tests/test_inkling2_tokengate.py
+@@ -0,0 +1,379 @@
++"""recipe/inkling2-tp4/smoke.py's token gate (the yardstick: the server forced along the oracle's replies, scored
++against the oracle's top-1 and top-2 over 445 positions), its forcing client against a stand-in /v1/completions, the
++free-running departures (information), and tools/zig/inkling2_tokengate.py and inkling2_tolerance.py --yardstick
++offline. Standard library only (python3 -I -m pytest tools/tests/test_inkling2_tokengate.py, or -m unittest)."""
++
++import contextlib
++import io
++import json
++import os
++import sys
++import tempfile
++import threading
++import unittest
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "zig"))
++import inkling2_tokengate as D  # noqa: E402
++import inkling2_tolerance as T  # noqa: E402
++
++S = D.smoke
++EOS = 200006
++N, TOP1, TOP2 = S.YARDSTICK_POSITIONS, S.YARDSTICK_TOP1, S.YARDSTICK_TOP2
++
++
++def row(top1, top2, l1, gap, pre=None):
++    return {"top1": top1, "top2": top2, "top1_logit": l1, "top2_logit": None if gap is None else l1 - gap, "gap": gap,
++            "gap_pre": pre, "step": D.bf16_spacing(l1)}
++
++
++def entry(ids, margins=None):
++    e = {"ids": ids, "text": ""}
++    if margins is not None:
++        e["margins"] = margins
++    return e
++
++
++def clear(ids, logit=20.0, gap=3.0):
++    """Margins far from any tie, the oracle's picks first and token 1 second."""
++    return [row(t, 1, logit, gap) for t in ids]
++
++
++# the gate's shape: chat_short 11, tool_call 48 and 7 extended prompts, 445 positions
++SIZES = {"chat_short": 11, "tool_call": 48, "ext_json": 64, "ext_german": 64, "ext_long": 26, "ext_thinking": 64,
++         "ext_code": 64, "ext_tool": 64, "ext_multi_turn": 40}
++
++
++def gate_set():
++    """{name: (prompt ids, oracle entry)} with 445 positions; every reply token distinct, runner-up 1."""
++    out, base = {}, 1000
++    for i, (name, n) in enumerate(SIZES.items()):
++        ref = list(range(base, base + n))
++        base += n
++        out[name] = ([10 + i, 50 + i], entry(ref, clear(ref)))
++    return out
++
++
++def forced_score(off_top1_in_top2=0, outside_top2=0):
++    """A forced run over the gate set with that many positions at the oracle's runner-up and outside its top-2."""
++    gs = gate_set()
++    rows, k = [], 0
++    for name, (_, e) in gs.items():
++        f = list(e["ids"])
++        for j in range(len(f)):
++            if k < off_top1_in_top2:
++                f[j] = 1  # the runner-up
++            elif k < off_top1_in_top2 + outside_top2:
++                f[j] = 7  # not in the oracle's top-2
++            k += 1
++        rows.append((name, e["ids"], e["margins"], f))
++    return S.yardstick_score(rows)
++
++
++class Yardstick(unittest.TestCase):
++    def test_bars(self):
++        self.assertEqual((N, TOP1, TOP2), (445, 438, 443))
++        self.assertEqual(sum(SIZES.values()), N)
++
++    def test_all_equal_passes(self):
++        sc = forced_score()
++        self.assertEqual((sc["positions"], sc["top1"], sc["top2"]), (445, 445, 445))
++        self.assertTrue(S.yardstick_verdict(sc)[0])
++
++    def test_top1_at_just_over_just_under(self):
++        for off, ok in ((7, True), (6, True), (8, False)):  # 438 (at the bar), 439 (just over), 437 (just under)
++            sc = forced_score(off_top1_in_top2=off)
++            self.assertEqual((sc["top1"], sc["top2"]), (445 - off, 445))
++            passed, line = S.yardstick_verdict(sc)
++            self.assertEqual(passed, ok, line)
++        self.assertIn("YARDSTICK: top-1 437/445 (< 438), in the oracle's top-2 445/445 (>= 443): FAIL",
++                      S.yardstick_verdict(forced_score(off_top1_in_top2=8))[1])
++
++    def test_top2_at_just_over_just_under(self):
++        for out, ok in ((2, True), (1, True), (3, False)):  # 443 (at the bar), 444 (just over), 442 (just under)
++            sc = forced_score(outside_top2=out)
++            self.assertEqual((sc["top1"], sc["top2"]), (445 - out, 445 - out))
++            self.assertEqual(S.yardstick_verdict(sc)[0], ok)
++        line = S.yardstick_verdict(forced_score(outside_top2=3))[1]
++        self.assertIn("in the oracle's top-2 442/445 (< 443): FAIL", line)
++
++    def test_mixed_at_both_bars(self):
++        sc = forced_score(off_top1_in_top2=5, outside_top2=2)  # 438 top-1, 443 top-2
++        self.assertEqual((sc["top1"], sc["top2"]), (438, 443))
++        self.assertTrue(S.yardstick_verdict(sc)[0])
++        sc = forced_score(off_top1_in_top2=4, outside_top2=3)  # 438 top-1, 442 top-2
++        self.assertFalse(S.yardstick_verdict(sc)[0])
++
++    def test_a_token_outside_the_top_2(self):
++        m = row(179692, 220, 27.796, 0.1086)
++        self.assertEqual(S.yardstick_row(m, 179692, 179692), (True, True))
++        self.assertEqual(S.yardstick_row(m, 179692, 220), (False, True))
++        self.assertEqual(S.yardstick_row(m, 179692, 13), (False, False))
++        lines = []
++        sc = S.yardstick_score([("tool_call", [5, 179692], [row(5, 1, 20.0, 3.0), m], [5, 13])])
++        S.yardstick_lines(sc, lines.append)
++        self.assertEqual(lines, ["  tool_call j=1: server 13, oracle 179692 (outside the oracle's top-2; the oracle's "
++                                 "runner-up is 220, not the server's token)"])
++        sc = S.yardstick_score([("tool_call", [5, 179692], [row(5, 1, 20.0, 3.0), m], [5, 220])])
++        lines = []
++        S.yardstick_lines(sc, lines.append)
++        self.assertEqual(lines, ["  tool_call j=1: server 220, oracle 179692 (in the oracle's top-2; oracle gap "
++                                 "0.1086; upstream one bf16 step 0.125: near tie)"])
++
++    def test_exact_tie_at_the_oracle_top_listed_either_way(self):
++        # topk may list an exact tie at the top in either order; both tokens are the oracle's top-2
++        m = row(151272, 155262, 28.35, 0.0)
++        self.assertEqual(S.yardstick_row(m, 155262, 151272), (False, True))
++        self.assertEqual(S.yardstick_row(m, 155262, 155262), (True, True))
++
++    def test_other_position_counts_never_pass(self):
++        gs = gate_set()
++        rows = [(n, e["ids"], e["margins"], e["ids"]) for n, (_, e) in gs.items() if n != "ext_long"]
++        sc = S.yardstick_score(rows)
++        self.assertEqual(sc["positions"], 419)
++        passed, line = S.yardstick_verdict(sc)
++        self.assertFalse(passed)
++        self.assertIn("the bars are for 445 positions", line)
++
++    def test_refused_inputs(self):
++        with self.assertRaises(SystemExit):
++            S.yardstick_score([("x", [1, 2], None, [1, 2])])  # no margins
++        with self.assertRaises(SystemExit):
++            S.yardstick_score([("x", [1, 2], clear([1, 2]), [1])])  # a forced token missing
++
++
++class Departures(unittest.TestCase):
++    """Free-running greedy replies: information with margins, v0.1's strict rule without."""
++
++    def test_equal_and_eos(self):
++        ref = [5, 6, EOS]
++        self.assertEqual(D.compare(ref, clear(ref), [5, 6, EOS])[:3], ("EQUAL", None, 3))
++        self.assertEqual(D.compare(ref, clear(ref), [5, 6])[:3], ("EQUAL", None, 3))  # EOS not returned
++
++    def test_without_margins_strict(self):
++        self.assertEqual(D.compare([5, 6, 7], None, [5, 9, 7])[:3], ("DIFFER", 1, 1))
++        self.assertEqual(D.compare([5, 6, 7, 8], None, [5, 6])[:3], ("DIFFER", 2, 2))
++
++    def test_with_margins_information(self):
++        ref = [5, 6, 7, 8]
++        m = clear(ref)
++        m[2] = row(7, 9, 27.8, 0.1)
++        st, j, n, note = D.compare(ref, m, [5, 6, 9, 4])
++        self.assertEqual((st, j, n), ("DEPARTS", 2, 2))
++        self.assertIn("oracle gap 0.1000; upstream one bf16 step 0.125: near tie; information", note)
++        m[2] = row(7, 9, 27.8, 0.2)
++        self.assertIn("upstream one bf16 step 0.125: over", D.compare(ref, m, [5, 6, 9, 4])[3])
++        self.assertIn("the oracle's runner-up is 9, not the server's token", D.compare(ref, m, [5, 6, 3])[3])
++        self.assertEqual(D.compare(ref, m, [5, 6])[:3], ("DEPARTS", 2, 2))  # stopped early
++
++    def test_verdict_is_information(self):
++        v = D.verdict(row(179692, 220, 27.796, 0.146), 179692, 220)
++        self.assertEqual((v["upstream_one_step_info"], v["in_oracle_top2"]), (False, True))
++        self.assertTrue(v["oracle_gap_under_0p5"])
++        v = D.verdict(row(179692, 220, 27.796, 0.072), 179692, 220,
++                      server_row={"top1": 220, "top2": 179692, "top1_logit": 27.7604, "gap": 0.0})
++        self.assertTrue(v["upstream_two_sided_info"])
++        self.assertNotIn("verdict", v)
++
++    def test_check_never_fails_on_a_departure(self):
++        cs = list(range(100, 110)) + [EOS]
++        tc = list(range(200, 248))
++        dec = {"chat_short": entry(cs, clear(cs)), "tool_call": entry(tc, clear(tc))}
++        ext = {"ext_a": entry([1, 2, 3], clear([1, 2, 3])), "ext_b": entry([4, 5], clear([4, 5]))}
++        srv = {"chat_short": cs, "tool_call": tc[:10] + [220] + tc[11:], "ext_a": [1, 9], "ext_b": [4, 5]}
++        lines = []
++        r = D.check(dec, srv, ["chat_short", "tool_call"], ext, ["ext_a", "ext_b"], srv, out=lines.append)
++        self.assertEqual(r["fails"], 0)
++        self.assertEqual(r["results"]["tool_call"], ("DEPARTS", 10, 48))
++        self.assertIn("EXT summary: 2 prompts, 1 EQUAL, 1 DEPARTS, 0 DIFFER; 3 of 5 oracle tokens equal before the "
++                      "first departure (60.0%)", lines)
++        dec["tool_call"] = entry(tc)  # no margins: v0.1's strict rule
++        self.assertEqual(D.check(dec, srv, ["tool_call"], out=lines.append)["fails"], 1)
++
++
++class Offline(unittest.TestCase):
++    def test_score(self):
++        gs = gate_set()
++        dec = {n: e for n, (_, e) in gs.items() if not n.startswith("ext_")}
++        ext = {n: e for n, (_, e) in gs.items() if n.startswith("ext_")}
++        forced = {n: list(e["ids"]) for n, (_, e) in gs.items()}
++        forced["tool_call"][10] = 1
++        forced["ext_code"][3] = 7
++        lines = []
++        r = D.score(dec, forced, ["chat_short", "tool_call"], ext, list(ext), out=lines.append)
++        self.assertTrue(r["passed"])
++        self.assertEqual(lines[-1], "YARDSTICK: top-1 443/445 (>= 438), in the oracle's top-2 444/445 (>= 443): PASS")
++        self.assertIn("tool_call: 48 positions: top-1 47, in the oracle's top-2 48", lines)
++
++    def test_order_from_oracle_data(self):
++        a = entry([1] * 30, clear([1] * 30))
++        a["margins"][5] = row(1, 2, 20.0, 0.05)  # step 0.125 at 20: near tie at 5
++        b = entry([1] * 30, clear([1] * 30))  # none: 30
++        c = entry([1] * 40, clear([1] * 40))
++        c["margins"][12] = row(1, 2, 20.0, 0.3)  # under 0.5 only
++        self.assertEqual(D.order({"ext_a": a, "ext_b": b, "ext_c": c, "_wall_s": 1.0}), ["ext_c", "ext_b", "ext_a"])
++        self.assertEqual(D.first_near_tie(c, 0.5), 12)
++        with self.assertRaises(SystemExit):
++            D.order({"x": entry([1, 2])})
++
++    def test_tolerance_yardstick_counts_ties_both_ways(self):
++        def r(tok, top, logits):
++            return {"token": tok, "top": top, "top_logits": logits, "argmax": top[0], "margin": logits[0] - logits[1]}
++        pos = {}
++        for j in range(3):
++            pos[("p", j)] = {f: r(10 + j, [10 + j, 1, 2], [9.0, 5.0, 4.0]) for f in T.FORMS}
++        pos[("p", 1)][("eager", "tf")] = r(11, [11, 2, 1], [7.0, 7.0, 4.0])  # an exact tie at the top, argmax 11
++        pos[("p", 2)][("eager", "tf")] = r(12, [2, 12, 1], [7.0, 6.0, 4.0])  # outside the oracle's top-2
++        y = T.yardstick(pos)
++        self.assertEqual(y["eager/tf"], {"top1": (1, 2, 2), "top2": (1, 2, 2)})  # (low, argmax, high)
++        self.assertEqual(y["fp32/decode"], {"top1": (3, 3, 3), "top2": (3, 3, 3)})
++
++
++class Stand_in:
++    """A /v1/completions stand-in: replies with the oracle's next token after (prompt ids + reply[:j]), except where
++    `wrong` says otherwise; records every request body."""
++
++    def __init__(self, prompts, wrong=None, free=None):
++        self.prompts, self.wrong, self.free, self.bodies = prompts, wrong or {}, free or {}, []
++        outer = self
++
++        class H(BaseHTTPRequestHandler):
++            def do_POST(self):
++                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
++                outer.bodies.append(body)
++                p = body["prompt"]
++                ids = None
++                for name, (pids, e) in outer.prompts.items():
++                    if p[: len(pids)] == pids and p[len(pids):] == e["ids"][: len(p) - len(pids)]:
++                        j = len(p) - len(pids)
++                        ids = ([outer.wrong.get((name, j), e["ids"][j])] if body["max_tokens"] == 1
++                               else outer.free.get(name, e["ids"])[: body["max_tokens"]])
++                        break
++                out = json.dumps({"choices": [{"text": "", "finish_reason": "length"}],
++                                  "tensorfold": {"token_ids": ids if ids is not None else []}}).encode()
++                self.send_response(200)
++                self.send_header("Content-Type", "application/json")
++                self.send_header("Content-Length", str(len(out)))
++                self.end_headers()
++                self.wfile.write(out)
++
++            def log_message(self, *a):
++                pass
++
++        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
++        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
++        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
++
++    def close(self):
++        self.srv.shutdown()
++        self.srv.server_close()
++
++
++def write_release_data(d, gs):
++    def put(name, obj):
++        with open(os.path.join(d, name), "w") as f:
++            json.dump(obj, f)
++    put("decode.json", {n: e for n, (_, e) in gs.items() if not n.startswith("ext_")})
++    os.mkdir(os.path.join(d, "ext"))
++    put("ext/decode.json", {n: e for n, (_, e) in gs.items() if n.startswith("ext_")})
++    for n, (pids, _) in gs.items():
++        put(("ext/" if n.startswith("ext_") else "") + n + ".ids.json", pids)
++    with open(os.path.join(d, "ext", "ORDER"), "w") as f:
++        f.write("".join(n + "\n" for n in gs if n.startswith("ext_")))
++
++
++def run_smoke(argv):
++    buf, old = io.StringIO(), sys.argv
++    sys.argv = ["smoke.py"] + argv
++    try:
++        with contextlib.redirect_stdout(buf):
++            rc = S.main()
++    finally:
++        sys.argv = old
++    return rc, buf.getvalue()
++
++
++class SmokeHTTP(unittest.TestCase):
++    """smoke.py yardstick and oracle end to end against the stand-in."""
++
++    def run_yardstick(self, wrong):
++        gs = gate_set()
++        st = Stand_in(gs, wrong)
++        try:
++            with tempfile.TemporaryDirectory() as d:
++                write_release_data(d, gs)
++                out = os.path.join(d, "forced.json")
++                rc, text = run_smoke([st.url, "yardstick", os.path.join(d, "decode.json"),
++                                      "chat_short=" + os.path.join(d, "chat_short.ids.json"),
++                                      "tool_call=" + os.path.join(d, "tool_call.ids.json"),
++                                      "--ext", os.path.join(d, "ext"), "--json", out])
++                with open(out) as f:
++                    saved = json.load(f)
++                with open(os.path.join(d, "decode.json")) as f:
++                    dec = json.load(f)
++                lines = []
++                offline = D.score(dec, saved["forced"],
++                                  ["chat_short", "tool_call"], *D.read_ext(os.path.join(d, "ext")), out=lines.append)
++        finally:
++            st.close()
++        return gs, st, rc, text, saved, offline
++
++    def test_yardstick_requests_are_release_completions(self):
++        gs, st, rc, text, saved, offline = self.run_yardstick({("tool_call", 10): 1})
++        self.assertEqual(rc, 0, text)
++        self.assertEqual(len(st.bodies), 445)
++        for b in st.bodies:
++            self.assertEqual({k: b[k] for k in ("max_tokens", "temperature", "ignore_eos", "return_token_ids")},
++                             {"max_tokens": 1, "temperature": 0, "ignore_eos": True, "return_token_ids": True})
++            self.assertEqual(set(b), {"model", "prompt", "max_tokens", "temperature", "ignore_eos", "return_token_ids"})
++        pids, e = gs["tool_call"]
++        self.assertIn({"model": "model", "prompt": pids + e["ids"][:10], "max_tokens": 1, "temperature": 0,
++                       "ignore_eos": True, "return_token_ids": True}, st.bodies)
++        self.assertIn("tool_call: prompt 2 tokens, 48 positions: top-1 47, in the oracle's top-2 48", text)
++        self.assertIn("YARDSTICK: top-1 444/445 (>= 438), in the oracle's top-2 445/445 (>= 443): PASS", text)
++        self.assertEqual((saved["top1"], saved["top2"], saved["passed"]), (444, 445, True))
++        self.assertEqual(saved["forced"]["tool_call"][10], 1)
++        self.assertEqual((offline["top1"], offline["top2"], offline["passed"]), (444, 445, True))
++
++    def test_yardstick_fails_just_under(self):
++        wrong = {("ext_json", j): 7 for j in range(3)}  # three tokens outside the top-2: 442
++        _, _, rc, text, saved, offline = self.run_yardstick(wrong)
++        self.assertEqual(rc, 1)
++        self.assertIn("in the oracle's top-2 442/445 (< 443): FAIL", text)
++        self.assertIn("  ext_json j=0: server 7, oracle 1059 (outside the oracle's top-2;", text)
++        self.assertFalse(offline["passed"])
++
++    def test_force_one_refuses_a_missing_token(self):
++        st = Stand_in({})
++        try:
++            with self.assertRaises(SystemExit):
++                S.force_one(st.url, [1, 2, 3])
++        finally:
++            st.close()
++
++    def test_oracle_free_running_is_information(self):
++        gs = gate_set()
++        _, tc = gs["tool_call"]
++        st = Stand_in(gs, free={"tool_call": tc["ids"][:10] + [1] + tc["ids"][11:]})
++        try:
++            with tempfile.TemporaryDirectory() as d:
++                write_release_data(d, gs)
++                args = [st.url, "oracle", os.path.join(d, "decode.json"),
++                        "chat_short=" + os.path.join(d, "chat_short.ids.json"),
++                        "tool_call=" + os.path.join(d, "tool_call.ids.json")]
++                rc, text = run_smoke(args + ["--ext", os.path.join(d, "ext")])
++                self.assertEqual(rc, 0, text)
++                self.assertIn("tool_call: prompt 2 tokens; oracle 48 tokens, server 48 (finish length): DEPARTS at 10",
++                              text)
++                self.assertIn("EXT summary: 7 prompts, 7 EQUAL, 0 DEPARTS, 0 DIFFER; 386 of 386", text)
++                with open(os.path.join(d, "decode.json"), "w") as f:  # v0.1's oracle file: no margins, strict
++                    json.dump({n: {"ids": e["ids"], "text": ""} for n, (_, e) in gs.items()}, f)
++                rc, text = run_smoke(args)
++                self.assertEqual(rc, 1)
++                self.assertIn("DIFFER at 10", text)
++        finally:
++            st.close()
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/tools/zig/inkling2_attn_check.py b/tools/zig/inkling2_attn_check.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..55f56d26744441e27a95f6aa74a1c17eba744ed4
+index 0000000000000000000000000000000000000000..79316b6fe514148b4bee199b24d1d68efd477bdc
 --- /dev/null
 +++ b/tools/zig/inkling2_attn_check.py
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,388 @@
 +"""G-attn's checks: long-prompt captures, tf-inkling2-attn's outputs against torch, and row invariance.
 +
 +USAGE = python tools/zig/inkling2_attn_check.py capture MODEL_DIR ORACLE_PROMPT --layers A:B --out CAPTURE [--rows T]
 +        python tools/zig/inkling2_attn_check.py compare MODEL_DIR CAPTURE ATTN_OUT [--json OUT]
 +        python tools/zig/inkling2_attn_check.py same DUMP_A DUMP_B [--ops attn.heads,attn.core]
++        python tools/zig/inkling2_attn_check.py core-inputs MODEL_DIR CAPTURE --layer L --out FILE
++        python tools/zig/inkling2_attn_check.py hist CORE_INPUTS ATTN_OUT [--json OUT] [--device cuda:0]
 +
 +  capture  inkling2_op_ref.py's capture for any prompt, also one whose oracle file keeps sampled rows (long_1500,
 +           long_4000): torch's chain starts from the normed embedding of the prompt's ids, runs layers 0 .. B-1 op by
@@ -80,6 +581,20 @@ index 0000000000000000000000000000000000000000..55f56d26744441e27a95f6aa74a1c17e
 +           the capture's; max |a - b|, relative norm, bf16 ulp histogram. Then every form and forward size against the
 +           first, bit for bit: a row's outputs must not depend on its forward's size or the attention's form.
 +  same     Two tf-inkling2-cuda --dump-ops dumps of the same prompt (e.g. different --chunk), op outputs bit for bit.
++  core-inputs  Layer L's attention core inputs from a capture of this tool or inkling2_op_ref.py (q'', r'', sink,
++           gate and the keys and values from position 0, as attn.heads and attn.project made them), its output o,
++           and the layer's rel_logits_proj.proj from the checkpoint, in one file with the layer kind in its
++           metadata: the input of tf-inkling2-attn --oracle --capture (no model needed there).
++  hist     The attention core's error on a real layer, in head-scale steps (information beside the
++           float64 range check): every form in ATTN_OUT (tf-inkling2-attn MODEL_DIR CAPTURE ATTN_OUT --layer L --forms
++           auto,kx: core.<form>.<N>.o; auto is v0.1's core, "v01"), torch's eager output (the core-inputs file's o,
++           v0.1's oracle arithmetic) and the fp32 form recomputed here (inkling2_ref.kx_core, v0.2's oracle), each
++           against float64 and against the fp32 form. float64 = the core in float64 on the same bf16 inputs and the
++           same bf16-rounded bias (the kernels' bias table, relbias_attention_ref.zig's point), sink in the
++           denominator. A head-scale step is one bf16 step at H = max over the head's columns of sigmoid(gate_c) *
++           sum_j p_j |v_jc| / sum p (float64, sink in sum p): an output's distance / that step. Prints p50, p99, max
++           and the share at <= 0.5, 1, 2, 4, 16 steps, per form and reference; forms' runs at different forward sizes
++           must be byte-equal (checked). TF32 off (inkling2_ref.tf32_guard).
 +
 +Transformers (Apache-2.0) is imported through inkling2_ref.py / inkling2_op_ref.py; this file copies none of it
 +(see THIRD_PARTY_NOTICES.md).
@@ -102,6 +617,7 @@ index 0000000000000000000000000000000000000000..55f56d26744441e27a95f6aa74a1c17e
 +from inkling2_compare import line, stats  # noqa: E402
 +
 +BF = torch.bfloat16
++WINDOW = 1024  # a sliding layer's keys: distance 0 .. 1023
 +ORDER = ["project", "heads", "core", "out"]  # tf-inkling2-attn's ops, in forward order
 +
 +
@@ -260,6 +776,143 @@ index 0000000000000000000000000000000000000000..55f56d26744441e27a95f6aa74a1c17e
 +    return 1 if bad or n == 0 else 0
 +
 +
++# ----------------------------------------------------------------------------------------------- core-inputs
++
++
++CORE_IN = ("q", "rel", "sink", "gate", "k_ctx@0", "v_ctx@0")
++
++
++def core_inputs(a):
++    c = safe_open(a.capture, framework="pt")
++    meta = c.metadata() or {}
++    L = a.layer
++    pre = f"op.{L}.attn.core"
++    if f"{pre}.in.q" not in c.keys():
++        raise SystemExit(f"{a.capture} has no layer {L} attention core")
++    T = c.get_slice(f"{pre}.in.q").get_shape()[0]
++    out = {f"{pre}.in.{n}": c.get_tensor(f"{pre}.in.{n}").contiguous() for n in CORE_IN}
++    out[f"{pre}.out.o"] = c.get_tensor(f"{pre}.out.o").contiguous()
++    for k, t in out.items():
++        if t.dtype != BF or t.dim() != 2 or t.shape[0] != T:
++            raise SystemExit(f"{k}: {t.dtype} {tuple(t.shape)}, expected bf16 [{T}, ...]")
++    proj = ref.Source(a.model_dir).get(f"model.llm.layers.{L}.attn.rel_logits_proj.proj")
++    if proj.dtype != BF or tuple(proj.shape) != (16, 1024):
++        raise SystemExit(f"rel_logits_proj.proj of layer {L}: {proj.dtype} {tuple(proj.shape)}, expected bf16 [16, 1024]")
++    out[f"{pre}.in.proj"] = proj.contiguous()
++    local = json.load(open(os.path.join(a.model_dir, "config.json")))["text_config"]["local_layer_ids"]
++    kind = "sliding" if L in local else "global"
++    save_file(out, a.out, metadata={"tool": "inkling2_attn_check.py core-inputs", "capture": os.path.basename(a.capture),
++                                     "oracle": meta.get("oracle", ""), "layer": str(L), "kind": kind, "rows": str(T)})
++    print(f"layer {L} ({kind}), {T} rows: {len(out)} tensors to {a.out}")
++    return 0
++
++
++# ----------------------------------------------------------------------------------------------- hist
++
++EDGES = (0.5, 1, 2, 4, 16)
++SCALE32 = float(np.float32(128 ** -0.5))  # the kernels' fp32 scale (0.08838834764831845f)
++NAMES = {"auto": "v01", "fused": "v01-fused", "split": "v01-split", "kx": "kx"}
++
++
++def hist(a):
++    dev = torch.device(a.device)
++    ref.tf32_guard(dev)
++    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
++    c = safe_open(a.inputs, framework="pt")
++    meta = c.metadata() or {}
++    L, kind = int(meta["layer"]), meta["kind"]
++    pre = f"op.{L}.attn.core"
++    get = lambda n: c.get_tensor(f"{pre}.{n}").to(dev)  # noqa: E731
++    q, rel, sink, gate = get("in.q"), get("in.rel"), get("in.sink"), get("in.gate")
++    k, v, proj, eager = get("in.k_ctx@0"), get("in.v_ctx@0"), get("in.proj"), get("out.o")
++    T, hq = sink.shape
++    hk = k.shape[1] // 128
++    ext = proj.shape[1]
++    f = safe_open(a.out, framework="pt")
++    runs = {}
++    for key in sorted(f.keys()):
++        p = key.split(".")
++        if p[0] == "core" and p[-1] == "o":
++            runs.setdefault(p[1], []).append((int(p[2]), key))
++    if not runs:
++        raise SystemExit(f"{a.out} holds no core.<form>.<N>.o")
++    forms, invariance = {}, {}
++    for form, items in sorted(runs.items()):
++        items.sort()
++        first = f.get_tensor(items[0][1])
++        for N, key in items[1:]:
++            d = int((bits(f.get_tensor(key)) != bits(first)).sum())
++            invariance[f"{form}.{N} vs {form}.{items[0][0]}"] = d
++        forms[NAMES.get(form, form)] = first.to(dev)
++    R = min([T] + [t.shape[0] for t in forms.values()])
++    forms["torch-eager"] = eager
++    forms["torch-fp32"] = None  # computed per block
++    refs = ("float64", "torch-fp32")
++    errs = {(fm, r): [] for fm in forms for r in refs if fm != r}
++    zero_h = 0
++    g = hq // hk
++    for r0 in range(0, R, a.block):
++        r1 = min(R, r0 + a.block)
++        lo = max(0, r0 - (WINDOW - 1)) if kind == "sliding" else 0
++        rows = torch.arange(r0, r1, device=dev)
++        keys = torch.arange(lo, r1, device=dev)
++        dist = rows[:, None] - keys[None, :]
++        allowed = dist >= 0
++        if kind == "sliding":
++            allowed &= dist <= WINDOW - 1
++        qb = q[r0:r1].view(-1, hq, 128).transpose(0, 1)  # [hq, Rb, D]
++        kb = k[lo:r1].view(-1, hk, 128).transpose(0, 1).repeat_interleave(g, dim=0)
++        vb = v[lo:r1].view(-1, hk, 128).transpose(0, 1).repeat_interleave(g, dim=0)
++        rl = rel[r0:r1].view(-1, hq, proj.shape[0]).transpose(0, 1)  # [hq, Rb, d_rel]
++        table = torch.matmul(rl, proj)  # bf16 [hq, Rb, extent], fp32 sums: the kernels' bf16 bias table
++        bias = table.gather(-1, dist.clamp(0, ext - 1).expand(hq, -1, -1))
++        bias = bias.masked_fill((dist < 0) | (dist >= ext), 0.0)
++        sk = sink[r0:r1].transpose(0, 1)[..., None]  # [hq, Rb, 1]
++        gt = gate[r0:r1].view(-1, hq, 128).transpose(0, 1)  # [hq, Rb, D]
++        y, phi = ref.kx_core(qb[None], kb[None], vb[None], bias[None], allowed[None, None], SCALE32, sk[None])
++        forms["torch-fp32"] = ref.kx_output(y[0].transpose(0, 1).reshape(r1 - r0, -1), gate[r0:r1],
++                                            phi[0].transpose(0, 1))
++        s = torch.matmul(qb.double(), kb.double().transpose(-1, -2)) * SCALE32 + bias.double()
++        s = s.masked_fill(~allowed, float("-inf"))
++        m = torch.maximum(s.amax(-1, keepdim=True), sk.double())
++        w = torch.exp(s - m)
++        den = w.sum(-1, keepdim=True) + torch.exp(sk.double() - m)
++        sg = torch.sigmoid(gt.double())
++        point = (torch.matmul(w, vb.double()) / den) * sg  # [hq, Rb, D]
++        H = ((torch.matmul(w, vb.double().abs()) / den) * sg).amax(-1, keepdim=True)
++        step = torch.exp2(torch.floor(torch.log2(H)) - 7)
++        zero_h += int((H == 0).sum())
++        step = torch.where(H > 0, step, torch.full_like(step, float("nan")))
++        want = {"float64": point,
++                "torch-fp32": forms["torch-fp32"].view(-1, hq, 128).transpose(0, 1).double()}
++        for (fm, rf) in errs:
++            got = (forms[fm] if fm == "torch-fp32" else forms[fm][r0:r1]).view(-1, hq, 128).transpose(0, 1).double()
++            e = ((got - want[rf]).abs() / step).flatten()
++            errs[(fm, rf)].append(e[~torch.isnan(e)].float().cpu())
++    res = {"layer": L, "kind": kind, "rows": R, "heads": [hq, hk], "invariance": invariance,
++           "zero_head_scale_outputs": zero_h, "stats": {}}
++    print(f"HIST layer {L} ({kind}), {R} rows, heads {hq}/{hk}; forms: {', '.join(forms)}; runs byte-equal across "
++          f"forward sizes: {'yes' if all(d == 0 for d in invariance.values()) else 'NO ' + str(invariance)}")
++    for (fm, rf), parts in errs.items():
++        e = torch.cat(parts).numpy()
++        st = {"n": int(e.size), "p50": float(np.percentile(e, 50)), "p99": float(np.percentile(e, 99)),
++              "max": float(e.max()), "le": {str(x): float((e <= x).mean()) for x in EDGES}}
++        res["stats"][f"{fm} vs {rf}"] = st
++        print(f"HIST L{L} {fm:11s} vs {rf:10s}: p50 {st['p50']:.3f} p99 {st['p99']:.3f} max {st['max']:.3f} "
++              f"head-scale steps; " + " ".join(f"<={x}: {100 * st['le'][str(x)]:.2f}%" for x in EDGES))
++    k64, v64 = res["stats"].get("kx vs float64"), res["stats"].get("v01 vs float64")
++    if k64 and v64:
++        print(f"HIST L{L} line: kx vs float64 p50 {k64['p50']:.3f} p99 {k64['p99']:.3f} max {k64['max']:.3f}; v01 "
++              f"p50 {v64['p50']:.3f} p99 {v64['p99']:.3f} max {v64['max']:.3f} (head-scale steps); kx "
++              f"{'no further' if k64['p50'] <= v64['p50'] and k64['p99'] <= v64['p99'] else 'FURTHER'} than v01 at "
++              f"p50 and p99")
++    bad = any(d for d in invariance.values())
++    if a.json:
++        with open(a.json, "w") as fh:
++            json.dump(res, fh, indent=1)
++    return 1 if bad else 0
++
++
 +def main():
 +    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 +    sub = ap.add_subparsers(dest="cmd", required=True)
@@ -281,10 +934,21 @@ index 0000000000000000000000000000000000000000..55f56d26744441e27a95f6aa74a1c17e
 +    s.add_argument("a")
 +    s.add_argument("b")
 +    s.add_argument("--ops", default="")
++    ci = sub.add_parser("core-inputs")
++    ci.add_argument("model_dir")
++    ci.add_argument("capture")
++    ci.add_argument("--layer", type=int, required=True)
++    ci.add_argument("--out", required=True)
++    h = sub.add_parser("hist")
++    h.add_argument("inputs", help="a core-inputs file (this tool's core-inputs)")
++    h.add_argument("out", help="tf-inkling2-attn's output for the same capture and layer")
++    h.add_argument("--json", default="")
++    h.add_argument("--block", type=int, default=128, help="rows a step")
++    h.add_argument("--device", default="cuda:0")
 +    a = ap.parse_args()
 +    torch.backends.cuda.matmul.allow_tf32 = False
 +    torch.backends.cudnn.allow_tf32 = False
-+    return {"capture": capture, "compare": compare, "same": same}[a.cmd](a)
++    return {"capture": capture, "compare": compare, "same": same, "core-inputs": core_inputs, "hist": hist}[a.cmd](a)
 +
 +
 +if __name__ == "__main__":
@@ -2244,6 +2908,444 @@ index 0000000000000000000000000000000000000000..b5ff33a391bf34f46bc5c6dcc9319889
 +
 +if __name__ == "__main__":
 +    main()
+diff --git a/tools/zig/inkling2_margins.py b/tools/zig/inkling2_margins.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8707bfcba2c2633eaf167ba2410eaf1b148550c0
+--- /dev/null
++++ b/tools/zig/inkling2_margins.py
+@@ -0,0 +1,395 @@
++"""Teacher-forced token margins of Inkling-2's greedy oracle replies: is each departure from the oracle a near tie?
++
++USAGE = python tools/zig/inkling2_margins.py MODEL_DIR ORACLE_DECODE_JSON --out OUT_DIR
++            [--prompts chat_short,tool_call|ext] [--ids NAME=IDS_JSON,...] [--branch LABEL=PROMPT:REPLY_JSON ...]
++            [--modes eager,eager32,fp32] [--tf-dir ORACLE_DIR] [--device cuda:0]
++
++  python tools/zig/inkling2_margins.py MODEL ORACLE/full/decode.json --out OUT \
++      --ids chat_short=data/chat_short.ids.json,tool_call=data/tool_call.ids.json \
++      --branch kx=tool_call:kx-tool_call.json --tf-dir ORACLE/full
++
++Each sequence is a prompt (rendered by inkling2_ref.py's prompt_specs, and checked equal to --ids when given) plus a
++reply: the oracle's (ORACLE_DECODE_JSON, inkling2_ref.py --decode) or a branch's (REPLY_JSON: {"ids": [...]} or
++{"text": "..."}, the text encoded by the checkpoint's tokenizer without special-token insertion, its decode checked
++equal to the text). One whole-sequence forward per sequence and mode, layers streamed as in inkling2_ref.py's
++teacher-forced pass (full mode: experts decoded to bf16, Transformers' eager modules). At every reply position j
++(the logits row of position P-1+j, P the prompt length) it records the top-5 tokens and logits, the margin
++top1 - top2, the reply's own token, its logit and rank, and the row's argmax (the oracle's greedy pick: torch's tie
++winner, the first maximal ID). Top-1 agreement is the argmax equal to the reply token; rank 0 (no logit above the
++reply's) is counted apart, as the reply at the maximum. At every departure (the first position where a branch leaves
++the oracle reply) it records, in both sequences, the logits of the two contenders and both tie rules:
++
++  upstream (tools/zig/qwen27_margins.py): near tie when the top two are exactly the two contenders and top1 - top2 is
++           at most one bf16 spacing of the top-1 logit (on both sides; here the reference side only)
++  0.5:     whether the oracle-side margin between the two contenders is under 0.5 logit (information; a server's
++           side, from prompt_logprobs, is not visible to this tool)
++
++Modes (the attention core and the cuBLAS reduction; everything else is the reference's own code):
++  eager    Transformers' eager attention (bf16 scores, bias add, softmax in fp32 rounded to bf16 P, bf16 P.V, output
++           times sigmoid(gate) rounded to bf16), cuBLAS bf16 partial reduction allowed (torch's default). The
++           arithmetic of v0.1's oracle (inkling2_ref.py --decode without --fp32-reduction).
++  eager32  eager attention, bf16 matmuls reduced in fp32 (inkling2_ref.py --fp32-reduction).
++  fp32     v0.2's oracle form (inkling2_ref.py --attn fp32: the one definition,
++           inkling2_ref.kx_core): q', k', v', the bias (the module's 16-term product, rounded to bf16) and the sink
++           logit from the eager heads as they are, then scores q.k in fp32 times the scale plus the bias, m and z over
++           the keys only, weights e^(s - m) in fp32 (never rounded), o = (weights . v) / z in fp32, times sigmoid(gate)
++           in fp32, times sigmoid((m + log z) - sink) (the sink as kx's multiplier), one bf16 rounding (at the output
++           projection's input). bf16 matmuls reduced in fp32. Until 2026-11-17 this mode folded the sink into z as a
++           logit (z + e^(sink - m)); the same value in real arithmetic, other fp32 roundings.
++TF32 is off in every mode and checked (inkling2_ref.tf32_guard: exit 3 if TF32 could be on).
++
++Output: OUT_DIR/margins.json (every row), OUT_DIR/margins.txt (the tables), OUT_DIR/manifest.json (provenance,
++modes, input sha256, wall times).
++
++Transformers (Apache-2.0) is imported through inkling2_ref.py; its eager attention is called, not copied. The fp32
++core is written from the reference document (see THIRD_PARTY_NOTICES.md).
++"""
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++import time
++
++import torch
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import inkling2_ref as R  # noqa: E402
++
++BF = torch.bfloat16
++
++MODES = {
++    "eager": {"attn": "eager", "fp32_reduction": False},
++    "eager32": {"attn": "eager", "fp32_reduction": True},
++    "fp32": {"attn": "fp32", "fp32_reduction": True},
++}
++TOPK = 5
++HALF_LOGIT = 0.5
++bf16_spacing = R.bf16_spacing
++
++
++def set_mode(name: str):
++    R.ATTN["form"] = MODES[name]["attn"]
++    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = not MODES[name]["fp32_reduction"]
++
++
++def file_sha(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        h.update(f.read())
++    return h.hexdigest()
++
++
++def load_branch(tok, path: str) -> list:
++    d = json.load(open(path))
++    if "ids" in d:
++        return [int(t) for t in d["ids"]]
++    ids = tok.encode(d["text"], add_special_tokens=False)
++    if tok.decode(ids, skip_special_tokens=False) != d["text"]:
++        raise SystemExit(f"{path}: the text does not survive encode/decode")
++    if "tokens" in d and len(ids) != d["tokens"]:
++        raise SystemExit(f"{path}: {len(ids)} tokens encoded, the server reported {d['tokens']}")
++    return ids
++
++
++def first_diff(a: list, b: list):
++    return next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), None)
++
++
++def agreement(lg: torch.Tensor, reply: list) -> tuple:
++    """Rows j of lg (a logits row a reply position) against reply token j: each row's greedy pick as the oracle takes
++    it, int(lg[j].argmax()) (inkling2_ref.py --decode; torch's tie winner, the first maximal ID), the rows whose pick is
++    the reply token (top-1 agreement), and the rows where no logit exceeds the reply token's (rank 0: at a tie at the
++    maximum, every tied token counts here, the pick only in the agreement)."""
++    picks = [int(lg[j].argmax()) for j in range(len(reply))]
++    agree = sum(p == t for p, t in zip(picks, reply))
++    at_max = sum(int((lg[j] > lg[j, t]).sum()) == 0 for j, t in enumerate(reply))
++    return picks, agree, at_max
++
++
++def tie_rules(lg: torch.Tensor, raw: torch.Tensor, a: int, b: int) -> dict:
++    """lg: one softcapped fp32 logits row, raw: the same row before the softcap (the bf16 unembed output in fp32).
++    a: the oracle's token, b: the branch's token. The upstream rule is applied to both rows: to the softcapped logits
++    the sampler ranks (literal), and to the bf16 values the rounding happens in (pre-softcap)."""
++    out = {}
++    for name, row in (("softcapped", lg), ("pre_softcap", raw)):
++        v, i = row.topk(2)
++        top = [int(i[0]), int(i[1])]
++        margin = float(v[0] - v[1])
++        sp = bf16_spacing(float(v[0]))
++        gap = float(row[a] - row[b])
++        out[name] = {"top2": top, "top2_logits": [float(v[0]), float(v[1])], "top_margin": margin,
++                     "bf16_spacing": sp, "contender_logits": [float(row[a]), float(row[b])],
++                     "gap_oracle_minus_branch": gap, "gap_in_bf16_steps": gap / sp,
++                     "upstream_near_tie_ref_side": set(top) == {a, b} and margin <= sp}
++    out["under_0p5_ref_side"] = abs(out["softcapped"]["gap_oracle_minus_branch"]) < HALF_LOGIT
++    return out
++
++
++def tf_pass(model, cfg, seqs, specs, modes, dev, times):
++    """One whole-sequence forward per (sequence, mode), dense layers streamed (inkling2_ref.py's teacher-forced
++    pass)."""
++    emb = model.embed()
++    states = []
++    for s in seqs:
++        ids = torch.tensor([specs[s["prompt"]]["ids"] + s["reply"]], device=dev)
++        e = emb(ids)
++        pos = torch.arange(ids.shape[1], device=dev)[None]
++        mk = R.masks(cfg, e, pos)
++        for m in modes:
++            states.append((s, m, {"h": e, "blocks": e.new_zeros(1, ids.shape[1], 0, e.shape[-1]), "masks": mk,
++                                  "pos": pos}))
++    del emb
++    torch.cuda.empty_cache()
++    for i in range(cfg.num_hidden_layers):
++        t0 = time.time()
++        layer = model.layer(i)  # inkling2_ref.attach_attn: the fp32 form's sink factor and bf16 rounding
++        t1 = time.time()
++        for s, m, st in states:
++            set_mode(m)
++            R.run_layer(layer, st)
++        del layer
++        torch.cuda.synchronize()
++        times.append(("tf", i, round(t1 - t0, 2), round(time.time() - t1, 2)))
++        print(f"tf layer {i}: load {t1 - t0:.1f} s, run {time.time() - t1:.1f} s", flush=True)
++    head = model.head()
++    _, _, lm, cap = head
++    rows = {}
++    for s, m, st in states:
++        set_mode(m)
++        hn = R.finish(head, st)
++        P, n = s["P"], len(s["reply"])
++        raw = lm(hn[0, P - 1:P - 1 + n]).float()[..., : cfg.unpadded_vocab_size]
++        rows[(s["label"], m, "tf")] = (cap(raw).cpu(), raw.cpu())
++    del head, states
++    torch.cuda.empty_cache()
++    return rows
++
++
++def decode_pass(model, cfg, seqs, specs, modes, dev, lru_cap, times):
++    """The oracle's own path (inkling2_ref.py's greedy_decode: the prompt as one prefill, then one row a step through
++    a DynamicCache, experts decoded on use), each step fed the reply's token instead of the argmax."""
++    from transformers.cache_utils import DynamicCache
++
++    lru = R.ExpertLRU(dev, lru_cap)
++    t0 = time.time()
++    emb = model.embed()
++    layers = [model.layer(i, experts="lazy", lru=lru) for i in range(cfg.num_hidden_layers)]
++    head = model.head()
++    _, _, lm, cap = head
++    print(f"decode: resident layers built in {time.time() - t0:.1f} s", flush=True)
++    streams = [(s, m) for s in seqs for m in modes]
++    caches = [DynamicCache(config=cfg) for _ in streams]
++    cur = [torch.tensor([specs[s["prompt"]]["ids"]], device=dev) for s, _ in streams]
++    got = [([], []) for _ in streams]
++    steps = max(len(s["reply"]) for s, _ in streams)
++    for step in range(steps):
++        ts = time.time()
++        live = [k for k, (s, _) in enumerate(streams) if step < len(s["reply"])]
++        states = {}
++        for k in live:
++            c, ids = caches[k], cur[k]
++            e = emb(ids)
++            pos = (torch.arange(ids.shape[1], device=dev) + c.get_seq_length())[None]
++            states[k] = {"h": e, "blocks": e.new_zeros(1, ids.shape[1], 0, e.shape[-1]),
++                         "masks": R.masks(cfg, e, pos, c), "pos": pos}
++        for ly in layers:
++            for k in live:
++                set_mode(streams[k][1])
++                R.run_layer(ly, states[k], caches[k])
++        for k in live:
++            s, m = streams[k]
++            set_mode(m)
++            raw = lm(R.finish(head, states[k])[0, -1:]).float()[0, : cfg.unpadded_vocab_size]
++            got[k][0].append(cap(raw).cpu())
++            got[k][1].append(raw.cpu())
++            cur[k] = torch.tensor([[s["reply"][step]]], device=dev)
++        times.append(("decode", step, len(live), round(time.time() - ts, 2)))
++        print(f"decode step {step}: {len(live)} streams, {time.time() - ts:.1f} s, expert hits {lru.hits} "
++              f"misses {lru.misses}", flush=True)
++    rows = {(s["label"], m, "decode"): (torch.stack(g[0]), torch.stack(g[1])) for (s, m), g in zip(streams, got)}
++    del layers, head, caches, lru
++    torch.cuda.empty_cache()
++    return rows
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("model_dir")
++    ap.add_argument("oracle_decode")
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--prompts", default="chat_short,tool_call", help="prompt_specs or ext_specs names; 'ext' "
++                    "stands for all of ext_specs (in their order)")
++    ap.add_argument("--ids", default="", help="NAME=IDS_JSON,...: the prompt ids the server is given; must equal the "
++                    "reference's rendering")
++    ap.add_argument("--branch", action="append", default=[], help="LABEL=PROMPT:REPLY_JSON (repeatable)")
++    ap.add_argument("--modes", default="eager,eager32,fp32")
++    ap.add_argument("--paths", default="tf,decode", help="tf: one whole-sequence forward; decode: the oracle's own "
++                    "prefill + one-row steps, fed the reply")
++    ap.add_argument("--tf-dir", default="", help="the oracle's teacher-forced folder (inkling2_ref.py --out .../full): "
++                    "its last prompt row's top-64 logits compared with this run's eager row P-1 of each path")
++    ap.add_argument("--device", default="cuda:0")
++    ap.add_argument("--expert-cache", type=int, default=1000, help="decode path: experts kept on --device")
++    ap.add_argument("--layers", type=int, default=0, help="only the first N layers, then the head (smoke; 0: all)")
++    a = ap.parse_args()
++    t_start = time.time()
++    from transformers import AutoTokenizer
++
++    modes = a.modes.split(",")
++    paths = a.paths.split(",")
++    for m in modes:
++        if m not in MODES:
++            raise SystemExit(f"unknown mode {m}")
++    for p in paths:
++        if p not in ("tf", "decode"):
++            raise SystemExit(f"unknown path {p}")
++    dev = torch.device(a.device)
++    tok = AutoTokenizer.from_pretrained(a.model_dir)
++    cfg = R.text_config(a.model_dir, a.layers)
++    specs = {s["name"]: s for s in R.prompt_specs(tok) + R.ext_specs(tok)}
++    for s in specs.values():
++        s["text"], s["ids"] = R.render(tok, s)
++    inputs = {"oracle_decode": {"path": a.oracle_decode, "sha256": file_sha(a.oracle_decode)}}
++    for kv in filter(None, a.ids.split(",")):
++        name, path = kv.split("=", 1)
++        given = [int(t) for t in json.load(open(path))]
++        if given != specs[name]["ids"]:
++            raise SystemExit(f"{name}: {path} differs from the reference's rendering")
++        inputs[f"ids.{name}"] = {"path": path, "sha256": file_sha(path), "tokens": len(given)}
++    oracle = json.load(open(a.oracle_decode))
++    seqs = []
++    names = [n for p in a.prompts.split(",") for n in ([e["name"] for e in R.ext_specs(tok)] if p == "ext" else [p])]
++    for name in names:
++        ids = oracle[name]["ids"]
++        seqs.append({"label": f"{name}/oracle", "prompt": name, "reply": ids, "oracle": ids})
++    for br in a.branch:
++        label, rest = br.split("=", 1)
++        name, path = rest.split(":", 1)
++        ids = load_branch(tok, path)
++        inputs[f"branch.{label}"] = {"path": path, "sha256": file_sha(path), "tokens": len(ids), "ids": ids}
++        seqs.append({"label": f"{name}/{label}", "prompt": name, "reply": ids, "oracle": oracle[name]["ids"]})
++    for s in seqs:
++        s["P"] = len(specs[s["prompt"]]["ids"])
++        s["departure"] = first_diff(s["reply"], s["oracle"])
++
++    tf32 = R.tf32_guard(dev)
++    model = R.Model(a.model_dir, cfg, dev, "full")  # installs inkling2_ref's attention dispatch
++    rows, times = {}, []
++    with torch.no_grad():
++        if "tf" in paths:
++            rows.update(tf_pass(model, cfg, seqs, specs, modes, dev, times))
++        if "decode" in paths:
++            rows.update(decode_pass(model, cfg, seqs, specs, modes, dev, a.expert_cache, times))
++
++    res = {"modes": {m: MODES[m] for m in modes}, "paths": paths, "checks": {}, "sequences": [], "departures": []}
++    if a.tf_dir and "eager" in modes:
++        from safetensors.torch import load_file
++        for s in seqs:
++            if not s["label"].endswith("/oracle"):
++                continue
++            ref = load_file(os.path.join(a.tf_dir, s["prompt"] + ".safetensors"))
++            ri, rv = ref["topk.ids"][-1].long(), ref["topk.vals"][-1]
++            for p in paths:
++                g = rows[(s["label"], "eager", p)][0][0]
++                res["checks"][f"{s['prompt']} {p} eager row P-1 vs the oracle's teacher-forced file"] = {
++                    "top1_equal": int(ri[0]) == int(g.argmax()), "top64_max_abs_diff": float((g[ri] - rv).abs().max()),
++                    "top64_bit_equal": bool(torch.equal(g[ri], rv))}
++    if "decode" in paths and "eager" in modes:
++        for s in seqs:
++            if s["label"].endswith("/oracle") and "prefill_top5" in oracle[s["prompt"]]:
++                g = rows[(s["label"], "eager", "decode")][0][0]
++                res["checks"][f"{s['prompt']} decode eager prefill top-5 vs decode.json"] = {
++                    "equal": g.topk(5).indices.tolist() == oracle[s["prompt"]]["prefill_top5"]}
++    for s in seqs:
++        for p in paths:
++            for m in modes:
++                lg, raw = rows[(s["label"], m, p)]
++                picks, agree, at_max = agreement(lg, s["reply"])
++                out = []
++                for j, t in enumerate(s["reply"]):
++                    v, i = lg[j].topk(TOPK)
++                    rv = raw[j].topk(2).values
++                    out.append({"j": j, "token": t, "tok": tok.convert_ids_to_tokens(t), "logit": float(lg[j, t]),
++                                "rank": int((lg[j] > lg[j, t]).sum()), "argmax": picks[j],
++                                "top": [int(x) for x in i],
++                                "top_tok": tok.convert_ids_to_tokens([int(x) for x in i]),
++                                "top_logits": [float(x) for x in v], "margin": float(v[0] - v[1]),
++                                "bf16_spacing": bf16_spacing(float(v[0])),
++                                "pre_softcap_top2": [float(x) for x in rv],
++                                "pre_softcap_margin_steps": float(rv[0] - rv[1]) / bf16_spacing(float(rv[0]))})
++                res["sequences"].append({"label": s["label"], "prompt": s["prompt"], "mode": m, "path": p,
++                                         "prompt_tokens": s["P"], "reply_tokens": len(s["reply"]),
++                                         "departure": s["departure"], "top1_agrees": agree,
++                                         "reply_at_max": at_max, "rows": out})
++                lo = min(out, key=lambda r: r["margin"])
++                print(f"{s['label']} {p} {m}: top-1 (argmax) equals the reply at {agree}/{len(out)} (the reply at "
++                      f"the maximum, ties included: {at_max}); min margin "
++                      f"{lo['margin']:.4f} at j={lo['j']}", flush=True)
++        d = s["departure"]
++        if d is None or s["label"].endswith("/oracle"):
++            continue
++        oa, ob = s["oracle"][d], s["reply"][d]
++        o_label = f"{s['prompt']}/oracle"
++        for p in paths:
++            for m in modes:
++                dep = {"branch": s["label"], "mode": m, "path": p, "j": d, "oracle_token": oa,
++                       "oracle_tok": tok.convert_ids_to_tokens(oa), "branch_token": ob,
++                       "branch_tok": tok.convert_ids_to_tokens(ob),
++                       "in_branch_sequence": tie_rules(rows[(s["label"], m, p)][0][d], rows[(s["label"], m, p)][1][d],
++                                                       oa, ob)}
++                if (o_label, m, p) in rows:
++                    dep["in_oracle_sequence"] = tie_rules(rows[(o_label, m, p)][0][d], rows[(o_label, m, p)][1][d],
++                                                          oa, ob)
++                res["departures"].append(dep)
++    os.makedirs(a.out, exist_ok=True)
++    json.dump(res, open(os.path.join(a.out, "margins.json"), "w"), indent=1, ensure_ascii=False)
++    with open(os.path.join(a.out, "margins.txt"), "w") as f:
++        f.write(tables(res))
++    man = R.provenance(a.model_dir)
++    man.update({"tool": "inkling2_margins.py", "layers": cfg.num_hidden_layers, "argv": sys.argv[1:], "inputs": inputs,
++                "device": a.device,
++                "tf32": tf32,
++                "times_s": times, "wall_s": round(time.time() - t_start, 1)})
++    json.dump(man, open(os.path.join(a.out, "manifest.json"), "w"), indent=1)
++    print(tables(res), flush=True)
++
++
++def tables(res: dict) -> str:
++    L = [f"{k}: {v}" for k, v in res["checks"].items()]
++    for sq in res["sequences"]:
++        L.append("")
++        L.append(f"## {sq['label']} [{sq['path']}, {sq['mode']}] prompt {sq['prompt_tokens']}, reply "
++                 f"{sq['reply_tokens']}, top-1 (argmax) = reply at {sq['top1_agrees']}/{sq['reply_tokens']} (reply at "
++                 f"the maximum: {sq['reply_at_max']}), departure from the oracle: {sq['departure']}")
++        L.append("| j | reply token | logit | rank | top-1 | top-2 | margin | bf16 step | pre-softcap margin (steps) |")
++        L.append("|---|---|---|---|---|---|---|---|---|")
++        for r in sq["rows"]:
++            L.append(f"| {r['j']} | {r['token']} {r['tok']!r} | {r['logit']:.4f} | {r['rank']} | "
++                     f"{r['top'][0]} {r['top_tok'][0]!r} {r['top_logits'][0]:.4f} | "
++                     f"{r['top'][1]} {r['top_tok'][1]!r} {r['top_logits'][1]:.4f} | {r['margin']:.4f} | "
++                     f"{r['bf16_spacing']:.4g} | {r['pre_softcap_margin_steps']:.2f} |")
++    if res["departures"]:
++        L.append("")
++        L.append("## departures (oracle token a, branch token b; gap = logit(a) - logit(b); steps = gap / one bf16 "
++                 "spacing at the top-1 value)")
++        L.append("| branch | path | mode | j | a | b | sequence | logit a | logit b | gap | top-2 | "
++                 "upstream (softcapped) | pre-softcap a / b | gap steps | upstream (pre-softcap) | |gap| < 0.5 |")
++        L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
++        for d in res["departures"]:
++            for where in ("in_oracle_sequence", "in_branch_sequence"):
++                if where not in d:
++                    continue
++                c, r = d[where]["softcapped"], d[where]["pre_softcap"]
++                L.append(f"| {d['branch']} | {d['path']} | {d['mode']} | {d['j']} | {d['oracle_token']} "
++                         f"{d['oracle_tok']!r} | {d['branch_token']} {d['branch_tok']!r} | {where.split('_')[1]} | "
++                         f"{c['contender_logits'][0]:.4f} | {c['contender_logits'][1]:.4f} | "
++                         f"{c['gap_oracle_minus_branch']:.4f} | {c['top2']} | {c['upstream_near_tie_ref_side']} | "
++                         f"{r['contender_logits'][0]:.4f} / {r['contender_logits'][1]:.4f} | "
++                         f"{r['gap_in_bf16_steps']:.2f} | {r['upstream_near_tie_ref_side']} | "
++                         f"{d[where]['under_0p5_ref_side']} |")
++    return "\n".join(L) + "\n"
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/zig/inkling2_margins_test.py b/tools/zig/inkling2_margins_test.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f7887a521c4472e8411baa1d42338c813088e24a
+--- /dev/null
++++ b/tools/zig/inkling2_margins_test.py
+@@ -0,0 +1,31 @@
++"""inkling2_margins.py's top-1 agreement: the reply token against the oracle's greedy pick (torch's argmax, its tie
++winner the first maximal ID), not against membership of the maximum. Needs torch and safetensors (CPU is enough)."""
++import os
++import sys
++import unittest
++
++import torch
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import inkling2_margins as M  # noqa: E402
++
++
++class AgreementTests(unittest.TestCase):
++    def test_tie_at_the_maximum_agrees_only_with_the_first_id(self):
++        # softcapped logits of IDs 0 and 1 both 27.760387, the others smaller, reply token 1
++        lg = torch.full((1, 8), 3.0)
++        lg[0, 0] = lg[0, 1] = 27.760387
++        picks, agree, at_max = M.agreement(lg, [1])
++        self.assertEqual(picks, [0])
++        self.assertEqual(agree, 0)
++        self.assertEqual(at_max, 1)
++        self.assertEqual(M.agreement(lg, [0]), ([0], 1, 1))
++
++    def test_rows_with_one_maximum(self):
++        lg = torch.tensor([[0.5, 2.0, 1.0], [4.0, -1.0, 3.5], [1.0, 1.0, 1.25]])
++        self.assertEqual(M.agreement(lg, [1, 2, 2]), ([1, 0, 2], 2, 2))
++        self.assertEqual(M.agreement(lg, [0, 0, 0]), ([1, 0, 2], 1, 1))
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/tools/zig/inkling2_mask_dump.py b/tools/zig/inkling2_mask_dump.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..28624c66c5c634b4dcdaf18f2494af774437b70b
@@ -2591,10 +3693,10 @@ index 0000000000000000000000000000000000000000..2f564e33617df47af4823a08714ec9ca
 +    sys.exit(main())
 diff --git a/tools/zig/inkling2_op_ref.py b/tools/zig/inkling2_op_ref.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..4cf5974c331ee1e38073df3a692e01e6204dbd4e
+index 0000000000000000000000000000000000000000..0b28689e95b76181b3b5cbd419de732fd88ada06
 --- /dev/null
 +++ b/tools/zig/inkling2_op_ref.py
-@@ -0,0 +1,512 @@
+@@ -0,0 +1,529 @@
 +"""Inkling-2's forward op by op in torch, in tf-inkling2-cuda's op names and layouts: the per-op oracle.
 +
 +Every op of the CUDA forward (zig/src/families/inkling2/cuda_forward.zig) is one function here, built from the
@@ -2604,10 +3706,16 @@ index 0000000000000000000000000000000000000000..4cf5974c331ee1e38073df3a692e01e6
 +or gathered cache rows carry "@<first row>".
 +
 +USAGE = python tools/zig/inkling2_op_ref.py capture MODEL_DIR ORACLE_PROMPT --layers A:B --out CAPTURE [--head]
-+            [--fp32-reduction]
++            [--fp32-reduction] [--attn eager|fp32]
 +        python tools/zig/inkling2_op_ref.py check MODEL_DIR DUMP [--tol-rel 0.01] [--ops a,b] [--fp32-reduction]
++            [--attn eager|fp32]
 +        python tools/zig/inkling2_op_ref.py layers MODEL_DIR ORACLE_PROMPT --layers A:B --out FILE [--head]
-+            [--teacher] [--fp32-reduction]
++            [--teacher] [--fp32-reduction] [--attn eager|fp32]
++
++  --attn   attn.core's form: Transformers' eager attention (default; v0.1's oracle) or fp32, v0.2's oracle form
++           (inkling2_ref.py --attn fp32: inkling2_ref.kx_core and kx_output, the kx kernels' rounding points, the
++           sink as a multiplier). fp32 turns --fp32-reduction on. Every run sets TF32 off and exits 3 if it is not
++           (inkling2_ref.tf32_guard).
 +
 +  capture  From the oracle's input of layer A (h.<A-1> or embed, and the block states below A), run layers
 +           A..B-1 (and with --head the final mix, norm, unembed and softcap at logits.rows) op by op in torch,
@@ -2783,8 +3891,6 @@ index 0000000000000000000000000000000000000000..4cf5974c331ee1e38073df3a692e01e6
 +        raise KeyError(f"no torch form for {op}")
 +
 +    def core(self, ins, pos0, R, kv_lo):
-+        from transformers.models.inkling2.modeling_inkling2 import eager_attention_forward
-+
 +        sa = self.ly.self_attn
 +        hq, hk = sa.num_heads, sa.num_key_value_heads
 +        kx = find_whole(ins, "k_ctx", pos0)
@@ -2807,6 +3913,13 @@ index 0000000000000000000000000000000000000000..4cf5974c331ee1e38073df3a692e01e6
 +            ok = ok & (dist < sa.sliding_window)
 +        mask = torch.zeros(R, C, dtype=q.dtype, device=dev).masked_fill(~ok, torch.finfo(q.dtype).min)[None, None]
 +        sinks = ins["sink"][None].transpose(1, 2).unsqueeze(-1)
++        if ref.ATTN["form"] == "fp32":
++            from transformers.models.inkling2.modeling_inkling2 import repeat_kv
++
++            g = sa.num_key_value_groups
++            y, phi = ref.kx_core(q, repeat_kv(k, g), repeat_kv(v, g), bias, ok[None, None], sa.scaling, sinks)
++            return ref.kx_output(y[0].transpose(0, 1).reshape(R, -1), ins["gate"], phi[0].transpose(0, 1))
++        eager_attention_forward = ref.hf_eager()
 +        o, _ = eager_attention_forward(sa, q, k, v, mask, dropout=0.0, scaling=sa.scaling, sliding_window=sa.sliding_window,
 +                                       position_bias=bias, sinks=sinks)
 +        o = o.reshape(R, -1).contiguous()
@@ -3080,6 +4193,7 @@ index 0000000000000000000000000000000000000000..4cf5974c331ee1e38073df3a692e01e6
 +    c.add_argument("--out", required=True)
 +    c.add_argument("--head", action="store_true")
 +    c.add_argument("--fp32-reduction", action="store_true", help="bf16 matmuls reduced in fp32")
++    c.add_argument("--attn", choices=["eager", "fp32"], default="eager", help="attn.core's form (fp32: v0.2's)")
 +    c.add_argument("--device", default="cuda:0")
 +    y = sub.add_parser("layers")
 +    y.add_argument("model_dir")
@@ -3089,6 +4203,7 @@ index 0000000000000000000000000000000000000000..4cf5974c331ee1e38073df3a692e01e6
 +    y.add_argument("--head", action="store_true")
 +    y.add_argument("--teacher", action="store_true", help="every layer from the oracle's input")
 +    y.add_argument("--fp32-reduction", action="store_true", help="bf16 matmuls reduced in fp32")
++    y.add_argument("--attn", choices=["eager", "fp32"], default="eager", help="attn.core's form (fp32: v0.2's)")
 +    y.add_argument("--device", default="cuda:0")
 +    k = sub.add_parser("check")
 +    k.add_argument("model_dir")
@@ -3096,12 +4211,16 @@ index 0000000000000000000000000000000000000000..4cf5974c331ee1e38073df3a692e01e6
 +    k.add_argument("--tol-rel", type=float, default=1e-2)
 +    k.add_argument("--ops", default="", help="only these ops (comma-separated, e.g. conv.kv,attn.heads)")
 +    k.add_argument("--fp32-reduction", action="store_true", help="bf16 matmuls reduced in fp32")
++    k.add_argument("--attn", choices=["eager", "fp32"], default="eager", help="attn.core's form (fp32: v0.2's)")
 +    k.add_argument("--device", default="cuda:0")
 +    a = ap.parse_args()
-+    torch.backends.cuda.matmul.allow_tf32 = False
-+    torch.backends.cudnn.allow_tf32 = False
++    ref.tf32_guard(torch.device(a.device))
++    ref.ATTN["form"] = a.attn
++    if a.attn == "fp32":
++        a.fp32_reduction = True
 +    if getattr(a, "fp32_reduction", False):
 +        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
++    print(f"attn.core: {a.attn}; bf16 matmuls reduced in fp32: {bool(getattr(a, 'fp32_reduction', False))}", flush=True)
 +    return {"capture": capture, "check": check, "layers": layers}[a.cmd](a)
 +
 +
@@ -3150,10 +4269,10 @@ index 0000000000000000000000000000000000000000..f8123b37d6e2c47fa5b0c179290a3667
 +exit $rc
 diff --git a/tools/zig/inkling2_ref.py b/tools/zig/inkling2_ref.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d2095262835d40a205
+index 0000000000000000000000000000000000000000..9fb5cb9c32afa58b664f925f1eac4671c15152e1
 --- /dev/null
 +++ b/tools/zig/inkling2_ref.py
-@@ -0,0 +1,1338 @@
+@@ -0,0 +1,1613 @@
 +"""Inkling-2-Small's text model streamed a layer at a time through Transformers' own Inkling2 modules: the oracle.
 +
 +The checkpoint (366 GiB, NVFP4 and MXFP8 experts) fits neither the GPUs nor host memory, so the reference loads one
@@ -3165,7 +4284,8 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +teacher-forced pass; in --decode they live in a `DynamicCache` per prompt as in Transformers' own generation.
 +
 +USAGE = python tools/zig/inkling2_ref.py MODEL_DIR --out OUT_DIR [--mode full|checkpoint] [--layers N]
-+            [--prompts a,b] [--all-rows] [--fp32-reduction] [--decode 48 --decode-prompts a,b,c,d]
++            [--prompts a,b] [--all-rows] [--fp32-reduction] [--attn eager|fp32]
++            [--decode 48 --decode-prompts a,b,c,d]
 +
 +  python tools/zig/inkling2_ref.py MODEL_DIR --out OUT                  # 48 layers, full mode
 +  python tools/zig/inkling2_ref.py MODEL_DIR --out OUT --mode checkpoint
@@ -3176,6 +4296,25 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +      --decode-prompts chat_short,code,tool_call,long_1500 --skip-forward                    # greedy text (gate G0)
 +  python tools/zig/inkling2_ref.py MODEL_DIR --out OUT --mode checkpoint --decode 768 --structured all \
 +      --grammar-lib LIBTFGRAMMAR --xgrammar-check --cases-out DIR       # grammar-masked greedy (structured output)
++  python tools/zig/inkling2_ref.py MODEL_DIR --out OUT --attn fp32 --decode 48 \
++      --decode-prompts chat_short,code,tool_call,long_1500 --skip-forward     # v0.2's oracle (fp32 attention)
++  python tools/zig/inkling2_ref.py MODEL_DIR --out OUT --attn fp32 --decode 64 --decode-prompts ext --skip-forward
++
++Attention (--attn): `eager` is Transformers' own eager attention (bf16 scores and bias add, softmax in fp32 rounded to
++bf16 P, bf16 P.V, the output times sigmoid(gate) rounded to bf16): v0.1's oracle. `fp32` is v0.2's oracle,
++fp32 attention at the rounding points of the kx kernels (kortexa-ai's tf_ik_attention arithmetic):
++q'', k', v', the relative bias (rounded to bf16), the sink and gate logits come from Transformers' modules as they
++are; scores q.k in fp32 times the fp32 scale plus the bias; m and z over the keys only; weights e^(s - m) in fp32,
++never rounded; o = (weights . v) / z in fp32; then Y = (o * sigmoid(gate)) * sigmoid((m + log z) - sink) (the sink as
++a multiplier, kx's form), rounded to bf16 once, at the output projection's input. `fp32` turns --fp32-reduction on.
++Every run sets TF32 off (matmul and cudnn, float32 matmul precision "highest"), prints the settings with an fp32 GEMM
++probe, and exits 3 if TF32 could be on (a flag reads back on, NVIDIA_TF32_OVERRIDE set to anything but 0, or the probe
++is TF32-sized).
++With --decode, decode.json keeps each step's margins on the oracle's own path (the logits row its pick came from:
++`margins[j]` = {top1, top2 (token ids), top1_logit, top2_logit, gap (softcapped top1 - top2), gap_pre (the same two
++tokens before the softcap), step (one bf16 spacing at top1_logit)}; masked rows for --structured), which v0.2's token
++gate reads (recipe/inkling2-tp4/smoke.py yardstick and oracle, tools/zig/inkling2_tokengate.py). `--decode-prompts ext`
++names the extended set (ext_specs: seven prompts beside prompt_specs' eight, part of the token gate's positions).
 +
 +Structured output (--structured): six OpenAI chat requests (structured_specs: json_object; a json_schema with nesting,
 +enums and arrays; tool_choice required; a named function; thinking on with a schema; a schema forcing a long string)
@@ -3250,6 +4389,7 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +import argparse
 +import hashlib
 +import json
++import math
 +import os
 +import re
 +import sys
@@ -3270,6 +4410,142 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +
 +torch.backends.cuda.matmul.allow_tf32 = False
 +torch.backends.cudnn.allow_tf32 = False
++
++
++# ----------------------------------------------------------------------------------------------- attention forms
++
++ATTN = {"form": "eager"}  # the core Transformers' Inkling2 attention modules run: "eager" (their own) or "fp32"
++_HF_EAGER = []  # Transformers' eager_attention_forward, kept when install_attn patches the module's name
++TF32_PROBE_LIMIT = 1e-5  # an fp32 GEMM's normwise error is ~1e-7; with TF32 inputs (10-bit mantissas) it is ~5e-4
++
++
++def bf16_spacing(value: float) -> float:
++    """One bf16 step at |value| (tools/zig/qwen27_margins.py's rule)."""
++    if not math.isfinite(value):
++        raise ValueError("nonfinite logit")
++    m = abs(value)
++    if m < 2.0 ** -126:
++        return 2.0 ** -133
++    return 2.0 ** (math.frexp(m)[1] - 1 - 7)
++
++
++def kx_core(q, k, v, bias, allowed, scaling, sinks):
++    """v0.2's fp32 attention at the kx kernels' rounding points (module docstring, --attn fp32).
++
++    q [B, H, Q, D], k and v [B, H, K, D] (bf16; key and value heads already repeated to H), bias [B, H, Q, K] (the
++    relative bias, rounded to bf16 here if it is not already) or None, allowed: bool, broadcastable to [B, H, Q, K]
++    (True: the key is in the row's window) or None (every key), sinks [B, H, Q, 1]. Returns y = O / Z [B, H, Q, D]
++    and phi = sigmoid((m + log Z) - sink) [B, H, Q, 1], both fp32: the output is bf16((y * sigmoid(gate)) * phi)."""
++    s = torch.matmul(q.float(), k.float().transpose(-1, -2)) * scaling
++    if bias is not None:
++        s = s + bias.to(BF).float()
++    if allowed is not None:
++        s = s.masked_fill(~allowed, float("-inf"))
++    m = s.amax(-1, keepdim=True)
++    w = torch.exp(s - m)
++    z = w.sum(-1, keepdim=True)
++    y = torch.matmul(w, v.float()) / z
++    phi = 1.0 / (1.0 + torch.exp(-((m + torch.log(z)) - sinks.float())))
++    return y, phi
++
++
++def kx_output(o, gate, phi):
++    """o [R, H * D] fp32 (y, row-major heads), gate [R, H * D], phi [R, H, 1]: bf16((o * sigmoid(gate)) * phi), the
++    order of the module's own gate multiply (Inkling2*Attention.forward) followed by the sink factor."""
++    R = o.shape[0]
++    g = o.float() * torch.sigmoid(gate.float())
++    return (g.view(R, phi.shape[1], -1) * phi).reshape(R, -1).to(BF)
++
++
++def hf_eager():
++    """Transformers' own eager_attention_forward, whether or not install_attn has patched the module."""
++    from transformers.models.inkling2 import modeling_inkling2 as M
++
++    return _HF_EAGER[0] if _HF_EAGER else M.eager_attention_forward
++
++
++def _attention(module, query, key, value, attention_mask, scaling, dropout=0.0, position_bias=None, sinks=None,
++               **kwargs):
++    """Inkling2's attention core by ATTN["form"]: Transformers' eager as it is, or kx_core (fp32: returns y in fp32 and
++    leaves phi on the module for its output projection's pre-hook, attach_attn)."""
++    if ATTN["form"] != "fp32":
++        return _HF_EAGER[0](module, query, key, value, attention_mask, scaling=scaling, dropout=dropout,
++                            position_bias=position_bias, sinks=sinks, **kwargs)
++    from transformers.models.inkling2.modeling_inkling2 import repeat_kv
++
++    k = repeat_kv(key, module.num_key_value_groups)
++    v = repeat_kv(value, module.num_key_value_groups)
++    allowed = None
++    if attention_mask is not None:
++        if attention_mask.dtype == torch.bool:
++            allowed = attention_mask
++        else:  # additive: 0 where allowed, the dtype's minimum elsewhere
++            allowed = attention_mask == 0
++            if not bool((allowed | (attention_mask <= -1e30)).all()):
++                raise RuntimeError("an additive attention mask with values other than 0 and the dtype's minimum")
++    y, phi = kx_core(query, k, v, position_bias, allowed, scaling, sinks)
++    module._ink2_phi = phi.transpose(1, 2)  # [B, Q, H, 1]
++    return y.transpose(1, 2).contiguous(), None
++
++
++def install_attn():
++    """Route Transformers' Inkling2 attention through _attention (its forward looks eager_attention_forward up at call
++    time). With ATTN["form"] "eager" every call goes to Transformers' function unchanged."""
++    from transformers.models.inkling2 import modeling_inkling2 as M
++
++    if not _HF_EAGER:
++        _HF_EAGER.append(M.eager_attention_forward)
++        M.eager_attention_forward = _attention
++
++
++def attach_attn(layer):
++    """The fp32 form's sink factor and one bf16 rounding at the output projection's input (the module has multiplied
++    y by sigmoid(gate) in fp32). Under eager the input is already bf16 and the hook changes nothing."""
++    attn = layer.self_attn
++
++    def hook(module, args):
++        phi = attn.__dict__.pop("_ink2_phi", None)
++        x = args[0]
++        if phi is None:
++            return None if x.dtype == BF else (x.to(BF),) + tuple(args[1:])
++        B, Q = x.shape[:2]
++        x = (x.view(B, Q, phi.shape[2], -1) * phi).reshape(B, Q, -1)
++        return (x.to(BF),) + tuple(args[1:])
++
++    attn.o_proj.register_forward_pre_hook(hook)
++    return layer
++
++
++def tf32_guard(dev) -> dict:
++    """TF32 off, read back, printed, and probed: exit 3 if TF32 could be on (an "fp32" oracle that runs TF32 is not
++    v0.2's form). NVIDIA_TF32_OVERRIDE other than 0 is refused by name (cuBLAS reads it below torch's flags)."""
++    torch.backends.cuda.matmul.allow_tf32 = False
++    torch.backends.cudnn.allow_tf32 = False
++    torch.set_float32_matmul_precision("highest")
++    env = os.environ.get("NVIDIA_TF32_OVERRIDE")
++    st = {"matmul.allow_tf32": torch.backends.cuda.matmul.allow_tf32,
++          "cudnn.allow_tf32": torch.backends.cudnn.allow_tf32,
++          "float32_matmul_precision": torch.get_float32_matmul_precision(),
++          "NVIDIA_TF32_OVERRIDE": env if env is not None else "unset"}
++    bad = [k for k in ("matmul.allow_tf32", "cudnn.allow_tf32") if st[k]]
++    if st["float32_matmul_precision"] != "highest":
++        bad.append("float32_matmul_precision")
++    if env not in (None, "0"):
++        bad.append(f"NVIDIA_TF32_OVERRIDE={env}")
++    g = torch.Generator().manual_seed(20261117)
++    a = torch.randn(256, 256, generator=g).float()
++    want = a.double() @ a.double()
++    got = (a.to(dev) @ a.to(dev)).double().cpu()
++    st["fp32_gemm_probe_rel"] = float((got - want).norm() / want.norm())
++    if not st["fp32_gemm_probe_rel"] <= TF32_PROBE_LIMIT:
++        bad.append("fp32 GEMM probe")
++    st["ok"] = not bad
++    print("TF32 guard: " + " ".join(f"{k}={v}" for k, v in st.items() if k not in ("ok", "fp32_gemm_probe_rel"))
++          + f" fp32 GEMM probe rel {st['fp32_gemm_probe_rel']:.2e} (limit {TF32_PROBE_LIMIT:g}): "
++          + ("OK" if not bad else "REFUSED (" + ", ".join(bad) + ")"), flush=True)
++    if bad:
++        sys.exit(3)
++    return st
 +
 +
 +# ----------------------------------------------------------------------------------------------- checkpoint access
@@ -3695,6 +4971,7 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +        from transformers.models.inkling2 import modeling_inkling2 as M
 +
 +        self.M, self.src, self.cfg, self.dev, self.mode = M, Source(folder), cfg, dev, mode
++        install_attn()
 +
 +    def _assign(self, module, sd: dict, prefix: str):
 +        """Checkpoint tensors in their Transformers dtype (bf16, or fp32 where `from_pretrained` keeps fp32)."""
@@ -3755,7 +5032,7 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +        layer = self._assign(layer, sd, f"model.layers.{i}.")
 +        if self.mode == "checkpoint":
 +            tokenspeed_slot_order(layer.mlp.gate)
-+        return layer
++        return attach_attn(layer)
 +
 +
 +# masks, run_layer and finish: adapted from huggingface/transformers
@@ -3851,6 +5128,64 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +                break
 +            n += 2
 +        specs.append(spec)
++    return specs
++
++
++UNITS = [{"type": "function", "function": {
++    "name": "convert_units", "description": "Convert a quantity from one unit to another.",
++    "parameters": {"type": "object", "properties": {"value": {"type": "number"}, "from": {"type": "string"},
++                                                    "to": {"type": "string"}},
++                   "required": ["value", "from", "to"]}}}]
++
++
++def catalogue_text(n_items: int) -> str:
++    """A library catalogue (the extended set's long prompt; a different shape from inventory_text)."""
++    first = ["Quiet", "Northern", "Paper", "Hidden", "Salt", "Winter", "Copper", "Glass", "Distant", "Silent"]
++    second = ["Harbour", "Orchard", "Lantern", "Meadow", "Bridge", "Garden", "Archive", "River", "Tower", "Valley"]
++    authors = ["A. Lindqvist", "B. Okafor", "C. Moreau", "D. Tanaka", "E. Novak", "F. Haddad", "G. Ruiz"]
++    lines = []
++    for k in range(1, n_items + 1):
++        lines.append(f"Book {k}: \"The {first[(k * 3) % 10]} {second[(k * 7) % 10]}\" by {authors[(k * 5) % 7]}, "
++                     f"{180 + (k * 29) % 420} pages, published {1950 + (k * 13) % 74}, room {1 + (k * 11) % 6}, "
++                     f"shelf {'ABCDEFGH'[(k * 5) % 8]}{1 + (k * 3) % 9}.")
++    return "\n".join(lines)
++
++
++def ext_specs(tok) -> list[dict]:
++    """The extended oracle set (part of v0.2's token gate): seven prompts beside prompt_specs, each a different shape
++    (thinking, a tool call, code, JSON, a non-English reply, a multi-turn chat, a prompt of at least 2,000 tokens)."""
++    specs = [
++        {"name": "ext_thinking", "effort": "medium",
++         "messages": [{"role": "user", "content": "Three friends split a restaurant bill of $84. Ana pays twice as "
++                                                   "much as Ben, and Ben pays $6 more than Cleo. How much does each "
++                                                   "pay? Think it through."}]},
++        {"name": "ext_tool", "effort": "low", "tools": UNITS,
++         "messages": [{"role": "user", "content": "How many kilometres is a marathon of 26.2 miles?"}]},
++        {"name": "ext_code", "effort": "none",
++         "messages": [{"role": "system", "content": "You are a careful C programmer."},
++                      {"role": "user", "content": "Write a C function that reverses a NUL-terminated string in "
++                                                  "place, with a short comment."}]},
++        {"name": "ext_json", "effort": "none",
++         "messages": [{"role": "user", "content": "Give the chemical symbol, atomic number and group name of sodium "
++                                                   "as a JSON object with the keys symbol, number and group. Reply "
++                                                   "with the JSON only."}]},
++        {"name": "ext_german", "effort": "none",
++         "messages": [{"role": "user", "content": "Erkläre in zwei Sätzen, warum der Himmel am Tag blau ist."}]},
++        {"name": "ext_multi_turn", "effort": "none",
++         "messages": [{"role": "user", "content": "I keep two beehives on a small farm."},
++                      {"role": "assistant", "content": "That sounds lovely. How are the bees doing this season?"},
++                      {"role": "user", "content": "Very well. Suggest three names for my honey, one line each."}]},
++    ]
++    n = 40
++    while True:
++        content = (f"Below is a library catalogue.\n\n{catalogue_text(n)}\n\n"
++                   f"Question: which book is on shelf {'ABCDEFGH'[(27 * 5) % 8]}{1 + (27 * 3) % 9} in room "
++                   f"{1 + (27 * 11) % 6}, and who wrote it? Answer briefly.")
++        spec = {"name": "ext_long", "effort": "none", "messages": [{"role": "user", "content": content}]}
++        if len(render(tok, spec)[1]) >= 2100:
++            break
++        n += 4
++    specs.append(spec)
 +    return specs
 +
 +
@@ -4252,15 +5587,30 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +    return files, times
 +
 +
++def margin_of(lg: torch.Tensor, raw: torch.Tensor, pick: int) -> dict:
++    """One decode step's margin on the row its pick came from: lg softcapped, raw before the softcap (both masked
++    alike for a grammar's step). top2 is the best other token (None when no other token is allowed)."""
++    rest = lg.clone()
++    rest[pick] = float("-inf")
++    second = int(rest.argmax())
++    t1 = float(lg[pick])
++    if not math.isfinite(float(rest[second])):
++        return {"top1": pick, "top2": None, "top1_logit": t1, "top2_logit": None, "gap": None, "gap_pre": None,
++                "step": bf16_spacing(t1)}
++    t2 = float(lg[second])
++    return {"top1": pick, "top2": second, "top1_logit": t1, "top2_logit": t2, "gap": t1 - t2,
++            "gap_pre": float(raw[pick]) - float(raw[second]), "step": bf16_spacing(t1)}
++
++
 +def greedy_decode(model: Model, specs: list, steps: int, lru_dev, lru_cap: int, tf_dir: str | None,
 +                  record: list | None = None, guides: list | None = None, limits: list | None = None,
-+                  stops: set | None = None):
++                  stops: set | None = None, margins: list | None = None):
 +    """Greedy continuation, all prompts in lockstep: dense layer weights resident, experts fetched per pick.
 +    `record` (a list per prompt) receives each step's last-row logits. `guides` (a Guide or None per prompt): the pick
 +    is the argmax over the tokens its grammar allows (the others -inf), and the prompt ends when the grammar does.
 +    `limits` (per prompt, else `steps`): a prompt's own token limit. `stops`: the ids that end an unguided prompt
 +    (default 200006 alone). A prompt that has ended is not run further (each prompt has its own cache; the others'
-+    results do not change)."""
++    results do not change). `margins` (a list per prompt) receives each kept step's margin_of."""
 +    from transformers.cache_utils import DynamicCache
 +
 +    cfg, dev = model.cfg, model.dev
@@ -4297,11 +5647,19 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +                    run_layer(layer, states[k], caches[k])
 +            for k in live:
 +                st, s, g = states[k], specs[k], guides[k]
-+                lg = logits_of(head, cfg, finish(head, st)[0, -1:])[0]
++                raw = None
++                if margins is None:
++                    lg = logits_of(head, cfg, finish(head, st)[0, -1:])[0]
++                else:  # logits_of's expression, the row before the softcap kept
++                    full = head[2](finish(head, st)[0, -1:]).float()
++                    lg = head[3](full)[..., : cfg.unpadded_vocab_size][0]
++                    raw = full[..., : cfg.unpadded_vocab_size][0]
 +                if g is not None:
 +                    ok = allowed_of(g.mask(), lg.shape[0]).to(lg.device)
 +                    free = int(lg.argmax())
 +                    lg = lg.masked_fill(~ok, float("-inf"))
++                    if raw is not None:
++                        raw = raw.masked_fill(~ok, float("-inf"))
 +                tok = int(lg.argmax())
 +                if g is not None:
 +                    if not bool(ok[tok]):
@@ -4320,6 +5678,8 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +                        report[s["name"]]["tf_max_abs_logit_diff"] = float((full - lg).abs().max())
 +                if step < limits[k]:
 +                    outs[k].append(tok)
++                    if margins is not None:
++                        margins[k].append(margin_of(lg, raw, tok))
 +                ended[k] = (g.terminated() if g is not None else tok in eos) or step >= limits[k]
 +                cur[k] = torch.tensor([[tok]], device=dev)
 +            print(f"step {step}: {len(live)} prompts, {time.time() - ts:.1f} s, expert hits {lru.hits} "
@@ -4337,7 +5697,8 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +    ap.add_argument("--device", default="cuda:0")
 +    ap.add_argument("--skip-forward", action="store_true", help="only --decode")
 +    ap.add_argument("--decode", type=int, default=0, help="greedy-continue --decode-prompts this many tokens")
-+    ap.add_argument("--decode-prompts", default="chat_short,code,tool_call,long_1500")
++    ap.add_argument("--decode-prompts", default="chat_short,code,tool_call,long_1500",
++                    help="prompt_specs or ext_specs names; 'ext' stands for all of ext_specs")
 +    ap.add_argument("--expert-device", default="cuda:1", help="--decode's expert cache")
 +    ap.add_argument("--expert-cache", type=int, default=1000, help="--decode's expert cache size (experts)")
 +    ap.add_argument("--all-rows", action="store_true", help="keep every row's hidden states (long prompts too)")
@@ -4351,25 +5712,32 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +    ap.add_argument("--xgrammar-check", action="store_true", help="--structured: byte-compare every mask with Python "
 +                    "xgrammar's (cache off) and fail on any difference")
 +    ap.add_argument("--cases-out", default="", help="--structured: also write one <case>.json per case here")
++    ap.add_argument("--attn", choices=["eager", "fp32"], default="eager",
++                    help="the attention core: Transformers' eager (v0.1's oracle) or the fp32 form (v0.2's; "
++                    "turns --fp32-reduction on)")
 +    ap.add_argument("--plain-steps", type=int, default=160, help="--structured: each case's prompt also greedy "
 +                    "without its grammar, at most this many tokens (stops: the server's), as `plain_ids` (0: not)")
 +    a = ap.parse_args()
-+    if a.structured:
++    if a.structured or a.attn == "fp32":
 +        a.fp32_reduction = True  # the masked oracle's picks meet near-ties: no bf16 partial sums in its matmuls
 +    if a.fp32_reduction:
 +        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
++    ATTN["form"] = a.attn
 +
 +    from transformers import AutoTokenizer
 +
 +    dev = torch.device(a.device)
++    tf32 = tf32_guard(dev)
++    print(f"attention: {a.attn}; bf16 matmuls reduced in fp32: {a.fp32_reduction}", flush=True)
 +    cfg = text_config(a.model_dir, a.layers)
 +    tok = AutoTokenizer.from_pretrained(a.model_dir)
 +    specs = prompt_specs(tok)
-+    for s in specs:
++    ext = ext_specs(tok)
++    for s in specs + ext:
 +        s["text"], s["ids"] = render(tok, s)
 +    if a.prompts:
 +        want = a.prompts.split(",")
-+        specs = [s for s in specs if s["name"] in want]
++        specs = [s for s in specs + ext if s["name"] in want]
 +    out = os.path.join(a.out, a.mode if not a.layers else f"{a.mode}-L{a.layers}")
 +    os.makedirs(out, exist_ok=True)
 +    man_path = os.path.join(out, "manifest.json")
@@ -4382,7 +5750,11 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +                   "post-attention/post-MLP, block-residual queries)",
 +                   "experts": "bf16 decoded weights" if a.mode == "full" else "checkpoint bytes, activations "
 +                   "quantized (TokenSpeed reference)", "logits": "fp32 softcapped"},
-+        "experts_implementation": "eager", "attn_implementation": "eager",
++        "experts_implementation": "eager",
++        "attn_implementation": "eager" if a.attn == "eager" else "fp32: v0.2's form at the kx kernels' rounding "
++        "points (inkling2_ref.kx_core; fp32 scores, softmax and P.V, P never rounded, the sink as the multiplier "
++        "sigmoid((m + log z) - sink), one bf16 rounding after the gate and the sink)",
++        "tf32": tf32,
 +        "expert_sum_order": "fp32 per row over the picks in ascending expert id, one bf16 rounding" if a.mode == "full"
 +        else "fp32 per row over the bf16 route rows in slot order (route.slot_ids: TokenSpeed's order, descending "
 +        "sigmoid(logit) + bias, ties to the lower id), one bf16 rounding",
@@ -4406,20 +5778,36 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +        json.dump(man, open(man_path, "w"), indent=1)
 +    if a.decode:
 +        want = a.decode_prompts.split(",")
-+        dspecs = [s for s in specs if s["name"] in want]
++        every = {s["name"]: s for s in prompt_specs_rendered(specs, ext)}
++        names = [n for w in want for n in ([e["name"] for e in ext] if w == "ext" else [w])]
++        for n in names:
++            if n not in every:
++                raise SystemExit(f"--decode-prompts: no prompt {n}")
++        dspecs = [every[n] for n in names]
++        man["decode_prompts"] = [{k: s[k] for k in ("name", "effort", "messages", "text", "ids")}
++                                 | {"tokens": len(s["ids"])} for s in dspecs]
 +        t0 = time.time()
++        margins = [[] for _ in dspecs]
 +        outs, report = greedy_decode(model, dspecs, a.decode, torch.device(a.expert_device), a.expert_cache,
 +                                     out if os.path.exists(os.path.join(out, dspecs[0]["name"] + ".safetensors"))
-+                                     else None)
++                                     else None, margins=margins)
 +        res = {}
-+        for s, o in zip(dspecs, outs):
-+            res[s["name"]] = {"ids": o, "text": tok.decode(o, skip_special_tokens=False), **report[s["name"]]}
++        for s, o, mg in zip(dspecs, outs, margins):
++            res[s["name"]] = {"ids": o, "text": tok.decode(o, skip_special_tokens=False), **report[s["name"]],
++                              "margins": mg}
 +            print(f"--- {s['name']}\n{res[s['name']]['text']}", flush=True)
++        res["_attn"] = a.attn
 +        res["_wall_s"] = round(time.time() - t0, 1)
 +        with open(os.path.join(out, "decode.json"), "w") as f:
 +            json.dump(res, f, indent=1, ensure_ascii=False)
 +        man["decode_wall_s"] = res["_wall_s"]
 +        json.dump(man, open(man_path, "w"), indent=1)
++
++
++def prompt_specs_rendered(specs: list, ext: list) -> list:
++    """Every rendered prompt by name: the selected prompt_specs (or --prompts) and the extended set."""
++    seen = {s["name"] for s in specs}
++    return specs + [e for e in ext if e["name"] not in seen]
 +
 +
 +def ids_sha(ids: list) -> str:
@@ -4446,15 +5834,18 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +    t0 = time.time()
 +    n = len(specs)
 +    plain = [dict(s, name=s["name"] + "+plain") for s in specs] if a.plain_steps > 0 else []
++    margins = [[] for _ in specs + plain]
 +    outs, report = greedy_decode(model, specs + plain, a.decode, torch.device(a.expert_device), a.expert_cache, None,
 +                                 guides=guides + [None] * len(plain),
-+                                 limits=[a.decode] * n + [a.plain_steps] * len(plain), stops=set(STOPS))
++                                 limits=[a.decode] * n + [a.plain_steps] * len(plain), stops=set(STOPS),
++                                 margins=margins)
 +    plain_outs = outs[n:] if plain else [None] * n
++    plain_margins = margins[n:] if plain else [None] * n
 +    outs = outs[:n]
 +    wall = round(time.time() - t0, 1)
 +    res, fails = {}, 0
-+    for s, o, g, po in zip(specs, outs, guides, plain_outs):
-+        r = {"ids": o, "ids_sha": ids_sha(o), "tokens": len(o), "ended": g.terminated(),
++    for s, o, g, po, mg, pm in zip(specs, outs, guides, plain_outs, margins[:n], plain_margins):
++        r = {"ids": o, "ids_sha": ids_sha(o), "tokens": len(o), "ended": g.terminated(), "attn": ATTN["form"],
 +             "text": tok.decode(o, skip_special_tokens=False), "mask_steps": g.steps,
 +             "mask_sha": g.sha.hexdigest()[:16], "masked_picks": g.changed,
 +             "mask_check": None if check is None else ("equal" if g.differ == 0 else f"{g.differ} differ"),
@@ -4463,6 +5854,9 @@ index 0000000000000000000000000000000000000000..88e59f5cf9c901dc2897b6d209526283
 +            r.update({"plain_request": plain_request(s["request"]), "plain_ids": po, "plain_ids_sha": ids_sha(po),
 +                      "plain_tokens": len(po), "plain_text": tok.decode(po, skip_special_tokens=False),
 +                      "first_masked_pick": next((i for i, (x, y) in enumerate(zip(o, po)) if x != y), None)})
++        r["margins"] = mg  # masked rows (the allowed tokens only)
++        if pm is not None:
++            r["plain_margins"] = pm
 +        fails += g.differ + (not g.terminated())
 +        res[s["name"]] = r
 +        print(f"--- {s['name']}: {len(o)} tokens, ended {r['ended']}, ids {r['ids_sha']}, masks {r['mask_sha']} "
@@ -7986,6 +9380,429 @@ index 0000000000000000000000000000000000000000..3fee8680f1ab6fdf2087f0b56d4158f4
 +
 +if __name__ == "__main__":
 +    main()
+diff --git a/tools/zig/inkling2_tokengate.py b/tools/zig/inkling2_tokengate.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b98a0e6d5310431ddbde41c3a3b53cec7272bf86
+--- /dev/null
++++ b/tools/zig/inkling2_tokengate.py
+@@ -0,0 +1,217 @@
++"""v0.2's token gate, offline: the yardstick (recipe/inkling2-tp4/smoke.py's yardstick_score and yardstick_verdict,
++one definition, which users run from the tarball; this file imports them) on recorded forced tokens, and the
++free-running greedy departures as information. Standard library only.
++
++USAGE = python3 tools/zig/inkling2_tokengate.py score DECODE_JSON FORCED_JSON [--ext DIR]
++        python3 tools/zig/inkling2_tokengate.py check DECODE_JSON SERVER_JSON [--ext DIR]
++        python3 tools/zig/inkling2_tokengate.py order EXT_DECODE_JSON
++        python3 tools/zig/inkling2_tokengate.py margins DECODE_JSON [--below 0.5]
++
++The gate (smoke.py yardstick): the server is forced along the fp32 oracle's greedy replies, one greedy token at every
++position j (the prompt plus the oracle's first j reply tokens), and over the 445 positions of chat_short, tool_call
++and the extended set's 7 prompts its token must equal the oracle's top-1 at >= smoke.YARDSTICK_TOP1 positions and be
++in the oracle's top-2 (decode.json's margins[j]) at >= smoke.YARDSTICK_TOP2. The bars are the worst scores of the
++reference implementation's own valid variants on the same positions (smoke.py says which).
++
++  score    the yardstick on FORCED_JSON (smoke.py yardstick --json's output, or {"name": [one token per oracle
++           position], ...}): the per-prompt lines, every position off the oracle's top-1 with upstream TensorFold's
++           one-bf16-step label (information), the YARDSTICK line; exit 1 when it fails.
++  check    information: SERVER_JSON = {"name": [ids], ...} (a server's free-running greedy replies); smoke.py oracle's
++           per-prompt lines (EQUAL, DEPARTS at j with the oracle's gap and the one-step label; DIFFER only for an
++           oracle file without margins) and the EXT summary.
++  order    the extended set's ORDER, as the frozen ORDER file was made: each prompt's first position whose oracle
++           margin is at most one bf16 step (the reply's length when there is none), latest first; ties by name.
++  margins  every position whose oracle margin is at most one bf16 step, or under --below (information).
++
++verdict(oracle_row, oracle_token, server_token, server_row=None) describes one free-running departure as a dict
++(information only); with a server row (a debug dump's top-2, never available in the release) it also reports
++upstream's literal two-sided rule.
++"""
++
++import argparse
++import json
++import os
++import sys
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.join(HERE, "..", "..", "recipe", "inkling2-tp4"))
++import smoke  # noqa: E402
++
++bf16_spacing = smoke.bf16_spacing
++near_tie = smoke.near_tie
++compare = smoke.compare
++yardstick_score = smoke.yardstick_score
++yardstick_verdict = smoke.yardstick_verdict
++
++
++def verdict(oracle_row: dict, oracle_token: int, server_token: int, server_row: dict = None) -> dict:
++    """One free-running departure, information only (the gate is the yardstick). oracle_row: decode.json's margins[j].
++    server_row: {"top1", "top2", "top1_logit", "gap"} of the server's own row j, from a debug dump."""
++    near, gap, step, why = near_tie(oracle_row, oracle_token, server_token)
++    in_top2 = smoke.yardstick_row(oracle_row, oracle_token, server_token)[1] if oracle_row else False
++    out = {"upstream_one_step_info": near, "in_oracle_top2": in_top2, "oracle_gap": gap, "oracle_step": step,
++           "why": why, "label": "oracle side: top-2 = {oracle token, server token}, gap <= one bf16 step of top-1"}
++    if oracle_row and oracle_row.get("gap") is not None:
++        out["oracle_gap_pre_softcap"] = oracle_row.get("gap_pre")
++        out["oracle_gap_under_0p5"] = oracle_row["gap"] < 0.5
++    if server_row is not None:
++        s_top = {server_row.get("top1"), server_row.get("top2")}
++        s_gap = server_row.get("gap")
++        s_ok = (s_top == {oracle_token, server_token} and s_gap is not None
++                and s_gap <= bf16_spacing(float(server_row["top1_logit"])))
++        out["upstream_two_sided_info"] = bool(near and s_ok)
++        out["server_gap"] = s_gap
++    return out
++
++
++def first_near_tie(entry: dict, threshold=None) -> int:
++    """The first position whose oracle margin is at most one bf16 step (threshold None) or under threshold; the reply's
++    length when there is none."""
++    for j, m in enumerate(entry.get("margins") or []):
++        if m.get("gap") is None:
++            continue
++        lim = bf16_spacing(float(m["top1_logit"])) if threshold is None else threshold
++        if (m["gap"] <= lim) if threshold is None else (m["gap"] < lim):
++            return j
++    return len(entry["ids"])
++
++
++def prompts(dec: dict) -> list:
++    return sorted(k for k, v in dec.items() if not k.startswith("_") and isinstance(v, dict) and "ids" in v)
++
++
++def order(dec: dict) -> list:
++    """ORDER: latest first oracle near tie first, ties by name."""
++    names = prompts(dec)
++    for n in names:
++        if "margins" not in dec[n] or len(dec[n]["margins"]) != len(dec[n]["ids"]):
++            raise SystemExit(f"{n}: no margins for every token (an oracle file made with inkling2_ref.py --attn fp32)")
++    return sorted(names, key=lambda n: (-first_near_tie(dec[n]), n))
++
++
++def cmd_order(a) -> int:
++    dec = json.load(open(a.decode))
++    names = order(dec)
++    for n in names:
++        print(n)
++    total = 0
++    print("# prompt | reply tokens | first near tie (one bf16 step) | first gap < 0.5", file=sys.stderr)
++    for n in names:
++        e = dec[n]
++        total += len(e["ids"])
++        print(f"# {n} | {len(e['ids'])} | {first_near_tie(e)} | {first_near_tie(e, 0.5)}", file=sys.stderr)
++    print(f"# {len(names)} prompts, {total} reply tokens; tokens before the first near tie: "
++          f"{sum(first_near_tie(dec[n]) for n in names)} (gap < 0.5: {sum(first_near_tie(dec[n], 0.5) for n in names)})",
++          file=sys.stderr)
++    return 0
++
++
++def check(dec: dict, server: dict, gated: list, ext: dict = None, ext_order: list = None, ext_server: dict = None,
++          out=print) -> dict:
++    """smoke.py oracle's lines on recorded free-running replies (information, except DIFFER for an oracle file without
++    margins). Returns {"fails", "results": {name: (status, tokens equal before the departure, oracle tokens)}}."""
++    fails, results = 0, {}
++
++    def one(name, d, srv):
++        status, j, n, note = compare(d[name]["ids"], d[name].get("margins"), srv[name])
++        out(f"{name}: oracle {len(d[name]['ids'])} tokens, server {len(srv[name])}: {status}"
++            f"{'' if status == 'EQUAL' else f' at {j}'}{note}")
++        results[name] = (status, n, len(d[name]["ids"]))
++        return status
++
++    for name in gated:
++        fails += one(name, dec, server) == "DIFFER"
++    if ext is not None:
++        for name in ext_order:
++            fails += one(name, ext, ext_server) == "DIFFER"
++        done = [results[n] for n in ext_order]
++        c = {k: sum(v[0] == k for v in done) for k in ("EQUAL", "DEPARTS", "DIFFER")}
++        n, total = sum(v[1] for v in done), sum(v[2] for v in done)
++        out(f"EXT summary: {len(done)} prompts, {c['EQUAL']} EQUAL, {c['DEPARTS']} DEPARTS, {c['DIFFER']} DIFFER; "
++            f"{n} of {total} oracle tokens equal before the first departure ({100.0 * n / max(total, 1):.1f}%)")
++    return {"fails": fails, "results": results}
++
++
++def read_ext(path: str):
++    with open(os.path.join(path, "decode.json")) as f:
++        ext = json.load(f)
++    with open(os.path.join(path, "ORDER")) as f:
++        order = [x.strip() for x in f if x.strip() and not x.startswith("#")]
++    return ext, order
++
++
++def cmd_check(a) -> int:
++    dec = json.load(open(a.decode))
++    server = json.load(open(a.server))
++    gated = [n for n in prompts(dec) if n in server] if not a.prompts else a.prompts.split(",")
++    ext, ext_order = read_ext(a.ext) if a.ext else (None, None)
++    r = check(dec, server, gated, ext, ext_order, server)
++    return 1 if r["fails"] else 0
++
++
++def score(dec: dict, forced: dict, gated: list, ext: dict = None, ext_order: list = None, out=print) -> dict:
++    """The yardstick on recorded forced tokens: smoke.py yardstick's lines. Returns the score with "passed"."""
++    parts = [(n, dec[n]) for n in gated] + [(n, ext[n]) for n in (ext_order or [])]
++    rows = []
++    for name, e in parts:
++        if name not in forced:
++            raise SystemExit(f"{name}: no forced tokens")
++        one = yardstick_score([(name, e["ids"], e.get("margins"), forced[name])])
++        out(f"{name}: {len(e['ids'])} positions: top-1 {one['top1']}, in the oracle's top-2 {one['top2']}")
++        smoke.yardstick_lines(one, out)
++        rows.append((name, e["ids"], e.get("margins"), forced[name]))
++    r = yardstick_score(rows)
++    r["passed"], line = yardstick_verdict(r)
++    out(line)
++    return r
++
++
++def cmd_score(a) -> int:
++    dec = json.load(open(a.decode))
++    forced = json.load(open(a.forced))
++    forced = forced.get("forced", forced)
++    ext, ext_order = read_ext(a.ext) if a.ext else (None, [])
++    gated = a.prompts.split(",") if a.prompts else [n for n in prompts(dec) if n in forced]
++    return 0 if score(dec, forced, gated, ext, ext_order)["passed"] else 1
++
++
++def cmd_margins(a) -> int:
++    dec = json.load(open(a.decode))
++    for n in prompts(dec):
++        rows = dec[n].get("margins") or []
++        hits = [(j, m) for j, m in enumerate(rows) if m.get("gap") is not None
++                and (m["gap"] <= bf16_spacing(float(m["top1_logit"])) or m["gap"] < a.below)]
++        print(f"{n}: {len(dec[n]['ids'])} tokens, first near tie (one bf16 step) at {first_near_tie(dec[n])}, "
++              f"first gap < {a.below:g} at {first_near_tie(dec[n], a.below)}")
++        for j, m in hits:
++            step = bf16_spacing(float(m["top1_logit"]))
++            print(f"  j={j}: top1 {m['top1']} {m['top1_logit']:.4f}, top2 {m['top2']} {m['top2_logit']:.4f}, gap "
++                  f"{m['gap']:.4f} ({'<=' if m['gap'] <= step else '>'} one bf16 step {step:.4g}), pre-softcap gap "
++                  f"{m['gap_pre']:.4f}")
++    return 0
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    sub = ap.add_subparsers(dest="cmd", required=True)
++    o = sub.add_parser("order")
++    o.add_argument("decode")
++    sc = sub.add_parser("score")
++    sc.add_argument("decode")
++    sc.add_argument("forced")
++    sc.add_argument("--prompts", default="", help="the gated prompts (default: every prompt both files hold)")
++    sc.add_argument("--ext", default="")
++    c = sub.add_parser("check")
++    c.add_argument("decode")
++    c.add_argument("server")
++    c.add_argument("--prompts", default="", help="the gated prompts (default: every prompt both files hold)")
++    c.add_argument("--ext", default="")
++    m = sub.add_parser("margins")
++    m.add_argument("decode")
++    m.add_argument("--below", type=float, default=0.5)
++    a = ap.parse_args()
++    return {"score": cmd_score, "check": cmd_check, "order": cmd_order, "margins": cmd_margins}[a.cmd](a)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/zig/inkling2_tolerance.py b/tools/zig/inkling2_tolerance.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d0aa1fc218dbfce94c2530397ef0f83207f05a3e
+--- /dev/null
++++ b/tools/zig/inkling2_tolerance.py
+@@ -0,0 +1,194 @@
++"""How far apart valid reference forms of Inkling-2-Small put the same oracle rows: the top-1/top-2 gap spread, and
++each form's yardstick score (the scores v0.2's token gate bars come from).
++
++USAGE = python3 tools/zig/inkling2_tolerance.py MARGINS_JSON [MARGINS_JSON ...] [--json OUT_JSON] [--top 10]
++        python3 tools/zig/inkling2_tolerance.py MARGINS_JSON [MARGINS_JSON ...] --yardstick
++
++  python3 tools/zig/inkling2_tolerance.py gated/margins.json ext/margins.json --json tol.json
++
++Inputs: inkling2_margins.py outputs (margins.json) over the fp32 oracle's replies (the gated prompts' decode.json and
++the extended set's ext/decode.json), each holding every oracle sequence ("NAME/oracle") in every reference form: the
++modes eager (Transformers' eager attention, cuBLAS bf16 partial reduction), eager32 (the same, fp32 reduction) and
++fp32 (v0.2's oracle form, kx's multiplier sink), each on the decode path (prefill + one-row steps) and the
++teacher-forced path (one whole-sequence forward). Branch sequences (a server's reply) are ignored. Every form must be
++present for every oracle position; a missing one is an error, not a smaller set.
++
++At every oracle position (prompt, j) and in every form f it reads the softcapped logits row's top-5 and computes:
++
++  margin(f)  f's own top-1 minus top-2 (the two tokens f ranks first);
++  pair(f)    logit(a) - logit(b) in f, a and b the fp32 decode path's top-1 and top-2 at that position (the oracle's
++             own two contenders, the pair the gate examines); signed, so a form that swaps them counts in full.
++             When b (or a) is not in f's top-5 the row is far from a tie; it is counted as missing.
++
++spread(prompt, j) = max over both measures of (max over forms - min over forms). The tolerance is 2 x the largest
++spread over all positions, printed with the position and the forms where the largest spread occurs, and rounded up
++at the fourth decimal (information: a per-departure tolerance is not the gate).
++
++--yardstick scores every form as recipe/inkling2-tp4/smoke.py yardstick scores a server: at each oracle position, is
++the form's top-1 the oracle's token (the fp32 decode path's), and is it in the oracle's top-2. An exact tie at a
++form's top makes its top-1 ambiguous, so each count is printed as a range (low: every tied token must qualify; high:
++one is enough) around the form's own argmax, beside smoke.py's bars. Standard library only.
++"""
++
++import argparse
++import hashlib
++import json
++import math
++import os
++import sys
++
++FORMS = [(m, p) for m in ("eager", "eager32", "fp32") for p in ("decode", "tf")]
++ORACLE_FORM = ("fp32", "decode")
++
++
++def sha256(path: str) -> str:
++    with open(path, "rb") as f:
++        return hashlib.sha256(f.read()).hexdigest()
++
++
++def collect(paths: list) -> dict:
++    """{(prompt, j): {(mode, path): row}} over the oracle sequences of every input."""
++    pos = {}
++    for path in paths:
++        for sq in json.load(open(path))["sequences"]:
++            if not sq["label"].endswith("/oracle"):
++                continue
++            form = (sq["mode"], sq["path"])
++            for r in sq["rows"]:
++                at = pos.setdefault((sq["prompt"], r["j"]), {})
++                if form in at:
++                    raise SystemExit(f"{sq['prompt']} j={r['j']} {form}: given twice")
++                at[form] = r
++    return pos
++
++
++def logit_of(row: dict, tok: int):
++    return row["top_logits"][row["top"].index(tok)] if tok in row["top"] else None
++
++
++def spreads(pos: dict) -> list:
++    out = []
++    for (prompt, j), at in sorted(pos.items()):
++        missing = [f for f in FORMS if f not in at]
++        if missing:
++            raise SystemExit(f"{prompt} j={j}: no rows for {missing}")
++        o = at[ORACLE_FORM]
++        a = o["token"]  # topk may list an exact tie at the top in either order; the oracle's pick is the token
++        b = o["top"][1] if o["top"][0] == a else o["top"][0]
++        if a not in o["top"][:2] or o["top_logits"][0] != logit_of(o, a):
++            raise SystemExit(f"{prompt} j={j}: the fp32 decode row's top-1 {a} is not the oracle's token {o['token']}")
++        margin = {f: at[f]["margin"] for f in FORMS}
++        pair, pair_missing = {}, []
++        for f in FORMS:
++            la, lb = logit_of(at[f], a), logit_of(at[f], b)
++            if la is None or lb is None:
++                pair_missing.append(f)
++            else:
++                pair[f] = la - lb
++        rec = {"prompt": prompt, "j": j, "a": a, "b": b, "oracle_gap": o["margin"], "pair_missing": pair_missing}
++        best = None
++        for name, d in (("margin", margin), ("pair", pair)):
++            if len(d) < 2:
++                continue
++            hi, lo = max(d, key=d.get), min(d, key=d.get)
++            s = d[hi] - d[lo]
++            rec[f"{name}_spread"] = s
++            if best is None or s > best[0]:
++                best = (s, name, hi, d[hi], lo, d[lo])
++        rec.update({"spread": best[0], "measure": best[1], "form_hi": "/".join(best[2]), "value_hi": best[3],
++                    "form_lo": "/".join(best[4]), "value_lo": best[5]})
++        out.append(rec)
++    return out
++
++
++def yardstick(pos: dict) -> dict:
++    """{form: {"top1": (low, argmax, high), "top2": (low, argmax, high)}} over every oracle position."""
++    out = {}
++    for f in FORMS:
++        lo1 = hi1 = lo2 = hi2 = am1 = am2 = 0
++        for (prompt, j), at in sorted(pos.items()):
++            o = at[ORACLE_FORM]
++            a = o["token"]
++            top2 = set(o["top"][:2]) | {a}  # as smoke.yardstick_row reads decode.json's top1/top2
++            r = at[f]
++            tied = [t for t, lg in zip(r["top"], r["top_logits"]) if lg == r["top_logits"][0]]
++            lo1 += all(t == a for t in tied)
++            hi1 += any(t == a for t in tied)
++            lo2 += all(t in top2 for t in tied)
++            hi2 += any(t in top2 for t in tied)
++            am1 += r["argmax"] == a
++            am2 += r["argmax"] in top2
++        out["/".join(f)] = {"top1": (lo1, am1, hi1), "top2": (lo2, am2, hi2)}
++    return out
++
++
++def ceil4(x: float) -> float:
++    return math.ceil(x * 1e4 - 1e-9) / 1e4
++
++
++def cmd_yardstick(a) -> int:
++    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "recipe", "inkling2-tp4"))
++    import smoke
++
++    pos = collect(a.margins)
++    for p in a.margins:
++        print(f"input {sha256(p)} {p}")
++    for (prompt, j), at in sorted(pos.items()):
++        missing = [f for f in FORMS if f not in at]
++        if missing:
++            raise SystemExit(f"{prompt} j={j}: no rows for {missing}")
++    print(f"{len(pos)} oracle positions; bars (smoke.py): top-1 >= {smoke.YARDSTICK_TOP1}, in the oracle's top-2 >= "
++          f"{smoke.YARDSTICK_TOP2} of {smoke.YARDSTICK_POSITIONS}")
++    print("| form | top-1: argmax (low-high) | in the oracle's top-2: argmax (low-high) |")
++    print("|---|---|---|")
++    for f, r in yardstick(pos).items():
++        t1, t2 = r["top1"], r["top2"]
++        print(f"| {f} | {t1[1]} ({t1[0]}-{t1[2]}) | {t2[1]} ({t2[0]}-{t2[2]}) |")
++    return 0
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("margins", nargs="+")
++    ap.add_argument("--json", default="")
++    ap.add_argument("--top", type=int, default=10)
++    ap.add_argument("--yardstick", action="store_true", help="each form's yardstick score instead of the spreads")
++    a = ap.parse_args()
++    if a.yardstick:
++        return cmd_yardstick(a)
++    rows = spreads(collect(a.margins))
++    worst = max(rows, key=lambda r: r["spread"])
++    tol = 2.0 * worst["spread"]
++    by_prompt = {}
++    for r in rows:
++        by_prompt[r["prompt"]] = by_prompt.get(r["prompt"], 0) + 1
++    res = {"tool": "inkling2_tolerance.py", "inputs": {p: sha256(p) for p in a.margins}, "forms": ["/".join(f) for f in
++           FORMS], "positions": len(rows), "prompts": by_prompt,
++           "pair_missing_positions": sum(bool(r["pair_missing"]) for r in rows),
++           "largest_spread": worst, "tolerance_exact": tol, "tolerance": ceil4(tol),
++           "max_margin_spread": max(r.get("margin_spread", 0.0) for r in rows),
++           "max_pair_spread": max(r.get("pair_spread", 0.0) for r in rows),
++           "top": sorted(rows, key=lambda r: -r["spread"])[: a.top]}
++    for p, h in res["inputs"].items():
++        print(f"input {h} {p}")
++    print(f"{len(rows)} oracle positions over {len(by_prompt)} prompts "
++          f"({', '.join(f'{k} {n}' for k, n in by_prompt.items())}), forms {', '.join(res['forms'])}; "
++          f"pair not in some form's top-5 at {res['pair_missing_positions']} positions")
++    print(f"largest margin spread {res['max_margin_spread']:.6f}, largest pair spread {res['max_pair_spread']:.6f}")
++    print("| prompt | j | a | b | fp32 decode gap | measure | spread | high form | high | low form | low |")
++    print("|---|---|---|---|---|---|---|---|---|---|---|")
++    for r in res["top"]:
++        print(f"| {r['prompt']} | {r['j']} | {r['a']} | {r['b']} | {r['oracle_gap']:.4f} | {r['measure']} | "
++              f"{r['spread']:.6f} | {r['form_hi']} | {r['value_hi']:.4f} | {r['form_lo']} | {r['value_lo']:.4f} |")
++    w = worst
++    print(f"TOLERANCE {res['tolerance']:.4f} (2 x {w['spread']:.6f} = {tol:.6f}, rounded up at 1e-4): {w['measure']} "
++          f"spread at {w['prompt']} j={w['j']}, {w['form_hi']} {w['value_hi']:.4f} vs {w['form_lo']} "
++          f"{w['value_lo']:.4f}")
++    if a.json:
++        with open(a.json, "w") as f:
++            json.dump(res, f, indent=1)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/tools/zig/template_parity.py b/tools/zig/template_parity.py
 index 59410fa82ce10636cb76aea0996d91f9fed807ac..fecd9345e048d4d357005f9023d84c42c4deda78 100644
 --- a/tools/zig/template_parity.py

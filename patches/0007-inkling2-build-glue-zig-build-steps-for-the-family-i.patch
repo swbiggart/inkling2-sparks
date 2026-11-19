@@ -1,22 +1,22 @@
-From d76dc86b3b7c0e7eee11fd98aa9264d9ad158d15 Mon Sep 17 00:00:00 2001
+From 73f4676030b7fa862ffbb6eae260ac3e677448b9 Mon Sep 17 00:00:00 2001
 From: Scott Biggart <297695+swbiggart@users.noreply.github.com>
-Date: Mon, 16 Nov 2026 01:00:00 -0800
+Date: Tue, 17 Nov 2026 19:30:00 -0800
 Subject: [PATCH 7/8] inkling2: build glue: zig build steps for the family, its
  kernels and tools
 
 8 files (1 new, 7 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
-Part of the engine changes behind Inkling-2-Small TP4 v0.1 (github.com/swbiggart/inkling2-sparks).
+Part of the engine changes behind Inkling-2-Small TP4 v0.2 (github.com/swbiggart/inkling2-sparks).
 Apply the whole series in order with git am (scripts/build-engine.sh does); only the full series is built and gated.
 ---
  build.zig                      |   1 +
- zig/build/cuda.zig             |   4 ++
+ zig/build/cuda.zig             |   4 +
  zig/build/cuda_engines.zig     |   3 +
- zig/build/cuda_kernels.zig     |   9 +++
+ zig/build/cuda_kernels.zig     |  10 +++
  zig/build/cuda_server_host.zig |   3 +
  zig/build/grammar.zig          |   2 +-
- zig/build/inkling2.zig         | 127 +++++++++++++++++++++++++++++++++
+ zig/build/inkling2.zig         | 129 +++++++++++++++++++++++++++++++++
  zig/build/tp.zig               |  37 +++++++++-
- 8 files changed, 184 insertions(+), 2 deletions(-)
+ 8 files changed, 187 insertions(+), 2 deletions(-)
  create mode 100644 zig/build/inkling2.zig
 
 diff --git a/build.zig b/build.zig
@@ -32,14 +32,14 @@ index 74f659e4d3b064945e0e045bdcd8f9d43c0a0ce4..c8dba235deeb6cb2065b5d11c1f2f6c4
      @import("zig/build/flashnext_budget.zig").steps(b, test_step);
      @import("zig/build/flashnext_batch_host.zig").tests(b, test_step);
 diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
-index 5aacb5ea49d5d49a7c7e5c77211bd6cb8387a4f4..513bda224fb147dafa219f6b5fa51f811ab64379 100644
+index 5aacb5ea49d5d49a7c7e5c77211bd6cb8387a4f4..6ed71bf4d41b5ad2042fc13956e2c25ddc7cf745 100644
 --- a/zig/build/cuda.zig
 +++ b/zig/build/cuda.zig
 @@ -110,6 +110,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
      for (exlr8_build.denseModules(b, target, optimize, exlr8, exlr8_tests[0])) |m| runner.addImport(m.name, m.module);
      runner.addImport("glm_cuda", glmCuda(b, target, optimize, cuda, mods.core, mods.lanes, mods.heat, mods.api));
      @import("minimax_cuda.zig").targets(b, target, optimize, strip, cuda, mods.core, mods.lanes, runner);
-+    @import("inkling2.zig").cudaTargets(b, target, optimize, strip, cuda);
++    @import("inkling2.zig").cudaTargets(b, target, optimize, strip, cuda, mods.core);
      for ([_]struct { []const u8, *std.Build.Module }{ .{ "kolibri1", kolibri1Module(b, target, optimize, cuda, mods.core, mods.lanes) }, .{ "dory", @import("dory.zig").module(b, target, optimize, cuda, mods.core, mods.lanes) } }) |m| runner.addImport(m[0], m[1]);
      runner.addImport("gemma4_cuda", @import("gemma4_cuda.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
      runner.addImport("spark25", @import("spark25.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
@@ -75,10 +75,10 @@ index 80f037e3d2210c237d48163fc55ad4e79c0b0d46..8ea2b122716bdd3d09a77f9a5919cb13
              .{ .name = "kolibri1", .module = @import("kolibri.zig").module(b, target, optimize, cuda, core, lanes) },
              .{ .name = "gemma4_cuda", .module = @import("gemma4_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
 diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
-index c0c8b503336808147778d40df18370af7ee09115..95d10cf15a97668a2609ccf894f0e83f207c816b 100644
+index c0c8b503336808147778d40df18370af7ee09115..852a9d4b330423f94e466e3d027f6693de482a82 100644
 --- a/zig/build/cuda_kernels.zig
 +++ b/zig/build/cuda_kernels.zig
-@@ -147,6 +147,15 @@ pub const kernels = [_]Kernel{
+@@ -147,6 +147,16 @@ pub const kernels = [_]Kernel{
      .{ .name = "glm_index", .flags = &.{"-O3"} }, // a prompt chunk's DSA scores and top-512 pools
      .{ .name = "minimax_m3", .flags = glue }, // ours: MiniMax-M3.1-Flash's glue (norms, RoPE prep, routing, DSpark, tower RoPE)
      .{ .name = "minimax_m3_attn", .flags = glue }, // ours: MiniMax-M3.1-Flash's indexer and block-sparse attention
@@ -91,6 +91,7 @@ index c0c8b503336808147778d40df18370af7ee09115..95d10cf15a97668a2609ccf894f0e83f
 +    .{ .name = "inkling2_dspark", .flags = glue }, // the DSpark drafter (mtp.safetensors)
 +    .{ .name = "inkling2_fuse", .flags = glue }, // fused stateless neighbours: the same bits as the ops they replace
 +    .{ .name = "inkling2_ck", .flags = glue, .arch_specific = true }, // checkpoint-mode experts: block-scaled FP4 / FP8 mma (sm_12xa)
++    .{ .name = "inkling2_kx", .flags = glue, .min_sm = 80 }, // Inkling-2's fp32 attention core after kortexa-ai's tf_ik_attention (the default; TF_INK2_ATTN=v01 runs inkling2_attn)
      .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
      .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5
      .{ .name = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/experts.cu's device code, tensorfold_exl3_experts
@@ -123,10 +124,10 @@ index 8e83bc3f7e4539440e323fd5af691e27ae37c8a8..fba82824fb4ddde889c20b26dd330f4f
          budget.dependOn(&b.addFail("zig build test-grammar-budget needs -Dxgrammar=DIR: " ++ clone).step);
 diff --git a/zig/build/inkling2.zig b/zig/build/inkling2.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..f90bf25563793e62e9b6ad26e24ea0f241246580
+index 0000000000000000000000000000000000000000..2700cbfd1156f69c5f79c393cf3c469174c5d6e7
 --- /dev/null
 +++ b/zig/build/inkling2.zig
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,129 @@
 +//! Inkling-2-Small in the build: its host module (no GPU, no core), its host tests, tf-inkling2-plan; its CUDA
 +//! module (the forward's op groups over the runtime) and tf-inkling2-cuda, the layer-range runner.
 +const std = @import("std");
@@ -196,7 +197,7 @@ index 0000000000000000000000000000000000000000..f90bf25563793e62e9b6ad26e24ea0f2
 +}
 +
 +/// tf-inkling2-cuda (Linux): layers [a, b) on one GPU from an oracle prompt file, every layer's rows dumped.
-+pub fn cudaTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module) void {
++pub fn cudaTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module, core: *std.Build.Module) void {
 +    const host = module(b, target, optimize);
 +    decodeTool(b, target, optimize, strip, cuda, host);
 +    draftTool(b, target, optimize, strip, cuda, host);
@@ -208,17 +209,19 @@ index 0000000000000000000000000000000000000000..f90bf25563793e62e9b6ad26e24ea0f2
 +    const exe = b.addExecutable(.{ .name = "tf-inkling2-cuda", .root_module = m });
 +    b.installArtifact(exe);
 +    b.step("tf-inkling2-cuda", "Inkling-2-Small's layers [a, b) on one GPU against the oracle (full mode)").dependOn(&b.addInstallArtifact(exe, .{}).step);
-+    attnTool(b, target, optimize, strip, cuda, host);
++    attnTool(b, target, optimize, strip, cuda, host, core);
 +    moeTool(b, target, optimize, strip, cuda, host);
 +    fuseTool(b, target, optimize, strip, cuda, host);
 +}
 +
-+/// tf-inkling2-attn (Linux): G-attn's ops alone over a captured prompt at several forward sizes.
-+fn attnTool(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module, host: *std.Build.Module) void {
++/// tf-inkling2-attn (Linux): G-attn's ops alone over a captured prompt at several forward sizes; --oracle takes
++/// core's relbias_attention_ref.zig.
++fn attnTool(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module, host: *std.Build.Module, core: *std.Build.Module) void {
 +    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/cuda_attn_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{
 +        .{ .name = "cuda", .module = cuda },
 +        .{ .name = "inkling2", .module = host },
 +        .{ .name = "inkling2_cuda", .module = cudaModule(b, target, optimize, cuda, host) },
++        .{ .name = "core", .module = core },
 +    } });
 +    const exe = b.addExecutable(.{ .name = "tf-inkling2-attn", .root_module = m });
 +    b.installArtifact(exe);

@@ -1,31 +1,39 @@
-From 4d2e7cbab369b4510641d144aebbb32f60204d16 Mon Sep 17 00:00:00 2001
+From a13309fc4346d68516c3164627c9bc62f38dcf99 Mon Sep 17 00:00:00 2001
 From: Scott Biggart <297695+swbiggart@users.noreply.github.com>
-Date: Mon, 16 Nov 2026 01:00:00 -0800
+Date: Tue, 17 Nov 2026 19:30:00 -0800
 Subject: [PATCH 3/8] inkling2: batching: lanes core for several streams a
  decode step and interleaved prefill
 
-16 files (3 new, 13 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
-Part of the engine changes behind Inkling-2-Small TP4 v0.1 (github.com/swbiggart/inkling2-sparks).
+22 files (5 new, 17 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
+Part of the engine changes behind Inkling-2-Small TP4 v0.2 (github.com/swbiggart/inkling2-sparks).
 Apply the whole series in order with git am (scripts/build-engine.sh does); only the full series is built and gated.
 ---
  zig/src/core/engine_stats.zig                 |    8 +
  zig/src/core/lane_host.zig                    |    9 +-
  zig/src/core/lanes/allocate.zig               |   55 +-
- zig/src/core/lanes/backend.zig                |    7 +
- zig/src/core/lanes/config.zig                 |   14 +
+ zig/src/core/lanes/backend.zig                |   11 +
+ zig/src/core/lanes/config.zig                 |   24 +
  zig/src/core/lanes/depth_shared_test.zig      |  257 +++
- zig/src/core/lanes/engine.zig                 |   23 +-
+ zig/src/core/lanes/engine.zig                 |   76 +-
  zig/src/core/lanes/engine_test.zig            |   48 +-
  zig/src/core/lanes/fake.zig                   |   24 +-
  zig/src/core/lanes/grammar.zig                |   11 +
  zig/src/core/lanes/grammar_parallel.zig       |    7 +-
  zig/src/core/lanes/grammar_window.zig         |   10 +
- zig/src/core/lanes/stream.zig                 |    8 +
- zig/src/core/lanes/windows.zig                |    5 +-
- .../families/inkling2/cuda_batch_check.zig    |  792 ++++++++++
- zig/src/families/inkling2/cuda_lanes.zig      | 1384 +++++++++++++++++
- 16 files changed, 2645 insertions(+), 17 deletions(-)
+ zig/src/core/lanes/lanes.zig                  |    2 +
+ zig/src/core/lanes/lone_cut_test.zig          |  292 +++
+ zig/src/core/lanes/open.zig                   |    2 +
+ zig/src/core/lanes/open_first.zig             |    2 +
+ zig/src/core/lanes/pieces.zig                 |    4 +
+ zig/src/core/lanes/shared_cut_test.zig        |  415 ++++
+ zig/src/core/lanes/stream.zig                 |   14 +
+ zig/src/core/lanes/windows.zig                |   57 +-
+ .../families/inkling2/cuda_batch_check.zig    |  808 +++++++
+ zig/src/families/inkling2/cuda_lanes.zig      | 1878 +++++++++++++++++
+ 22 files changed, 3991 insertions(+), 23 deletions(-)
  create mode 100644 zig/src/core/lanes/depth_shared_test.zig
+ create mode 100644 zig/src/core/lanes/lone_cut_test.zig
+ create mode 100644 zig/src/core/lanes/shared_cut_test.zig
  create mode 100644 zig/src/families/inkling2/cuda_batch_check.zig
  create mode 100644 zig/src/families/inkling2/cuda_lanes.zig
 
@@ -181,7 +189,7 @@ index 99426b5a0f1d3355f7e8ace24a06b475f0e08bbe..3968b8498b23a5e599e1c559961dffab
      const gpa = std.testing.allocator;
      const empty: Table = .{};
 diff --git a/zig/src/core/lanes/backend.zig b/zig/src/core/lanes/backend.zig
-index 48e2c8ffa23ead69a9f04dc0792771fc6d038120..da0af20b964ecda9122cae3d302bf30769e1a09c 100644
+index 48e2c8ffa23ead69a9f04dc0792771fc6d038120..3d878079211bf9e4906617d5a6e5eb8c74bcc0b6 100644
 --- a/zig/src/core/lanes/backend.zig
 +++ b/zig/src/core/lanes/backend.zig
 @@ -18,6 +18,7 @@ pub const Window = struct {
@@ -205,11 +213,22 @@ index 48e2c8ffa23ead69a9f04dc0792771fc6d038120..da0af20b964ecda9122cae3d302bf307
      ptr: *anyopaque,
      vtable: *const VTable,
  
+@@ -119,6 +126,10 @@ pub const Backend = struct {
+         unspeculate: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!void = null,
+         /// Each held draft's chance of landing, for heads that give them; false when it has none.
+         probabilities: ?*const fn (ptr: *anyopaque, s: *Stream, out: []f64) anyerror!bool = null,
++        /// shared_cut: before each verify, whether this round prices its drafts by chances (a shared round with 2 .. 4
++        /// live streams, Engine.shared_open): a backend that runs left-out streams' deferred drafts reads their chances
++        /// only then (else v0.2's proposals-only run).
++        shared_round: ?*const fn (ptr: *anyopaque, open: bool) void = null,
+         /// A tree head's held drafts as host tokens and parents (gpa-owned), read where Python reads them.
+         tree: ?*const fn (ptr: *anyopaque, s: *Stream, gpa: std.mem.Allocator) anyerror!?Held = null,
+         /// The head's best tokens and probabilities at each level it drafted for the stream (waits for the drafts).
 diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
-index 3d4470c510f263c030dd36b9b0d4a0dc9f9cc22e..ef7505e8ef6a0a47016ac54de617df67ad9bd3f4 100644
+index 3d4470c510f263c030dd36b9b0d4a0dc9f9cc22e..6690a58e933e1faf0e799e3ecc8b1e87c53e3d05 100644
 --- a/zig/src/core/lanes/config.zig
 +++ b/zig/src/core/lanes/config.zig
-@@ -4,6 +4,8 @@ const Allocator = std.mem.Allocator;
+@@ -4,8 +4,14 @@ const Allocator = std.mem.Allocator;
  const Table = @import("table.zig").Table;
  const alloc = @import("allocate.zig");
  const Constants = @import("depth.zig").Constants;
@@ -217,58 +236,70 @@ index 3d4470c510f263c030dd36b9b0d4a0dc9f9cc22e..ef7505e8ef6a0a47016ac54de617df67
 +pub const ContextCost = @import("depth.zig").ContextCost;
  
  pub const Cost = alloc.Cost;
++/// Model.shared_cut: a shared round's held drafts priced by the head's chances of this round (Backend.probabilities)
++/// in place of the stream's learned rates (`cut`); `deepen` also drafts every drafting stream's whole block, so the
++/// rows can go to a confident stream's deeper drafts as well as come off a doubtful one's.
++pub const SharedCut = enum { off, cut, deepen };
  
-@@ -33,6 +35,9 @@ pub const Model = struct {
+ /// The class default acceptance by depth (Python DraftDepth.depth_prior).
+ pub const default_prior = [_]f64{ 0.85, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 };
+@@ -33,6 +39,10 @@ pub const Model = struct {
      drafts: u32 = 1, // head drafts a round at most
      window_costs: []const Cost = &.{}, // forward ms by exact window width (timed at load)
      window_costs_lone: bool = false, // window_costs price a lone stream only; shared forwards use shared_costs
 +    context_costs: []const ContextCost = &.{}, // a lone round's prices by the stream's context (depth.zig ContextCost)
 +    depth_from: u64 = 0, // context_costs: shared rounds price a stream's depth past this context (depth.zig Rule.depth_from)
 +    depth_ab: bool = false, // context_costs: A/B tooling, new streams priced by context, by the table, plain in turn (Rule.ab_modes)
++    lone_cut: bool = false, // context_costs: a lone greedy stream at or below depth_from verifies only the held drafts that pay, by the head's chances (Backend.probabilities; depth.zig Rule.cut)
      shared_drafts: u32 = 0, // allocate_shared_drafts: a shared round's most head drafts a stream (0: drafts)
      mtp_step_ms: f64 = 0.0, // one chained head step (timed at load)
      shared_step_ms: ?f64 = null, // a separate shared head step; null keeps mtp_step_ms
-@@ -46,6 +51,7 @@ pub const Model = struct {
+@@ -46,6 +56,8 @@ pub const Model = struct {
      granted_depth: bool = false, // with draft_probabilities: every stream drafts its last grant plus a slack
      draft_slack: u32 = 0, // drafts past a stream's last grant, short or not (0: the Constants' own)
      draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
 +    draft_pass: ?DraftPass = null, // a shared round's drafter pass, priced: its streams draft only where it pays (depth.zig)
++    shared_cut: SharedCut = .off, // draft_pass: a shared round's rows by this round's chances of its greedy streams' drafts (windows.zig allocate)
      copy_first: bool = false, // a copy ahead takes the round: the head holds no drafts for it (a drafter's own pass)
      hold_costs: []const @import("hold_price.zig").HoldCost = &.{}, // a drafter's own hold pass, timed at load
      head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
-@@ -84,6 +90,7 @@ pub const Config = struct {
+@@ -84,6 +96,8 @@ pub const Config = struct {
      fill_match: u32 = 8, // context tokens a suffix-match branch must match (shorter ones are coincidental phrases)
      fill_floor: f64 = 0.35, // the share of grafted rows a stream must keep to go on reading its chain back every round
      draft_streams: bool,
 +    draft_pass: ?DraftPass = null, // Model.draft_pass
++    shared_cut: SharedCut = .off, // Model.shared_cut (off without draft_pass, drafts or several streams)
      head_trees: bool,
      /// a prompt in pieces leaves its last token as the pending row of its first shared round's window
      join_tail: bool = false,
-@@ -102,6 +109,9 @@ pub const Config = struct {
+@@ -102,6 +116,10 @@ pub const Config = struct {
      shared_costs: Table,
      lane_costs: Table, // window ms by rows to 64 (lanes/plan_lanes.zig)
      mtp_step_ms: f64,
 +    context_costs: []const ContextCost = &.{}, // Model.context_costs
 +    depth_from: u64 = 0, // Model.depth_from
 +    depth_ab: bool = false, // Model.depth_ab
++    lone_cut: bool = false, // Model.lone_cut
      draft_step_ms: f64 = 0, // Model.draft_step_ms
      shared_drafts: u32 = 0, // Model.shared_drafts
      lone_cost_tile: u32 = 0, // Model.lone_cost_tile
-@@ -168,6 +178,7 @@ pub const Config = struct {
+@@ -168,6 +186,8 @@ pub const Config = struct {
              .node_probabilities = m.draft_probabilities or m.draft_confidence != null,
              .granted_depth = m.granted_depth and m.draft_probabilities,
              .draft_streams = m.draft_streams,
 +            .draft_pass = m.draft_pass,
++            .shared_cut = if (m.draft_pass != null and m.mtp and streams) m.shared_cut else .off,
              .head_trees = m.head_trees,
              .join_tail = m.join_tail,
              .piece_runs = m.piece_runs,
-@@ -178,6 +189,9 @@ pub const Config = struct {
+@@ -178,6 +198,10 @@ pub const Config = struct {
              .shared_costs = try alloc.extendCosts(gpa, timed.items, batch_rows),
              .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
              .mtp_step_ms = m.mtp_step_ms,
 +            .context_costs = m.context_costs,
 +            .depth_from = m.depth_from,
 +            .depth_ab = m.depth_ab and m.context_costs.len > 0,
++            .lone_cut = m.lone_cut and m.context_costs.len > 0,
              .k = .{
                  .shared_step_ms = m.shared_step_ms,
                  .depth_rate = if (m.depth_rate > 0) m.depth_rate else (Constants{}).depth_rate,
@@ -536,10 +567,19 @@ index 0000000000000000000000000000000000000000..535464face95481267380b700e26fc54
 +    for (0..7) |_| try std.testing.expectEqual(@as(i64, 0), try r.depth(w));
 +}
 diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
-index 018ae4a72ebcde583ef11ce9d3f5625a4a96bb5e..163462796ae9df2fefb3d6c05ef85ecace1e1c01 100644
+index 018ae4a72ebcde583ef11ce9d3f5625a4a96bb5e..9b405fe90996a5f737cdd5ec0e1aca3c6dcec58d 100644
 --- a/zig/src/core/lanes/engine.zig
 +++ b/zig/src/core/lanes/engine.zig
-@@ -70,12 +70,16 @@ pub const Engine = struct {
+@@ -47,6 +47,8 @@ pub const Engine = struct {
+     shared_rounds: u64 = 0,
+     late: @import("late_draft.zig").State = .{},
+     alone: bool = true, // this step has one live stream: its copies may take their ramp
++    shared_open: bool = false, // shared_cut: this shared round may price its streams' drafts by chances (Rule.sharedOpen)
++    live_streams: usize = 0, // the streams live at this step, before the shared round takes its turns
+     lone_kept: [2][lone_costs.bands]?lone_costs.Kept = @splat(@splat(null)), // the newest lone calibrations, greedy then sampled, a band each
+     steps: u64 = 0,
+     grammar_round: @import("grammar_time.zig").Round = .{},
+@@ -70,12 +72,16 @@ pub const Engine = struct {
                  .shared_costs = &cfg.shared_costs,
                  .mtp_step_ms = cfg.mtp_step_ms,
                  .draft_step_ms = cfg.draft_step_ms,
@@ -556,7 +596,40 @@ index 018ae4a72ebcde583ef11ce9d3f5625a4a96bb5e..163462796ae9df2fefb3d6c05ef85eca
              },
          };
      }
-@@ -227,7 +231,7 @@ pub const Engine = struct {
+@@ -138,6 +144,7 @@ pub const Engine = struct {
+             live.shrinkRetainingCapacity(kept);
+         }
+         e.alone = live.items.len == 1;
++        e.live_streams = live.items.len;
+         if (!e.alone) for (live.items) |s| {
+             s.shared_round = true;
+         };
+@@ -200,12 +207,16 @@ pub const Engine = struct {
+     /// One stream's round: verify pending and drafted tokens together, keep drafts to the first mismatch.
+     fn familyRound(e: *Engine, s: *Stream, copied: ?win.Copy) !Result {
+         e.clock.start();
++        if (e.backend.vtable.shared_round) |told| told(e.backend.ptr, false); // a lone round: no chances for left-out streams
+         try e.late.flush(e, Engine.askDrafts);
+         const priced = s.priced;
+         s.priced = null;
+         const a = e.arena.allocator();
+         var plans = [_]Plan{try win.plan(e, s, copied)};
+-        if (plans[0].kind == .head and (e.cfg.node_probabilities or e.trim != null or lone_costs.enabled(e, plans[0]))) try win.allocate(e, &plans);
++        const lone_cut = if (plans[0].kind == .head and (e.cfg.node_probabilities or e.trim != null or lone_costs.enabled(e, plans[0]))) c: {
++            try win.allocate(e, &plans);
++            break :c null;
++        } else try win.cutLone(e, &plans[0]);
+         try win.constrain(e, &plans[0]);
+         const plan = plans[0];
+         const early = e.cfg.family_mtp and s.drafts and plan.kind != .forced and e.cfg.speculate_early and plan.parents == null and s.grammar == null;
+@@ -222,16 +233,19 @@ pub const Engine = struct {
+             if (early and o.cut == null) {
+                 var w = win.who(s);
+                 const d: u32 = @intCast(try e.rule.headDepth(&w, null, win.probe(e)));
++                s.asked = d;
++                s.deepened = false;
+                 try e.askDrafts(&.{.{ .stream = s, .follow = o.follow, .rows = o.path, .start = plan.position, .position = s.cache_len + 1, .depth = d, .early = true }});
+             } else {
                  if (early) if (e.backend.vtable.unspeculate) |undo| try undo(e.backend.ptr, s);
                  try e.draftLate(s, plan.position, o.follow, o.path, null);
              }
@@ -565,7 +638,12 @@ index 018ae4a72ebcde583ef11ce9d3f5625a4a96bb5e..163462796ae9df2fefb3d6c05ef85eca
                  const ms = e.clock.elapsedMs(.cost);
                  const first = s.rounds == 1; // a stream's first round carries the prefill-to-decode switch
                  try trail.event(e, &.{ f("ev", str("cost")), f("stream", str(s.id)), f("drafts", int(rows - 1)), f("init", .{ .bool = first }), f("ms", ev.bits(ms)) });
-@@ -248,7 +252,7 @@ pub const Engine = struct {
+                 try e.rule.observeCost(@intCast(rows - 1), ms, first, win.who(s));
++                if (lone_cut != null and !first) e.rule.observeCut(@intCast(rows - 1), ms, plan.position);
+                 lone_costs.observe(s, plan.cost_probe_rows, rows, ms);
+             }
+         }
+@@ -248,7 +262,7 @@ pub const Engine = struct {
          if (e.cfg.timed and plan.kind == .head) {
              const ms = e.clock.elapsedMs(.overhead);
              try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(1)), f("rows", int(rows)), f("ms", ev.bits(ms)) });
@@ -574,7 +652,39 @@ index 018ae4a72ebcde583ef11ce9d3f5625a4a96bb5e..163462796ae9df2fefb3d6c05ef85eca
          }
          if (e.backend.round_observer != null) e.backend.observed(&.{o.path});
          return .{ .rows = @intCast(rows), .keep = @intCast(o.path.len), .got = o.got };
-@@ -319,7 +323,12 @@ pub const Engine = struct {
+@@ -259,6 +273,9 @@ pub const Engine = struct {
+         e.clock.start();
+         try e.late.flush(e, Engine.askDrafts);
+         const a = e.arena.allocator();
++        e.shared_open = e.cfg.shared_cut != .off and entries.len >= 2 and e.rule.sharedOpen(e.live_streams);
++        if (e.backend.vtable.shared_round) |told| told(e.backend.ptr, e.shared_open);
++        defer e.shared_open = false;
+         const plans = try a.alloc(Plan, entries.len);
+         for (entries, plans) |s, *p| p.* = try win.plan(e, s, null);
+         try win.allocate(e, plans);
+@@ -301,11 +318,19 @@ pub const Engine = struct {
+             const requests = try a.alloc(be.DraftRequest, heads.items.len);
+             for (requests, heads.items, budgets) |*r, i, d| {
+                 const s = plans[i].stream;
+-                r.* = .{ .stream = s, .follow = outcomes[i].follow, .rows = outcomes[i].path, .start = plans[i].position, .position = s.cache_len + 1, .depth = @intCast(d) };
++                s.asked = @intCast(@max(0, d));
++                const depth_asked = e.deepened(s, d);
++                s.deepened = depth_asked > d;
++                r.* = .{ .stream = s, .follow = outcomes[i].follow, .rows = outcomes[i].path, .start = plans[i].position, .position = s.cache_len + 1, .depth = @intCast(depth_asked) };
+             }
+             try e.askDrafts(requests);
+         } else {
+-            for (heads.items, budgets) |i, d| try e.draftLate(plans[i].stream, plans[i].position, outcomes[i].follow, outcomes[i].path, d);
++            for (heads.items, budgets) |i, d| {
++                plans[i].stream.asked = @intCast(@max(0, d));
++                const depth_asked = e.deepened(plans[i].stream, d);
++                plans[i].stream.deepened = depth_asked > d;
++                try e.draftLate(plans[i].stream, plans[i].position, outcomes[i].follow, outcomes[i].path, depth_asked);
++            }
+         }
+         if (e.cfg.root_copies) for (heads.items, budgets) |i, *d| {
+             if (plans[i].stream.next) |held| if (held.count == 0) {
+@@ -319,11 +344,28 @@ pub const Engine = struct {
              for (budgets) |d| steps = if (e.cfg.draft_streams and depth.pricedBatched()) @max(steps, d - 1) else steps + @max(0, d - 1);
              const ms = e.clock.elapsedMs(.overhead) - e.cfg.draft_step_ms * @as(f64, @floatFromInt(steps));
              try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(plans.len)), f("rows", int(total)), f("ms", ev.bits(ms)) });
@@ -584,11 +694,44 @@ index 018ae4a72ebcde583ef11ce9d3f5625a4a96bb5e..163462796ae9df2fefb3d6c05ef85eca
 +            if (e.cfg.context_costs.len > 0) for (plans, windows) |p, w| {
 +                depth_ms += try e.rule.streamDepthMs(win.who(p.stream), @intCast(w.rows() - 1));
 +            };
-+            try e.rule.observeOverheadAt(@intCast(plans.len), total, ms, sampled, e.rule.headMs(budgets), depth_ms);
++            // shared_cut: a round whose drafts were all cut after the pass ran for their chances is neither a plain
++            // round (it paid the pass and the read) nor a drafted one (it verified none): not timed
++            var priced = false;
++            for (plans) |p| priced = priced or p.chance_priced;
++            if (!(priced and total == plans.len)) try e.rule.observeOverheadAt(@intCast(plans.len), total, ms, sampled, e.rule.headMs(budgets), depth_ms);
          }
          if (e.backend.round_observer != null) e.backend.observed(paths);
      }
-@@ -395,6 +404,14 @@ pub const Engine = struct {
+ 
++    /// shared_cut `deepen`: a drafting greedy stream of a shared round at or below depth_from drafts its whole block (as
++    /// deep as its room lets), and the next round's allocation verifies the prefix its chances pay for; else the budget.
++    fn deepened(e: *const Engine, s: *const Stream, d: i64) i64 {
++        if (e.cfg.shared_cut != .deepen or !e.shared_open or d <= 0 or s.sampling != null or s.grammar != null) return d;
++        if (e.cfg.context_costs.len > 0 and s.cache_len > e.cfg.depth_from) return d; // past it the depth rule's ramp holds
++        return @max(d, @min(@as(i64, e.cfg.most_drafts), s.draftRoom() - 1));
++    }
++
+     /// Commit the target-sampled path (after the thinking budget's cut), each token with its path row's logprob row.
+     fn conclude(e: *Engine, s: *Stream, p: Plan, sampled: []const u32, rows_lp: []const LogRow, tokens: []const u32, parents: []const i32, positions: []const u64) !Outcome {
+         const a = e.arena.allocator();
+@@ -363,7 +405,15 @@ pub const Engine = struct {
+                     const chain = if (p.branch_from > 0) ds[0..p.branch_from] else ds[0..own_end];
+                     var chain_kept: usize = 0;
+                     for (path[1..]) |r| chain_kept += @intFromBool((p.branch_from == 0 or r < p.branch_from) and r < own_end);
+-                    try e.rule.observeDepth(win.who(s), std.mem.max(u32, chain), @intCast(chain_kept));
++                    const verified = std.mem.max(u32, chain);
++                    if (!p.chance_priced) {
++                        try e.rule.observeDepth(win.who(s), verified, @intCast(chain_kept));
++                    } else if (s.asked > 0 and verified >= s.asked) {
++                        // shared_cut: a chain cut short of what the rule asked says nothing of the drafts it cut (they
++                        // were the unlikely ones), so the rates learn only from rounds that verified the rule's depth,
++                        // as far as it; drafting every round is then the rates' doing and the chances pick the rows
++                        try e.rule.observeDepth(win.who(s), s.asked, @intCast(@min(chain_kept, s.asked)));
++                    }
+                 }
+                 var kept_branch: u64 = 0; // the context's graft rows kept, then Recall's
+                 var kept_recall: u64 = 0;
+@@ -395,6 +445,14 @@ pub const Engine = struct {
                  }
              }
              if (s.recall) |r| if (p.kind != .copy) r.noteHead(path.len); // its own rounds: the bar a copy must beat
@@ -603,6 +746,17 @@ index 018ae4a72ebcde583ef11ce9d3f5625a4a96bb5e..163462796ae9df2fefb3d6c05ef85eca
          }
          if (e.trim) |t| if (p.kind != .forced) {
              const chain = parents.len == 0 or accept.isChain(parents);
+@@ -443,6 +501,10 @@ pub const Engine = struct {
+     fn draftLate(e: *Engine, s: *Stream, start: u64, follow: []const u32, path: []const u32, budget: ?i64) !void {
+         var w = win.who(s);
+         const d: u32 = @intCast(try e.rule.headDepth(&w, budget, win.probe(e)));
++        if (budget == null) {
++            s.asked = d; // a lone round's draft: the rule's own depth
++            s.deepened = false;
++        }
+         const request: be.DraftRequest = .{ .stream = s, .follow = follow, .rows = path, .start = start, .position = s.cache_len + 1, .depth = d };
+         if (!e.late.put(e.backend.defer_lone_draft and e.alone, request)) try e.askDrafts(&.{request});
+     }
 diff --git a/zig/src/core/lanes/engine_test.zig b/zig/src/core/lanes/engine_test.zig
 index 6c731c519eb277e51ef37329352cf1b86daa1fc6..b6628518aedcad703676041985c496dd6e35ef4b 100644
 --- a/zig/src/core/lanes/engine_test.zig
@@ -808,8 +962,791 @@ index b65460b626d96bf1f3cb04a41adbe7554924f775..fcfb64874709ec7fb76345a13c3055e8
      const prepared = try prepare(e, p);
      var profile: timing.Profile = .{ .clock = e.clock };
      defer timing.record(e, p.stream, profile);
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 34073e2e6ef74594d6dfa157e9193931e62d9549..004367e4c55c18ed771980d48bad472a9bbb6518 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -86,9 +86,11 @@ test {
+     _ = @import("lone_costs_test.zig");
+     _ = @import("depth_floor_test.zig");
+     _ = @import("lone_backoff_test.zig");
++    _ = @import("lone_cut_test.zig");
+     _ = @import("fill_test.zig");
+     _ = @import("fill_trim_test.zig");
+     _ = @import("fair_turns_test.zig");
++    _ = @import("shared_cut_test.zig");
+     _ = @import("copied_rate_test.zig");
+     _ = @import("granted_reservation_test.zig");
+     _ = @import("rollback_test.zig");
+diff --git a/zig/src/core/lanes/lone_cut_test.zig b/zig/src/core/lanes/lone_cut_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..c45e9c8d59a444300088b81942d4471bd0640726
+--- /dev/null
++++ b/zig/src/core/lanes/lone_cut_test.zig
+@@ -0,0 +1,292 @@
++//! lone_cut (depth.zig Rule.cut, windows.zig cutLone): a lone greedy stream at or below depth_from verifies the prefix
++//! of its held drafts that the head's chances price best; shared rounds, sampled, grammar and deeper streams are not
++//! touched, and every stream commits the same tokens as without it.
++const std = @import("std");
++const lanes = @import("lanes.zig");
++const fake = lanes.fake;
++const depth = lanes.depth;
++const win = lanes.windows;
++const engine_test = @import("engine_test.zig");
++
++const gpa = std.testing.allocator;
++
++/// A head's chances as the hook gives them (each draft's own; the hook returns their running product), and what the
++/// test saw: calls, calls outside a lone round, the deepest context a call came at, the streams it was asked for.
++var hook: struct {
++    chance: f64 = 0.0,
++    give: bool = true,
++    calls: usize = 0,
++    shared_calls: usize = 0,
++    deepest: u64 = 0,
++    engine: ?*lanes.Engine = null,
++} = .{};
++
++fn chances(_: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
++    hook.calls += 1;
++    if (hook.engine) |e| hook.shared_calls += @intFromBool(!e.alone);
++    hook.deepest = @max(hook.deepest, s.cache_len);
++    if (!hook.give) return false;
++    var product: f64 = 1;
++    for (out) |*o| {
++        product *= hook.chance;
++        o.* = product;
++    }
++    return true;
++}
++
++/// Prices by context (two nodes: windows rising 0.8 ms a row over a 6 ms base, a 2 ms draft) and `depth_from`.
++const window_ms = [_]f64{ 5.8, 6.6, 7.4, 8.2, 9.0, 9.8, 10.6, 11.4 };
++const nodes = [_]depth.ContextCost{
++    .{ .context = 8, .window_ms = &window_ms, .draft_ms = 2.0 },
++    .{ .context = 1 << 20, .window_ms = &window_ms, .draft_ms = 2.0 },
++};
++
++const Run = struct {
++    tokens: []u32,
++    by_drafts: [lanes.stream.depth_buckets]u32, // rounds by drafts verified (Stream.depth_rounds), every stream's
++};
++
++/// The cases admitted together and stepped until done, with the hook on the fake target and `cut` the fact.
++fn run(cases: []const engine_test.Case, cut: bool, depth_from: u64) ![]Run {
++    return runWith(cases, cut, depth_from, .{});
++}
++
++/// `run`'s options: every stream in the cut arm (Stream.cut_arm, A/B tooling), and a look at the engine once done.
++const With = struct {
++    cut_arm: bool = false,
++    done: ?*const fn (*lanes.Engine) anyerror!void = null,
++};
++
++fn runWith(cases: []const engine_test.Case, cut: bool, depth_from: u64, with: With) ![]Run {
++    var costs: [16]lanes.config.Cost = undefined;
++    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 0.8 * @as(f64, @floatFromInt(w)) };
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 16, .gpu_tokens = true, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 7, .window_costs = &costs, .mtp_step_ms = 0.5, .hidden_rows = true, .batch_rows = 32, .max_streams = 8, .draft_streams = true, .context_costs = &nodes, .depth_from = depth_from, .lone_cut = cut }, 16, 15);
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var b = target.backend();
++    var vt = b.vtable.*;
++    vt.probabilities = chances;
++    b.vtable = &vt;
++    var clock: fake.FixedClock = .{};
++    var engine = lanes.Engine.init(gpa, &cfg, b, clock.clock());
++    defer engine.deinit();
++    hook.engine = &engine;
++    defer hook.engine = null;
++    const streams = try gpa.alloc(lanes.Stream, cases.len);
++    defer gpa.free(streams);
++    const classes = try gpa.alloc(engine_test.Classes, cases.len);
++    defer gpa.free(classes);
++    const constraints = try gpa.alloc(lanes.grammar.Constraint, cases.len);
++    defer gpa.free(constraints);
++    for (cases, streams, classes, constraints) |c, *s, *g, *k| {
++        if (c.classes) |given| {
++            g.* = given;
++            k.* = .init(g.rules(), (fake.vocab + 31) / 32, given.after);
++        }
++        s.* = try lanes.Stream.init(gpa, .{ .id = "cut", .prompt = c.prompt, .max_new = c.max_new, .eos = c.eos, .sampling = c.sampling, .drafts = c.drafts, .grammar = if (c.classes != null) k else null });
++    }
++    defer for (streams) |*s| s.deinit(gpa);
++    for (streams) |*s| s.cut_arm = with.cut_arm;
++    for (streams) |*s| try engine.addStream(s);
++    while (engine.activeCount() > 0) try engine.step();
++    if (with.done) |look| try look(&engine);
++    const out = try gpa.alloc(Run, cases.len);
++    for (out, streams) |*o, *s| o.* = .{ .tokens = try gpa.dupe(u32, s.emitted()), .by_drafts = s.depth_rounds };
++    return out;
++}
++
++fn free(runs: []Run) void {
++    for (runs) |r| gpa.free(r.tokens);
++    gpa.free(runs);
++}
++
++fn reset(chance: f64, give: bool) void {
++    hook = .{ .chance = chance, .give = give };
++}
++
++/// Rounds that verified more than one draft.
++fn wide(r: Run) u32 {
++    var n: u32 = 0;
++    for (r.by_drafts[2..]) |x| n += x;
++    return n;
++}
++
++const long_prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3 };
++
++test "lone cut: off, no hook call; on, the same tokens with only the drafts that pay verified" {
++    const cases = [_]engine_test.Case{.{ .prompt = &.{ 3, 1, 4 }, .max_new = 120, .eos = &.{} }};
++    reset(0.0, true);
++    const off = try run(&cases, false, 1 << 15);
++    defer free(off);
++    try std.testing.expectEqual(@as(usize, 0), hook.calls);
++    try std.testing.expect(wide(off[0]) > 0); // the depth rule holds chains of several drafts
++    reset(0.0, true); // no draft looks likely: the cut keeps one, never none
++    const low = try run(&cases, true, 1 << 15);
++    defer free(low);
++    try std.testing.expect(hook.calls > 0);
++    try std.testing.expectEqualSlices(u32, off[0].tokens, low[0].tokens);
++    try std.testing.expectEqual(@as(u32, 0), wide(low[0]));
++    try std.testing.expect(low[0].by_drafts[1] > 0);
++    reset(1.0, true); // every draft certain: nothing cut
++    const high = try run(&cases, true, 1 << 15);
++    defer free(high);
++    try std.testing.expectEqualSlices(u32, off[0].tokens, high[0].tokens);
++    try std.testing.expect(wide(high[0]) > 0);
++    reset(0.0, false); // a hook without chances: the window stays whole, the rounds as without the fact
++    const none = try run(&cases, true, 1 << 15);
++    defer free(none);
++    try std.testing.expect(hook.calls > 0);
++    try std.testing.expectEqualSlices(u32, off[0].tokens, none[0].tokens);
++    try std.testing.expectEqualSlices(u32, &off[0].by_drafts, &none[0].by_drafts);
++}
++
++test "lone cut: shared rounds never ask the hook, and every stream commits what it commits without the fact" {
++    const cases = [_]engine_test.Case{ .{ .prompt = &.{ 3, 1, 4 }, .max_new = 60, .eos = &.{} }, .{ .prompt = &.{ 2, 7, 1, 8 }, .max_new = 60, .eos = &.{} }, .{ .prompt = &.{ 5, 5, 5 }, .max_new = 60, .eos = &.{} } };
++    reset(0.0, true);
++    const off = try run(&cases, false, 1 << 15);
++    defer free(off);
++    reset(0.0, true);
++    const on = try run(&cases, true, 1 << 15);
++    defer free(on);
++    try std.testing.expectEqual(@as(usize, 0), hook.shared_calls);
++    for (off, on) |x, y| try std.testing.expectEqualSlices(u32, x.tokens, y.tokens);
++}
++
++test "lone cut: sampled, grammar and deeper streams never ask the hook" {
++    reset(0.0, true);
++    const sampled = [_]engine_test.Case{.{ .prompt = &.{ 3, 1, 4 }, .max_new = 60, .sampling = .{ .temperature = 0.8, .seed = 7 }, .eos = &.{} }};
++    const s = try run(&sampled, true, 1 << 15);
++    defer free(s);
++    try std.testing.expectEqual(@as(usize, 0), hook.calls);
++    const shaped = [_]engine_test.Case{.{ .prompt = &.{ 3, 1, 4 }, .max_new = 30, .classes = .{} }};
++    const g = try run(&shaped, true, 1 << 15);
++    defer free(g);
++    try std.testing.expectEqual(@as(usize, 0), hook.calls);
++    const deep = [_]engine_test.Case{.{ .prompt = &long_prompt, .max_new = 60, .eos = &.{} }};
++    const d = try run(&deep, true, long_prompt.len - 1);
++    defer free(d);
++    try std.testing.expectEqual(@as(usize, 0), hook.calls);
++    reset(0.0, true);
++    const plain = try run(&deep, false, long_prompt.len - 1);
++    defer free(plain);
++    try std.testing.expectEqualSlices(u32, plain[0].tokens, d[0].tokens);
++    try std.testing.expectEqualSlices(u32, &plain[0].by_drafts, &d[0].by_drafts);
++}
++
++test "lone cut: a stream crossing depth_from mid-reply is cut up to it and not past it" {
++    const cases = [_]engine_test.Case{.{ .prompt = &long_prompt, .max_new = 120, .eos = &.{} }};
++    const from = long_prompt.len + 40;
++    reset(0.0, true);
++    const off = try run(&cases, false, from);
++    defer free(off);
++    reset(0.0, true);
++    const on = try run(&cases, true, from);
++    defer free(on);
++    try std.testing.expect(hook.calls > 0);
++    try std.testing.expect(hook.deepest <= from);
++    try std.testing.expectEqualSlices(u32, off[0].tokens, on[0].tokens);
++    try std.testing.expect(wide(on[0]) > 0); // past depth_from the rule's chains are verified whole again
++}
++
++fn rule(nodes_: []const depth.ContextCost) depth.Rule {
++    const T = @typeInfo(@FieldType(depth.Rule, "family_costs")).pointer.child;
++    const empty = struct {
++        var t: T = .{};
++    };
++    return .{ .gpa = gpa, .prior = &.{0.8}, .most_drafts = 7, .family_costs = &empty.t, .shared_costs = &empty.t, .mtp_step_ms = 0, .plain_guard = false, .node_probabilities = false, .batch_rows = 8, .context_costs = nodes_, .depth_from = 1 << 15 };
++}
++
++test "lone cut: the cut verifies one draft at least and never more than it holds" {
++    var r = rule(&nodes);
++    defer r.deinit();
++    try std.testing.expectEqual(@as(usize, 1), r.cut(&.{ 0, 0, 0, 0, 0, 0, 0 }, 100));
++    try std.testing.expectEqual(@as(usize, 7), r.cut(&.{ 1, 1, 1, 1, 1, 1, 1 }, 100));
++    try std.testing.expectEqual(@as(usize, 3), r.cut(&.{ 1, 1, 1 }, 100));
++    try std.testing.expectEqual(@as(usize, 1), r.cut(&.{0.0}, 100));
++    // a first draft at 0.95 and the second at 0.10 of it: one more row (0.8 ms) is worth 0.095 tokens, under the
++    // round's rate (1.95 / 8.6 ms = 0.23 a ms)
++    try std.testing.expectEqual(@as(usize, 1), r.cut(&.{ 0.95, 0.095, 0.01 }, 100));
++    try std.testing.expectEqual(@as(usize, 2), r.cut(&.{ 0.95, 0.9, 0.05 }, 100));
++    var unpriced = rule(&.{});
++    defer unpriced.deinit();
++    try std.testing.expectEqual(@as(usize, 4), unpriced.cut(&.{ 0, 0, 0, 0 }, 100)); // no prices: nothing cut
++}
++
++test "lone cut: prices are the windows' line in rows plus the draft, and one slow round moves them under 1 ms" {
++    // a noisy node: rows 2 .. 8 lie on 40 + 4 r except the 6-row window, 3 ms dear
++    const noisy = [_]f64{ 30, 48, 52, 56, 60, 67, 68, 72 };
++    const n = [_]depth.ContextCost{.{ .context = 600, .window_ms = &noisy, .draft_ms = 8 }};
++    var r = rule(&n);
++    defer r.deinit();
++    const line = struct {
++        fn at(d: f64) f64 {
++            return 40 + 4 * (d + 1) + 8 + 3.0 / 7.0 + (3.0 * (5 - 4) * (d - 4)) / 28.0; // least squares through the bump
++        }
++    }.at;
++    for (1..8) |d| try std.testing.expectApproxEqAbs(line(@floatFromInt(d)), r.cutPrice(@intCast(d), 600).?, 1e-9);
++    try std.testing.expectEqual(@as(?f64, null), r.cutPrice(0, 600));
++    const before = r.cutPrice(4, 600).?;
++    r.observeCut(4, 3 * before, 600);
++    const after = r.cutPrice(4, 600).?;
++    try std.testing.expect(after - before > 0 and after - before < 1.0);
++    for (1..8) |d| try std.testing.expectApproxEqAbs(after - before, r.cutPrice(@intCast(d), 600).? - line(@floatFromInt(d)), 1e-9);
++    // rounds 1.5 ms past their price: the figure settles there
++    for (0..80) |i| r.observeCut(@intCast(1 + i % 7), line(@floatFromInt(1 + i % 7)) + 1.5, 600);
++    try std.testing.expectApproxEqAbs(1.5, r.cutPrice(3, 600).? - line(3), 1e-6);
++}
++
++test "lone cut a/b: each arm's round times price its own streams alone" {
++    var fc: lanes.table.Table = .{};
++    defer fc.deinit(gpa);
++    for (1..9) |w| try fc.put(gpa, @intCast(w), 10 + @as(f64, @floatFromInt(w)));
++    var r: depth.Rule = .{ .gpa = gpa, .prior = &.{ 0.8, 0.8, 0.8 }, .most_drafts = 3, .family_costs = &fc, .shared_costs = &fc, .mtp_step_ms = 0, .plain_guard = false, .node_probabilities = false, .batch_rows = 8 };
++    defer r.deinit();
++    var states: [4]?depth.State = @splat(null);
++    defer for (&states) |*s| if (s.*) |*x| x.deinit(gpa);
++    const whole: depth.Who = .{ .state = &states[0], .draft_room = 8, .finished = false, .forced = false };
++    const whole_sampled: depth.Who = .{ .state = &states[1], .draft_room = 8, .finished = false, .forced = false, .sampled = true };
++    const cut: depth.Who = .{ .state = &states[2], .draft_room = 8, .finished = false, .forced = false, .cut_arm = true };
++    const cut_sampled: depth.Who = .{ .state = &states[3], .draft_room = 8, .finished = false, .forced = false, .sampled = true, .cut_arm = true };
++    // nothing timed: every stream prices two drafts by the table (a window of 3 rows, 13 ms)
++    for ([_]depth.Who{ whole, whole_sampled, cut, cut_sampled }) |w| try std.testing.expectEqual(@as(?f64, 13), try r.roundCost(2, w));
++    // a cut-arm round (its draft flushed early: slower) prices its arm's streams, greedy and sampled, and no other
++    try r.observeCost(2, 40, false, cut);
++    try std.testing.expectEqual(@as(?f64, 40), try r.roundCost(2, cut));
++    try std.testing.expectEqual(@as(?f64, 40), try r.roundCost(2, cut_sampled));
++    try std.testing.expectEqual(@as(?f64, 13), try r.roundCost(2, whole));
++    try std.testing.expectEqual(@as(?f64, 13), try r.roundCost(2, whole_sampled));
++    // and a whole-arm round its own, as a stream outside the A/B prices
++    try r.observeCost(2, 20, false, whole);
++    try std.testing.expectEqual(@as(?f64, 20), try r.roundCost(2, whole));
++    try std.testing.expectEqual(@as(?f64, 20), try r.roundCost(2, whole_sampled));
++    try std.testing.expectEqual(@as(?f64, 40), try r.roundCost(2, cut));
++    try std.testing.expectEqual(@as(?f64, 20), try r.roundCost(2, null));
++}
++
++test "lone cut a/b: a cut round crossing depth_from leaves the whole arm's deep prices as they were" {
++    // a cut-arm stream from below depth_from to just past it: cut rounds up to depth_from, the last of them ending
++    // past it (timed at the context it ends at, so priced by context), then a few deep rounds
++    const from = long_prompt.len + 40;
++    const cases = [_]engine_test.Case{.{ .prompt = &long_prompt, .max_new = 46, .eos = &.{} }};
++    const look = struct {
++        fn done(e: *lanes.Engine) !void {
++            // a whole-arm stream's next price past depth_from: the price at its context, nothing learned on top
++            var st: ?depth.State = null;
++            defer if (st) |*x| x.deinit(gpa);
++            const whole: depth.Who = .{ .state = &st, .draft_room = 8, .finished = false, .forced = false, .context = from + 8 };
++            var d: i64 = 0;
++            while (d < 7) : (d += 1) try std.testing.expectEqual(depth.priceAt(&nodes, d, from + 8), try e.rule.roundCost(d, whole));
++            // the whole arm's deep table untouched; the cut arm's rounds past depth_from timed in its own
++            for (e.rule.context_ms.slots) |x| try std.testing.expectEqual(@as(?f64, null), x);
++            var timed: usize = 0;
++            for (e.rule.cut_arm_context_ms.slots) |x| timed += @intFromBool(x != null);
++            try std.testing.expect(timed > 0);
++        }
++    };
++    reset(0.0, true);
++    const runs = try runWith(&cases, true, from, .{ .cut_arm = true, .done = look.done });
++    defer free(runs);
++    try std.testing.expect(hook.calls > 0 and hook.deepest <= from); // cut up to depth_from
++    try std.testing.expect(long_prompt.len + runs[0].tokens.len > from + 1); // and past it
++}
+diff --git a/zig/src/core/lanes/open.zig b/zig/src/core/lanes/open.zig
+index 684ab6b10bad7029145eb840dc8cb8d7dd527dd9..c382fa3f3ee907e1d92b587776419bd74694e11f 100644
+--- a/zig/src/core/lanes/open.zig
++++ b/zig/src/core/lanes/open.zig
+@@ -111,6 +111,8 @@ fn openedCommitted(e: *Engine, s: *Stream, reach: Reach, hook: ?be.Committed) !v
+         const requests = try @import("root_copy.zig").prepare(e, &.{.{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = wanted }});
+         var d = requests[0].depth;
+         asked = d;
++        s.asked = d; // the first block's budget (shared_cut's feed rule reads it)
++        s.deepened = false;
+         try e.backend.draftIn(e.arena.allocator(), requests);
+         if (e.backend.proposals()) d = requests[0].heldDepth(e.backend);
+         s.dropHeld(e.gpa);
+diff --git a/zig/src/core/lanes/open_first.zig b/zig/src/core/lanes/open_first.zig
+index efb79d5bfe6ac2dfa63f5f96ad5d22a1da46526b..33f72520e7b5122e50b3bdb9fae00dd9ef7f4197 100644
+--- a/zig/src/core/lanes/open_first.zig
++++ b/zig/src/core/lanes/open_first.zig
+@@ -57,6 +57,8 @@ pub fn opened(e: *Engine, s: *Stream, reach: open.Reach, hook: ?be.Committed) !v
+     };
+     s.dropHeld(e.gpa);
+     s.next = .{ .count = requests[0].heldDepth(e.backend) };
++    s.asked = requests[0].depth; // the first block's budget (shared_cut's feed rule reads it)
++    s.deepened = false;
+     if (requests[0].heldDepth(e.backend) > 0) if (e.backend.vtable.tree) |tree| if (try tree(e.backend.ptr, s, e.gpa)) |held| {
+         s.next = held;
+     };
+diff --git a/zig/src/core/lanes/pieces.zig b/zig/src/core/lanes/pieces.zig
+index 72210cc19f421179f73bbd92b3138be8ec7d4d47..ef721a604c494b414ea610c62cd0fee82ad5e64b 100644
+--- a/zig/src/core/lanes/pieces.zig
++++ b/zig/src/core/lanes/pieces.zig
+@@ -118,6 +118,8 @@ fn joined(e: *Engine, s: *Stream) !void {
+     try e.backend.draftIn(e.arena.allocator(), &.{.{ .stream = s, .follow = &.{}, .first = .{ .value = last }, .rows = null, .start = s.cache_len, .position = position, .depth = d }});
+     s.dropHeld(e.gpa);
+     s.next = .{ .count = if (e.backend.proposals()) s.proposal_depth orelse d else d };
++    s.asked = d; // the first block's budget (shared_cut's feed rule reads it)
++    s.deepened = false;
+     try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(d)), f("position", int(position)), f("follow", .{ .u32s = &.{last} }), f("rows", .null) });
+     try trail.resolve(e);
+     try e.live.append(e.gpa, s);
+@@ -128,6 +130,8 @@ fn joinedDrafted(e: *Engine, r: be.DraftRequest) !void {
+     const s = r.stream;
+     s.dropHeld(e.gpa);
+     s.next = .{ .count = r.heldDepth(e.backend) };
++    s.asked = r.depth; // the first block's budget (shared_cut's feed rule reads it)
++    s.deepened = false;
+     try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(r.depth)), f("position", int(r.position)), f("follow", .{ .u32s = &.{s.pending.?} }), f("rows", .null) });
+     try trail.resolve(e);
+     try e.live.append(e.gpa, s);
+diff --git a/zig/src/core/lanes/shared_cut_test.zig b/zig/src/core/lanes/shared_cut_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..92b665f5aa5443be82303d731824298d81d45d4e
+--- /dev/null
++++ b/zig/src/core/lanes/shared_cut_test.zig
+@@ -0,0 +1,415 @@
++//! shared_cut (windows.zig sharedChances, Engine.deepened): a shared round's greedy streams' held drafts priced by this
++//! round's chances (Backend.probabilities) in place of the learned rates; `deepen` drafts each drafting greedy stream's
++//! whole block. Off: no chances asked; lone, sampled and grammar streams never ask; every stream's tokens are the same.
++const std = @import("std");
++const lanes = @import("lanes.zig");
++const fake = lanes.fake;
++const depth = lanes.depth;
++const SharedCut = lanes.config.SharedCut;
++const t = std.testing;
++const a = t.allocator;
++
++var hook: struct { chance: f64 = 0.5, calls: usize = 0, sampled_calls: usize = 0, lone_calls: usize = 0, wide_calls: usize = 0, deny_after: ?usize = null, engine: ?*lanes.Engine = null } = .{};
++
++fn chances(_: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
++    hook.calls += 1;
++    if (s.sampling != null) hook.sampled_calls += 1;
++    if (hook.engine) |e| hook.lone_calls += @intFromBool(e.alone);
++    if (hook.engine) |e| hook.wide_calls += @intFromBool(e.activeCount() > 4);
++    if (hook.deny_after) |n| if (hook.calls > n) return false; // the chances lost (as a prefill's flush drops them)
++    var product: f64 = 1;
++    for (out) |*o| {
++        product *= hook.chance;
++        o.* = product;
++    }
++    return true;
++}
++
++/// Transitions the runs take: stream 1's reply length (null: 48 like the others), a stream that joins after this many
++/// steps (null: none), and a prior that makes the rule's budgets short (one or two drafts) while the chances are high.
++var short_for_test: ?u32 = null;
++var join_for_test: ?usize = null;
++var low_prior_for_test = false;
++/// The runs timed by the fake clock (rounds learn their overheads), else untimed.
++var timed_for_test = false;
++/// Windows of rounds that do not price by chances (lone, or 5 or more live streams) and how many verified more held
++/// drafts than the stream's budget (`Stream.asked`): what v0.2 would not have verified there.
++var watch: struct { orig: ?*const fn (ptr: *anyopaque, windows: []const lanes.backend.Window, out: []lanes.backend.Verified) anyerror!void = null, checked: usize = 0, past_budget: usize = 0, checked_unpriced: usize = 0, past_budget_unpriced: usize = 0 } = .{};
++/// From this many chance reads on, every read gives none (null: never).
++var deny_for_test: ?usize = null;
++
++fn verifyWatched(ptr: *anyopaque, windows: []const lanes.backend.Window, out: []lanes.backend.Verified) anyerror!void {
++    if (hook.engine) |e| {
++        const denied = hook.deny_after != null and hook.calls > hook.deny_after.?;
++        for (windows) |w| {
++            if (w.stream.asked == 0 or w.held == 0) continue;
++            if (!e.shared_open) {
++                watch.checked += 1;
++                watch.past_budget += @intFromBool(w.held > w.stream.asked);
++            } else if (denied) {
++                // a chance-open round whose chances are gone: its streams' blocks priced by the rates, within the budget
++                watch.checked_unpriced += 1;
++                watch.past_budget_unpriced += @intFromBool(w.held > w.stream.asked);
++            }
++        }
++    }
++    return watch.orig.?(ptr, windows, out);
++}
++
++/// The backend's view of each round (Backend.shared_round), and the chance reads a backend that runs left-out streams'
++/// deferred drafts would make, mirrored from cuda_lanes.zig's verifyFn: it reads them only when the round is open.
++var told: struct { open: usize = 0, closed: usize = 0, wide_open: usize = 0, lone_open: usize = 0, left_out_reads: usize = 0 } = .{};
++
++fn sharedRound(_: *anyopaque, open: bool) void {
++    if (open) told.open += 1 else told.closed += 1;
++    const e = hook.engine orelse return;
++    if (open and e.live_streams > 4) told.wide_open += 1;
++    if (open and e.alone) told.lone_open += 1;
++    // the CUDA flush of a left-out stream's deferred draft reads its chances exactly when `open` (leftOutChances)
++    if (open and e.live_streams > e.cfg.batch_streams) told.left_out_reads += 1;
++}
++
++/// The rounds' stream limit the runs take (null: the model's).
++var turns_for_test: ?u32 = null;
++
++const prompts = [_][]const u32{ &.{ 3, 1, 4 }, &.{ 1, 5, 9 }, &.{ 2, 6, 5 }, &.{ 3, 5, 8 }, &.{ 9, 7, 9 }, &.{ 3, 2, 3 } };
++const Run = struct { tokens: [6][]u32, record: [32]u8 = undefined, drafted: u64, rounds: u64, calls: usize, sampled_calls: usize, lone_calls: usize, wide_calls: usize = 0, rate: f64 = -1, prior: f64 = 0, plain_overheads: usize = 0 };
++
++/// `count` streams together (stream `sampled_at` sampled), stepped until done, the fact `cut`, the hook's `chance`.
++fn run(count: usize, cut: SharedCut, chance: f64, sampled_at: ?usize) !Run {
++    return runAt(count, cut, chance, sampled_at, null);
++}
++
++/// `run` with context prices and `depth_from` (null: none).
++fn runAt(count: usize, cut: SharedCut, chance: f64, sampled_at: ?usize, depth_from: ?u64) !Run {
++    const window_ms = [_]f64{ 5.8, 6.6, 7.4, 8.2, 9.0, 9.8, 10.6, 11.4 };
++    const nodes = [_]depth.ContextCost{
++        .{ .context = 8, .window_ms = &window_ms, .draft_ms = 2.0 },
++        .{ .context = 1 << 20, .window_ms = &window_ms, .draft_ms = 2.0 },
++    };
++    var costs: [16]lanes.config.Cost = undefined;
++    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 0.8 * @as(f64, @floatFromInt(w)) };
++    const pass: depth.DraftPass = .{ .base_ms = 1.0, .stream_ms = 0.5, .drafted_ms = 0.5, .fair_above = 4 };
++    var cfg = try lanes.Config.init(a, .{ .exact_width = 16, .gpu_tokens = true, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 7, .window_costs = &costs, .hidden_rows = true, .batch_rows = 32, .max_streams = 8, .draft_streams = true, .draft_pass = pass, .shared_cut = cut, .context_costs = if (depth_from != null) &nodes else &.{}, .depth_from = depth_from orelse 0 }, 16, 15);
++    defer cfg.deinit(a);
++    cfg.timed = timed_for_test;
++    if (turns_for_test) |n| cfg.batch_streams = n;
++    if (low_prior_for_test) for (cfg.depth_prior, 0..) |*x, i| {
++        x.* = if (i == 0) 0.9 else 0.15;
++    };
++    try t.expectEqual(cut, cfg.shared_cut);
++    var target: fake.Fake = .{ .gpa = a };
++    defer target.deinit();
++    var b = target.backend();
++    var vt = b.vtable.*;
++    vt.probabilities = chances;
++    vt.shared_round = sharedRound;
++    told = .{};
++    watch = .{ .orig = vt.verify };
++    vt.verify = verifyWatched;
++    b.vtable = &vt;
++    var clock: fake.FixedClock = .{};
++    var e = lanes.Engine.init(a, &cfg, b, clock.clock());
++    defer e.deinit();
++    hook = .{ .chance = chance, .engine = &e, .deny_after = deny_for_test };
++    defer hook.engine = null;
++    var streams: [6]lanes.Stream = undefined;
++    var log = lanes.events.Log.init(a);
++    defer log.deinit();
++    e.log = &log;
++    var made: usize = 0;
++    defer for (streams[0..made]) |*s| s.deinit(a);
++    const joined = join_for_test != null;
++    for (streams[0..count], prompts[0..count], 0..) |*s, p, i| {
++        const max_new: u32 = if (i == 1 and short_for_test != null) short_for_test.? else 48;
++        s.* = try lanes.Stream.init(a, .{ .id = "s", .prompt = p, .max_new = max_new, .sampling = if (sampled_at == i) .{ .seed = 11 } else null });
++        made += 1;
++        if (!(joined and i == count - 1)) try e.addStream(s);
++    }
++    var rate: f64 = -1; // stream 0's first-draft rate, last seen while it decodes
++    var steps: usize = 0;
++    while (e.activeCount() > 0) {
++        try e.step();
++        steps += 1;
++        if (joined and steps == join_for_test.?) try e.addStream(&streams[count - 1]);
++        if (streams[0].depth) |st| rate = st.p[0];
++    }
++    var out: Run = .{ .tokens = undefined, .drafted = e.drafted, .rounds = e.shared_rounds, .calls = hook.calls, .sampled_calls = hook.sampled_calls, .lone_calls = hook.lone_calls, .wide_calls = hook.wide_calls, .rate = rate, .prior = cfg.depth_prior[0], .plain_overheads = e.rule.plain_overhead.items.len };
++    for (&out.tokens, 0..) |*x, i| x.* = try a.dupe(u32, if (i < count) streams[i].emitted() else &.{});
++    var hash = std.crypto.hash.sha2.Sha256.init(.{});
++    for (0..log.events.items.len) |i| {
++        const line = try log.line(a, i);
++        defer a.free(line);
++        hash.update(line);
++        hash.update("\n");
++    }
++    out.record = hash.finalResult();
++    return out;
++}
++
++fn free(r: Run) void {
++    for (r.tokens) |x| a.free(x);
++}
++
++test "shared cut: off asks no chances; on, every stream's tokens are as without it" {
++    var off = try run(4, .off, 0.5, null);
++    defer free(off);
++    try t.expectEqual(@as(usize, 0), off.calls);
++    for ([_]SharedCut{ .cut, .deepen }) |mode| for ([_]f64{ 0.05, 0.5, 0.99 }) |chance| {
++        const on = try run(4, mode, chance, null);
++        defer free(on);
++        try t.expect(on.calls > 0);
++        try t.expectEqual(@as(usize, 0), on.lone_calls);
++        for (off.tokens, on.tokens) |x, y| try t.expectEqualSlices(u32, x, y);
++    };
++    _ = &off;
++}
++
++test "shared cut: drafts unlikely to land are verified less, likely ones more when deepened" {
++    const off = try run(4, .off, 0.5, null);
++    defer free(off);
++    const low = try run(4, .cut, 0.02, null);
++    defer free(low);
++    try t.expect(low.drafted < off.drafted);
++    const high = try run(4, .deepen, 0.999, null);
++    defer free(high);
++    const high_cut = try run(4, .cut, 0.999, null);
++    defer free(high_cut);
++    try t.expect(high.drafted >= high_cut.drafted);
++}
++
++test "shared cut: rates learn only from chains that verified the rule's depth (cut chains feed nothing)" {
++    const off = try run(4, .off, 0.3, null);
++    defer free(off);
++    try t.expect(off.rate >= 0 and off.rate != off.prior); // the rates move with what lands
++    const cut = try run(4, .cut, 0.3, null);
++    defer free(cut);
++    try t.expect(cut.rate >= 0 and cut.drafted < off.drafted);
++    // every chain was cut short of the rule's depth: nothing fed, the rate is the prior's
++    try t.expectEqual(cut.prior, cut.rate);
++}
++
++test "shared cut: past depth_from no stream asks chances or drafts deeper than its budget" {
++    const off = try runAt(4, .off, 0.99, null, 1);
++    defer free(off);
++    const deep = try runAt(4, .deepen, 0.99, null, 1);
++    defer free(deep);
++    try t.expectEqual(@as(usize, 0), deep.calls);
++    try t.expectEqual(off.drafted, deep.drafted);
++    for (off.tokens, deep.tokens) |x, y| try t.expectEqualSlices(u32, x, y);
++    const shallow = try runAt(4, .deepen, 0.99, null, 1 << 20);
++    defer free(shallow);
++    try t.expect(shallow.calls > 0);
++}
++
++test "shared cut: rounds of more than the pass's fair_above streams ask no chances (v0.2's rounds), tokens as off" {
++    for ([_]usize{ 5, 6 }) |n| {
++        const off = try run(n, .off, 0.99, null);
++        defer free(off);
++        const on = try run(n, .deepen, 0.99, null);
++        defer free(on);
++        try t.expectEqual(@as(usize, 0), on.wide_calls);
++        for (off.tokens, on.tokens) |x, y| try t.expectEqualSlices(u32, x, y);
++    }
++}
++
++test "shared cut: five live streams in rounds of four ask no chances (the live count gates, not the round's)" {
++    turns_for_test = 4;
++    defer turns_for_test = null;
++    const on = try run(5, .deepen, 0.99, null);
++    defer free(on);
++    try t.expectEqual(@as(usize, 0), on.wide_calls);
++    turns_for_test = null;
++    const off = try run(5, .off, 0.99, null);
++    defer free(off);
++    for (off.tokens, on.tokens) |x, y| try t.expectEqualSlices(u32, x, y);
++}
++
++test "shared cut: open at 2 .. the pass's fair_above streams, never without the priced pass" {
++    var shared = try lanes.allocate.extendCosts(a, &.{ .{ .width = 1, .ms = 30.0 }, .{ .width = 8, .ms = 70.0 }, .{ .width = 32, .ms = 160.0 } }, 32);
++    defer shared.deinit(a);
++    const empty: lanes.table.Table = .{};
++    var r: depth.Rule = .{ .gpa = a, .prior = &.{0.8}, .most_drafts = 1, .family_costs = &empty, .shared_costs = &shared, .mtp_step_ms = 0, .plain_guard = false, .node_probabilities = false, .batch_rows = 32, .draft_pass = .{ .base_ms = 3.8, .stream_ms = 4.6, .fair_above = 4 } };
++    defer r.deinit();
++    try t.expect(!r.sharedOpen(1) and r.sharedOpen(2) and r.sharedOpen(3) and r.sharedOpen(4) and !r.sharedOpen(5) and !r.sharedOpen(8));
++    // TF_INK2_DRAFT_FAIR=8 moves the plain-share rule's threshold, not the shared cut's 2 .. 4
++    var fair8 = r;
++    fair8.draft_pass.?.fair_above = 8;
++    try t.expect(fair8.sharedOpen(4) and !fair8.sharedOpen(5) and !fair8.sharedOpen(8));
++    var none: depth.Rule = .{ .gpa = a, .prior = &.{0.8}, .most_drafts = 1, .family_costs = &empty, .shared_costs = &shared, .mtp_step_ms = 0, .plain_guard = false, .node_probabilities = false, .batch_rows = 32 };
++    defer none.deinit();
++    try t.expect(!none.sharedOpen(2));
++}
++
++test "shared cut: a sampled stream and a lone stream ask no chances" {
++    const mixed = try run(4, .deepen, 0.5, 2);
++    defer free(mixed);
++    try t.expectEqual(@as(usize, 0), mixed.sampled_calls);
++    try t.expectEqual(@as(usize, 0), mixed.lone_calls);
++    const lone = try run(1, .deepen, 0.5, null);
++    defer free(lone);
++    try t.expectEqual(@as(usize, 0), lone.calls);
++}
++
++test "shared cut: the fact needs the priced pass, drafts and shared forwards" {
++    var costs: [16]lanes.config.Cost = undefined;
++    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 0.8 * @as(f64, @floatFromInt(w)) };
++    var none = try lanes.Config.init(a, .{ .exact_width = 16, .gpu_tokens = true, .mtp = true, .speculate = true, .drafts = 7, .window_costs = &costs, .hidden_rows = true, .batch_rows = 32, .max_streams = 8, .draft_streams = true, .shared_cut = .cut }, 16, 15);
++    defer none.deinit(a);
++    try t.expectEqual(SharedCut.off, none.shared_cut);
++}
++
++test "shared cut: a deepened block is verified past its budget only in a chance-priced round (2 -> 1)" {
++    low_prior_for_test = true;
++    defer low_prior_for_test = false;
++    // 2 -> 1: stream 1 ends early; stream 0's next rounds are lone
++    short_for_test = 6;
++    const lone_off = try run(2, .off, 0.999, null);
++    defer free(lone_off);
++    const lone = try run(2, .deepen, 0.999, null);
++    defer free(lone);
++    try t.expect(watch.checked > 0); // lone windows with a held block were seen
++    try t.expectEqual(@as(usize, 0), watch.past_budget);
++    for (lone_off.tokens, lone.tokens) |x, y| try t.expectEqualSlices(u32, x, y);
++    short_for_test = null;
++}
++
++test "shared cut: a deepened block is verified past its budget only in a chance-priced round (4 -> 5)" {
++    low_prior_for_test = true;
++    defer low_prior_for_test = false;
++    // a fifth stream joins; rounds of five are v0.2's
++    join_for_test = 6;
++    defer join_for_test = null;
++    const wide_off = try run(5, .off, 0.999, null);
++    defer free(wide_off);
++    const wide = try run(5, .deepen, 0.999, null);
++    defer free(wide);
++    try t.expect(watch.checked > 0);
++    try t.expectEqual(@as(usize, 0), watch.past_budget);
++    for (wide_off.tokens, wide.tokens) |x, y| try t.expectEqualSlices(u32, x, y);
++}
++
++test "shared cut: a round whose drafts were all cut after the pass ran is not timed as a plain round" {
++    timed_for_test = true;
++    defer timed_for_test = false;
++    // chances so low that every held draft is cut: the pass ran (for the chances), no draft was verified
++    const cut_all = try run(3, .deepen, 0.0001, null);
++    defer free(cut_all);
++    try t.expect(cut_all.calls > 0);
++    try t.expectEqual(@as(usize, 0), cut_all.plain_overheads);
++    // without the shared cut the same rounds draft and nothing is cut by chances: timing as before
++    const off = try run(3, .off, 0.0001, null);
++    defer free(off);
++    for (off.tokens, cut_all.tokens) |x, y| try t.expectEqualSlices(u32, x, y);
++}
++
++test "shared cut: a deepened block whose chances are gone is planned to its budget in a shared round" {
++    // the allocation of a 2-stream shared round (open: 2 .. 4 live) whose chances are gone (as when a joining prompt's
++    // flush drops them): each stream holds a deepened block of 7 against a budget of 2; the rates alone would keep more
++    var costs: [16]lanes.config.Cost = undefined;
++    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 0.8 * @as(f64, @floatFromInt(w)) };
++    const pass: depth.DraftPass = .{ .base_ms = 1.0, .stream_ms = 0.5, .drafted_ms = 0.5, .fair_above = 4 };
++    var cfg = try lanes.Config.init(a, .{ .exact_width = 16, .gpu_tokens = true, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 7, .window_costs = &costs, .hidden_rows = true, .batch_rows = 32, .max_streams = 8, .draft_streams = true, .draft_pass = pass, .shared_cut = .deepen }, 16, 15);
++    defer cfg.deinit(a);
++    cfg.timed = false;
++    var target: fake.Fake = .{ .gpa = a };
++    defer target.deinit();
++    var b = target.backend();
++    var vt = b.vtable.*;
++    vt.probabilities = chances;
++    b.vtable = &vt;
++    var clock: fake.FixedClock = .{};
++    var e = lanes.Engine.init(a, &cfg, b, clock.clock());
++    defer e.deinit();
++    hook = .{ .chance = 0.999, .engine = &e, .deny_after = 0 }; // every read gives none
++    defer hook.engine = null;
++    var s1 = try lanes.Stream.init(a, .{ .id = "a", .prompt = &.{ 3, 1, 4 }, .max_new = 48 });
++    defer s1.deinit(a);
++    var s2 = try lanes.Stream.init(a, .{ .id = "b", .prompt = &.{ 1, 5, 9 }, .max_new = 48 });
++    defer s2.deinit(a);
++    for ([_]*lanes.Stream{ &s1, &s2 }) |s| {
++        s.asked = 2;
++        s.deepened = true;
++    }
++    e.live_streams = 2;
++    e.shared_open = true;
++    defer e.shared_open = false;
++    var plans = [_]lanes.windows.Plan{
++        .{ .stream = &s1, .position = 3, .kind = .head, .held = 7 },
++        .{ .stream = &s2, .position = 3, .kind = .head, .held = 7 },
++    };
++    try lanes.windows.allocate(&e, &plans);
++    try t.expect(hook.calls > 0); // the chances were asked for, and none came
++    for (plans) |p| {
++        try t.expect(!p.chance_priced);
++        try t.expect(p.count() <= 2);
++    }
++    // the same round with chances: the deepened blocks are priced by them, not cut to the budget
++    hook = .{ .chance = 0.999, .engine = &e };
++    var priced = [_]lanes.windows.Plan{
++        .{ .stream = &s1, .position = 3, .kind = .head, .held = 7 },
++        .{ .stream = &s2, .position = 3, .kind = .head, .held = 7 },
++    };
++    try lanes.windows.allocate(&e, &priced);
++    var most: usize = 0;
++    for (priced) |p| {
++        try t.expect(p.chance_priced);
++        most = @max(most, p.count());
++    }
++    try t.expect(most > 2);
++}
++
++test "shared cut: a new stream's first block feeds the rates when its chance-priced round verifies it whole" {
++    // two streams admitted together, chances high: the first shared round verifies each stream's first block whole,
++    // and the rates learn from it (the first block's budget is its request's depth)
++    var costs: [16]lanes.config.Cost = undefined;
++    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 0.8 * @as(f64, @floatFromInt(w)) };
++    const pass: depth.DraftPass = .{ .base_ms = 1.0, .stream_ms = 0.5, .drafted_ms = 0.5, .fair_above = 4 };
++    var cfg = try lanes.Config.init(a, .{ .exact_width = 16, .gpu_tokens = true, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 7, .window_costs = &costs, .hidden_rows = true, .batch_rows = 32, .max_streams = 8, .draft_streams = true, .draft_pass = pass, .shared_cut = .deepen }, 16, 15);
++    defer cfg.deinit(a);
++    cfg.timed = false;
++    var target: fake.Fake = .{ .gpa = a };
++    defer target.deinit();
++    var b = target.backend();
++    var vt = b.vtable.*;
++    vt.probabilities = chances;
++    b.vtable = &vt;
++    var clock: fake.FixedClock = .{};
++    var e = lanes.Engine.init(a, &cfg, b, clock.clock());
++    defer e.deinit();
++    hook = .{ .chance = 0.999, .engine = &e };
++    defer hook.engine = null;
++    var s1 = try lanes.Stream.init(a, .{ .id = "a", .prompt = &.{ 3, 1, 4 }, .max_new = 48 });
++    defer s1.deinit(a);
++    var s2 = try lanes.Stream.init(a, .{ .id = "b", .prompt = &.{ 1, 5, 9 }, .max_new = 48 });
++    defer s2.deinit(a);
++    try e.addStream(&s1);
++    try e.addStream(&s2);
++    try t.expect(s1.asked > 0 and s2.asked > 0); // the first block's budget is kept
++    // step until the first shared round has verified both streams
++    var steps: usize = 0;
++    while (e.shared_rounds == 0 and steps < 8) : (steps += 1) try e.step();
++    try t.expect(e.shared_rounds > 0);
++    var moved = false;
++    for ([_]*lanes.Stream{ &s1, &s2 }) |s| if (s.depth) |st| {
++        for (st.p, cfg.depth_prior[0..st.p.len]) |x, prior| moved = moved or x != prior;
++    };
++    try t.expect(moved); // fed: some rate left the prior
++}
++
++test "shared cut: the backend is told a round is open only at 2 .. 4 live streams (no left-out chance reads at 1 or 5+)" {
++    // 5 live streams in rounds of 4 (one left out each round), and 2 -> 1 with a peer ending early
++    turns_for_test = 4;
++    const wide = try run(5, .deepen, 0.99, null);
++    turns_for_test = null;
++    defer free(wide);
++    try t.expect(told.closed > 0);
++    try t.expectEqual(@as(usize, 0), told.wide_open);
++    try t.expectEqual(@as(usize, 0), told.left_out_reads);
++    short_for_test = 6;
++    defer short_for_test = null;
++    const lone = try run(2, .deepen, 0.99, null);
++    defer free(lone);
++    try t.expect(told.open > 0 and told.closed > 0); // shared rounds of 2 open, lone rounds after the peer ended closed
++    try t.expectEqual(@as(usize, 0), told.lone_open);
++}
 diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
-index baff3bd3100bbf287db9cb071c4d84da32ec0888..72621b7d881305a3e69639eb3d2214d9794e9780 100644
+index baff3bd3100bbf287db9cb071c4d84da32ec0888..829b99afc699fab95abcbf382194d140d0081c4c 100644
 --- a/zig/src/core/lanes/stream.zig
 +++ b/zig/src/core/lanes/stream.zig
 @@ -1,5 +1,7 @@
@@ -820,7 +1757,7 @@ index baff3bd3100bbf287db9cb071c4d84da32ec0888..72621b7d881305a3e69639eb3d2214d9
  const grammar = @import("grammar.zig");
  const shape = @import("shape.zig");
  const plan_lanes = @import("plan_lanes.zig");
-@@ -234,6 +236,12 @@ pub const Stream = struct {
+@@ -234,14 +236,24 @@ pub const Stream = struct {
      grammar_time: @import("grammar_time.zig").Sum = .{},
      grammar_round: @import("grammar_time.zig").Round = .{},
      gpu_seconds: ?f64 = null, // a timed backend's passes this stream ran in (TF_Q27_PROFILE); null: untimed
@@ -832,12 +1769,33 @@ index baff3bd3100bbf287db9cb071c4d84da32ec0888..72621b7d881305a3e69639eb3d2214d9
 +    draft_gaps: u32 = 0,
      paused: bool = false,
      depth: ?State = null,
++    cut_arm: bool = false, // lone_cut A/B tooling: the backend's cut arm, its rounds timed apart (Who.cut_arm)
      mode: ?Mode = null,
+     next: ?Held = null,
+     inflight: ?u64 = null,
+     served: ?u64 = null,
+     proposal_depth: ?u32 = null, // null: legacy; otherwise the last routed request, zero until it succeeds
+     granted: ?u32 = null,
++    asked: u32 = 0, // shared_cut: the drafts the rule's budget asked of the last shared draft, before `deepen`
++    deepened: bool = false, // shared_cut `deepen`: the held block was drafted past `asked`; only a chance-priced round verifies past it
++
+     grant_short: bool = false, // the last grant verified fewer drafts than the stream held
+     grant_gain: ?f64 = null, // the drafts its last grant expected to keep (the chances it was priced by)
+     draft_chances: std.ArrayList(f64) = .empty, // last full head prices, retained through zero-row rounds
+@@ -317,6 +329,8 @@ pub const Stream = struct {
+         s.granted = null;
+         s.grant_short = false;
+         s.grant_gain = null;
++        s.asked = 0;
++        s.deepened = false;
+         s.draft_chances.deinit(gpa);
+         s.draft_chances = .empty;
+         s.copy_width = null;
 diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
-index b3758b7c38498d8d1f82881b7c0f0291e3a4e471..2d5a43c0be4529a701e2107220ce38fb53dc6977 100644
+index b3758b7c38498d8d1f82881b7c0f0291e3a4e471..f2f487991cafc7c935c3a8b286181e9cff2afa13 100644
 --- a/zig/src/core/lanes/windows.zig
 +++ b/zig/src/core/lanes/windows.zig
-@@ -35,6 +35,7 @@ pub const Plan = struct {
+@@ -35,9 +35,11 @@ pub const Plan = struct {
      tried: bool = false, // the planner read the head's chain back to graft branches
      lanes: ?*const shape.Shape = null, // the held drafts' tree shape (each lane's depth and rank)
      masks: []const u32 = &.{}, // structured output: the rows' allowed-token bits (constrain)
@@ -845,16 +1803,99 @@ index b3758b7c38498d8d1f82881b7c0f0291e3a4e471..2d5a43c0be4529a701e2107220ce38fb
      grammar_from: u32 = 0, // the first row the grammar drafted itself (0: none)
      recalled: bool = false, // the copy came from Recall's record
      graft_recalled: []const bool = &.{}, // each row from branch_from: a Recall candidate grafted it
-@@ -230,7 +231,7 @@ pub fn probe(e: *Engine) depth.Probe {
++    chance_priced: bool = false, // shared_cut: the held chain was allocated by this round's chances (sharedChances)
+ 
+     pub fn count(p: Plan) usize {
+         return p.held + p.tokens.len;
+@@ -90,6 +92,9 @@ pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
+                 }
+             } else {
+                 p.held = q.count;
++                // shared_cut: a block drafted past its budget (`deepen`) is verified past it only in a round that prices
++                // it by its chances; any other round (lone, 5 or more streams) sees the budget's prefix, as v0.2 drafted
++                if (s.deepened and !e.shared_open) p.held = @min(p.held, s.asked);
+                 if (s.lanes) |*l| {
+                     // a held tree is a lone stream's (shared rounds verify chains); a chain's lanes are observed too
+                     if (q.parents) |parents| {
+@@ -230,7 +235,7 @@ pub fn probe(e: *Engine) depth.Probe {
  }
  
  pub fn who(s: *Stream) depth.Who {
 -    return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .grant_short = s.grant_short, .gain = s.grant_gain, .stream = s, .sampled = s.sampling != null };
-+    return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .grant_short = s.grant_short, .gain = s.grant_gain, .stream = s, .sampled = s.sampling != null, .context = s.cache_len };
++    return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .grant_short = s.grant_short, .gain = s.grant_gain, .stream = s, .sampled = s.sampling != null, .context = s.cache_len, .cut_arm = s.cut_arm };
  }
  
  /// Whether any of a round's streams draws keyed samples (its rows carry their host work).
-@@ -514,7 +515,7 @@ pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
+@@ -245,7 +250,8 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
+     const a = e.arena.allocator();
+     const fixed = try a.alloc(u32, plans.len);
+     const probs = try a.alloc([]const f64, plans.len);
+-    for (plans, fixed, probs) |p, *fx, *pr| {
++    for (plans, fixed, probs) |*pp, *fx, *pr| {
++        const p = pp.*;
+         const n = p.count();
+         if (p.kind == .forced or n == 0) {
+             fx.* = 1 + @as(u32, @intCast(if (p.kind == .forced) n else 0));
+@@ -256,7 +262,16 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
+             pr.* = try alloc.chainProbabilities(a, &.{rate}, n);
+         } else {
+             fx.* = 1;
+-            const chances = try planChances(e, p, n);
++            const shared = try sharedChances(e, plans.len, p);
++            pp.chance_priced = shared != null;
++            // a deepened block without this round's chances (none read, past depth_from): its budget's prefix only
++            if (shared == null and p.stream.deepened and p.kind == .head and p.held > p.stream.asked and p.tokens.len == 0 and p.parents == null) {
++                try cut.prefix(a, pp, p.stream.asked);
++                fx.* = 1;
++                pr.* = if (pp.count() == 0) &.{} else try planChances(e, pp.*, pp.count());
++                continue;
++            }
++            const chances = shared orelse try planChances(e, p, n);
+             const controls = @import("mtp_policy.zig").Controls{ .cap = e.cfg.most_drafts, .floor = e.cfg.draft_confidence };
+             pr.* = if (p.kind == .head and e.cfg.draft_confidence != null) chances[0..controls.prefix(chances)] else chances;
+         }
+@@ -503,6 +518,40 @@ pub fn nodeChances(e: *Engine, s: *Stream, n: usize) ![]const f64 {
+     return alloc.chainProbabilities(a, try e.rule.rates(who(s)), n);
+ }
+ 
++/// shared_cut: in a round of several streams, a greedy stream's held chain without a grammar is priced by the head's
++/// chances of this round (Backend.probabilities: each draft's chance of landing with the drafts before it, which may run
++/// the deferred drafts first), so the allocation gives the rows to the drafts likeliest to land; null (the learned
++/// rates) when the round is not open to it (Engine.shared_open: 2 .. the pass's fair_above streams), when it is not
++/// such a stream, it is past depth_from (with context prices: its drafts' map and its rounds' prices
++/// there are the depth rule's), or the backend has none.
++fn sharedChances(e: *Engine, streams: usize, p: Plan) !?[]const f64 {
++    if (e.cfg.shared_cut == .off or !e.shared_open or streams < 2 or p.kind != .head or p.held == 0 or p.tokens.len > 0 or p.parents != null) return null;
++    const s = p.stream;
++    if (s.sampling != null or s.grammar != null) return null;
++    if (e.cfg.context_costs.len > 0 and s.cache_len > e.cfg.depth_from) return null; // the chances' map: shallow drafts
++    const hook = e.backend.vtable.probabilities orelse return null;
++    const out = try e.arena.allocator().alloc(f64, p.held);
++    if (!try hook(e.backend.ptr, s, out)) return null;
++    try trail.event(e, &.{ f("ev", trail.str("shared-chances")), f("stream", trail.str(s.id)), f("held", trail.int(p.held)) });
++    return out;
++}
++
++/// lone_cut: a lone greedy stream without a grammar, at or below depth_from, verifies the prefix of its held chain
++/// with the most expected tokens a ms (depth.zig Rule.cut) by the head's chances (Backend.probabilities, which may
++/// run the stream's draft first; false: none, the window stays whole). The drafts it verifies, or null when not cut.
++pub fn cutLone(e: *Engine, p: *Plan) !?usize {
++    const s = p.stream;
++    if (!e.cfg.lone_cut or !e.alone or p.kind != .head or p.held == 0 or p.tokens.len > 0 or p.parents != null) return null;
++    if (s.sampling != null or s.grammar != null or s.cache_len > e.cfg.depth_from) return null;
++    const hook = e.backend.vtable.probabilities orelse return null;
++    const chances = try e.arena.allocator().alloc(f64, p.held);
++    if (!try hook(e.backend.ptr, s, chances)) return null;
++    const keep = @max(1, @min(e.rule.cut(chances, s.cache_len), p.held));
++    try trail.event(e, &.{ f("ev", trail.str("cut")), f("stream", trail.str(s.id)), f("held", trail.int(p.held)), f("kept", trail.int(keep)) });
++    try cut.prefix(e.arena.allocator(), p, @intCast(keep));
++    return keep;
++}
++
+ /// The grammar walk stays shared by serial windows and parallel per-stream jobs.
+ pub const constrain = @import("grammar_window.zig").constrain;
+ 
+@@ -514,7 +563,7 @@ pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
      const ds = try accept.depths(a, parents);
      const positions = try a.alloc(u64, rows);
      for (positions, ds) |*x, d| x.* = p.position + 1 + d;
@@ -865,10 +1906,10 @@ index b3758b7c38498d8d1f82881b7c0f0291e3a4e471..2d5a43c0be4529a701e2107220ce38fb
  pub fn rowParents(e: *Engine, w: be.Window) ![]const i32 {
 diff --git a/zig/src/families/inkling2/cuda_batch_check.zig b/zig/src/families/inkling2/cuda_batch_check.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..d7bc83834531522e8b48d9e7ee556c36a2e32567
+index 0000000000000000000000000000000000000000..6e3d9611dbfbcf151419a5e66e34c89187397fd2
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_batch_check.zig
-@@ -0,0 +1,792 @@
+@@ -0,0 +1,808 @@
 +//! tf-inkling2-decode's batched-decode gate (--streams S) and the state kernels' op check (--op-check).
 +//!
 +//! Streams gate: S slots on prompts of different lengths and contents (so different positions), each decoded alone
@@ -1339,9 +2380,17 @@ index 0000000000000000000000000000000000000000..d7bc83834531522e8b48d9e7ee556c36
 +/// Total rows the shared price measures (`sharedPrice`): 1 .. 8, then up to the lane core's 32 a round.
 +pub const shared_sizes = [_]usize{ 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 28, 32 };
 +
++/// `--shared-grid`: forwards of S streams of r rows each (S x r rows in all), the shapes the lane core's shared rounds
++/// take at 2, 4 and 8 streams (shared_sizes measures only the fewest streams of a row count).
++pub const shared_grid = [_][2]usize{ .{ 2, 1 }, .{ 2, 4 }, .{ 2, 8 }, .{ 4, 1 }, .{ 4, 2 }, .{ 4, 4 }, .{ 4, 8 }, .{ 8, 1 }, .{ 8, 2 }, .{ 8, 3 }, .{ 8, 4 } };
++/// The most streams a shared price forward takes: 4 (shared_sizes), 8 with the grid.
++pub fn sharedStreams(grid: bool) usize {
++    return if (grid) 8 else 4;
++}
++
 +/// Positions a slot of the shared price takes past its prompt (a keep of one row after each forward).
-+pub fn sharedPositions(reps: usize) usize {
-+    return shared_sizes.len * (reps + 2);
++pub fn sharedPositions(reps: usize, grid: bool) usize {
++    return (shared_sizes.len + if (grid) shared_grid.len else 0) * (reps + 2);
 +}
 +
 +/// The shared price (tf-inkling2-decode --exp shared-price, the drafter loaded): forwards of R rows in all as the
@@ -1350,21 +2399,26 @@ index 0000000000000000000000000000000000000000..d7bc83834531522e8b48d9e7ee556c36
 +/// stay at their positions. `reps` forwards a size after two not timed (a key of several streams runs eagerly at its
 +/// first sighting and is captured at its second; TF_INK2_GRAPH=0 or TF_INK2_GRAPH_SEGS=1: all eager). Prints each
 +/// size's median and mean ms from the call to the logits on the host, and the forwards of each kind: the lane core's
-+/// shared_costs (cuda_lanes.zig shared_ms).
-+pub fn sharedPrice(io: std.Io, x: Leader, seq: []const u32, T: usize, reps: usize) !void {
++/// shared_costs (cuda_lanes.zig shared_ms). `grid` (--shared-grid 1): then `shared_grid`'s cells, S streams of r rows
++/// each, on slots 3 .. 10 (8 prompts), printed as "grid S r median mean".
++pub fn sharedPrice(io: std.Io, x: Leader, seq: []const u32, T: usize, reps: usize, grid: bool) !void {
 +    const e = x.e;
 +    if (e.drafter == null) return error.SharedPriceNeedsTheDrafter; // the rollback (keep) needs the window history
 +    const clock = std.Io.Clock.awake;
-+    const S_most = 4;
-+    if (T <= stagger * S_most or reps == 0) return error.BadStreams;
++    const S_most = 8;
++    const S_used = sharedStreams(grid);
++    if (T <= stagger * S_used or reps == 0) return error.BadStreams;
 +    const tmp = try std.heap.page_allocator.alloc(f32, e.vocab());
 +    defer std.heap.page_allocator.free(tmp);
-+    for (0..S_most) |j| try prefill(x, first_slot + @as(u32, @intCast(j)), promptOf(seq, T, j), tmp);
++    for (0..S_used) |j| try prefill(x, first_slot + @as(u32, @intCast(j)), promptOf(seq, T, j), tmp);
 +    const t = try std.heap.page_allocator.alloc(f64, reps);
 +    defer std.heap.page_allocator.free(t);
-+    std.debug.print("shared price (ms, {d} forwards a size, slots {d}.., prompts {d} .. {d}): rows streams median mean\n", .{ reps, first_slot, T - stagger * (S_most - 1), T });
-+    for (shared_sizes) |R| {
-+        const S: usize = if (R == 1) 1 else @max(2, (R + 7) / 8);
++    std.debug.print("shared price (ms, {d} forwards a size, slots {d}.., prompts {d} .. {d}): rows streams median mean\n", .{ reps, first_slot, T - stagger * (S_used - 1), T });
++    const cells = shared_sizes.len + if (grid) shared_grid.len else 0;
++    for (0..cells) |cell| {
++        const in_grid = cell >= shared_sizes.len;
++        const R: usize = if (in_grid) shared_grid[cell - shared_sizes.len][0] * shared_grid[cell - shared_sizes.len][1] else shared_sizes[cell];
++        const S: usize = if (in_grid) shared_grid[cell - shared_sizes.len][0] else if (R == 1) 1 else @max(2, (R + 7) / 8);
 +        const c0 = e.counts;
 +        for (0..reps + 2) |i| {
 +            var segs: [S_most]engine.Segment = undefined;
@@ -1389,7 +2443,10 @@ index 0000000000000000000000000000000000000000..d7bc83834531522e8b48d9e7ee556c36
 +        std.mem.sort(f64, t, {}, std.sort.asc(f64));
 +        const med = if (reps % 2 == 1) t[reps / 2] else (t[reps / 2 - 1] + t[reps / 2]) / 2;
 +        const c = e.counts;
-+        std.debug.print("  {d} {d} {d:.2} {d:.2} (graphs {d}, captured {d}, eager {d})\n", .{ R, S, med, sum / @as(f64, @floatFromInt(reps)), c.graph - c0.graph, c.captured - c0.captured, c.eager - c0.eager });
++        if (in_grid and cell == shared_sizes.len) std.debug.print("shared price grid (ms, {d} forwards a cell, slots {d}..{d}): grid streams rows-a-stream median mean\n", .{ reps, first_slot, first_slot + S_most - 1 });
++        if (in_grid) {
++            std.debug.print("  grid {d} {d} {d:.2} {d:.2} (graphs {d}, captured {d}, eager {d})\n", .{ S, R / S, med, sum / @as(f64, @floatFromInt(reps)), c.graph - c0.graph, c.captured - c0.captured, c.eager - c0.eager });
++        } else std.debug.print("  {d} {d} {d:.2} {d:.2} (graphs {d}, captured {d}, eager {d})\n", .{ R, S, med, sum / @as(f64, @floatFromInt(reps)), c.graph - c0.graph, c.captured - c0.captured, c.eager - c0.eager });
 +    }
 +}
 +
@@ -1663,10 +2720,10 @@ index 0000000000000000000000000000000000000000..d7bc83834531522e8b48d9e7ee556c36
 +}
 diff --git a/zig/src/families/inkling2/cuda_lanes.zig b/zig/src/families/inkling2/cuda_lanes.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5dbc286adec
+index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03cacd0fe68
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_lanes.zig
-@@ -0,0 +1,1384 @@
+@@ -0,0 +1,1878 @@
 +//! Inkling-2's CUDA lane backend: a slot a stream (its state on every rank), prompts in 2048-row chunks, then decode
 +//! windows. Rank 0 draws on the host from the softcapped fp32 logits rows: greedy, or the request's sampling keyed at
 +//! each row's position over the whole vocabulary (sample.zig). Without the drafter a window is the pending row alone.
@@ -1707,6 +2764,12 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +    kept: ?usize = null, // rows of the last window `keep` accepted, not yet sent to the ranks
 +    held: [ic.dspark.drafts]u32 = undefined, // the drafter's block for the next window
 +    held_n: usize = 0,
++    /// The lone cut (TF_INK2_DRAFT_CUT): whether the stream's held chain is cut by its chances, and the chances of
++    /// its held block (each draft's pick probability, the drafter's own), read when its draft ran: in `flushWhere`
++    /// (deferred) or right after its eager pass (`eagerPass`, when a stream of the pass can use them).
++    cut: bool = false,
++    chances: [ic.dspark.drafts]f32 = undefined,
++    chances_ok: bool = false,
 +    /// The draft `draft` asked for, not run yet (TF_INK2_DRAFT_DEFER): it runs with the stream's next verify, in its
 +    /// step (Leader.forwardDrafted: one header, the keep, the block, then the window), its drafts read back after
 +    /// the head. Any other forward first runs it on its own (`flush`), since the block reads the taps of the
@@ -1762,14 +2825,15 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +}
 +
 +/// A lone window's ms by rows at TP4 on four GB10s (switch fabric with the RoCE mesh wire, checkpoint mode, experts
-+/// split, all 48 layers, the drafter loaded, the one-row latency forms, lane A's 1-8-row attention passes, lane K's
-+/// window tiles), measured by `tf-inkling2-decode --exp price` (20 a width) at a 600-token prompt (the server's
-+/// requests' depth; at 3040 tokens within 1.5 ms: 33.4 41.3 45.4 50.1 54.9 60.3 63.2 68.0): the window as a captured
-+/// graph with every row's head logits, plus the keep that rolls back the rejected rows (0.05 ms from two rows on).
-+const tp4_window_ms = [_]f64{ 34.1, 42.4, 46.9, 51.7, 57.6, 60.2, 65.5, 67.3 };
++/// split, all 48 layers, the drafter loaded, release defaults), measured by `tf-inkling2-decode --exp check,price` (20
++/// a width, two runs, the cells' medians) at a 600-token prompt (the server's requests' depth) on v0.2 with the decode
++/// launch merges (one-launch projections, the bf16 router, the convolutions with their commits) and the drafter's
++/// packed global attention: the window as a captured graph with every row's head logits, plus the keep that rolls
++/// back the rejected rows; rows 2-8 on their least-squares line in rows (cells scatter 1-5 ms run to run).
++const tp4_window_ms = [_]f64{ 29.9, 38.6, 43.0, 47.5, 51.9, 56.3, 60.7, 65.1 };
 +/// The drafter's block (with its keep) at TP4, measured the same way: one pass whatever its depth (its 7 drafts at
 +/// once), so a round's draft is a fixed cost, not a cost a draft.
-+const tp4_draft_ms = 8.4;
++const tp4_draft_ms = 8.2;
 +/// What the lane core weighs depths by: a round of a window of R rows (R - 1 drafts) is the window and, from two
 +/// rows on, the draft that made its drafts (the head steps are priced at 0: `mtp_step_ms`).
 +const tp4_costs = costs: {
@@ -1779,18 +2843,37 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +};
 +/// A lone round's prices by the stream's context (lanes/depth.zig ContextCost): the drafter's global layer and the
 +/// window's global layers read the whole context, so at depth the draft and every window cost more, a window's rows
-+/// more than one row. The first node is `tp4_window_ms`/`tp4_draft_ms` (the server's shallow requests); the others
-+/// were measured as those were, on the same Sparks: 3,040 by `--exp check,price` (20 a width), 32,768 .. 524,000 by
-+/// `--exp deep-draft --price-depths` in one prefill of real text (10 a width; slot 524,304), the window as a captured
-+/// graph with every row's head logits plus the keep, the draft with its keep. A round is priced at its stream's own
++/// more than one row. The first node is `tp4_window_ms`/`tp4_draft_ms` (the server's shallow requests); the others were
++/// measured as those were, on the same Sparks and build: 3,040 and 32,768 by `--exp check,price` (20 a width, two runs)
++/// and `--exp deep-draft --price-depths` (10 a width, one run in one prefill of real text, slot 524,304), the cells'
++/// medians; 131,072 .. 524,000 by the deep run alone; the window as a captured graph with every row's head logits plus
++/// the keep, the draft with its keep; rows 2-8 on their line at every node. A round is priced at its stream's own
 +/// context (interpolated between two nodes), and a plain round competes with the drafted depths (lanes/depth.zig
 +/// `depth`), so a stream deep enough that its drafts do not pay decodes plainly. In a shared round each stream pays
-+/// what its rows and its draft cost past `depth_from` (lanes/depth.zig `depthMs`): a deep stream drafts less or not
-+/// at all beside shallow streams. Up to `depth_from` (32,768: the nodes there are one price within noise) a stream is
++/// what its rows and its draft cost past `depth_from` (lanes/depth.zig `depthMs`): a deep stream drafts less or not at
++/// all beside shallow streams. Up to `depth_from` (32,768: the nodes there are one price within noise) a stream is
 +/// priced as v0.1 prices it (lone rounds by `tp4_costs`, always drafting; shared rounds without depth): on short
 +/// prompts a plain round competing lost 4-14 % on bursty acceptance (it went plain in a stretch of misses and waited).
 +const depth_costs = [_]lanes.depth.ContextCost{
 +    .{ .context = 600, .window_ms = &tp4_window_ms, .draft_ms = tp4_draft_ms },
++    .{ .context = 3_040, .window_ms = &.{ 30.1, 39.5, 44.0, 48.6, 53.1, 57.7, 62.2, 66.8 }, .draft_ms = 8.4 },
++    .{ .context = 32_768, .window_ms = &.{ 31.3, 40.1, 44.1, 48.2, 52.2, 56.3, 60.3, 64.4 }, .draft_ms = 8.7 },
++    .{ .context = 131_072, .window_ms = &.{ 36.2, 45.6, 49.9, 54.2, 58.5, 62.9, 67.2, 71.5 }, .draft_ms = 10.8 },
++    .{ .context = 262_144, .window_ms = &.{ 44.3, 52.2, 57.1, 62.0, 66.9, 71.8, 76.7, 81.6 }, .draft_ms = 12.1 },
++    .{ .context = 524_000, .window_ms = &.{ 58.0, 63.9, 69.6, 75.4, 81.2, 87.0, 92.7, 98.5 }, .draft_ms = 15.5 },
++};
++
++/// TF_INK2_DRAFT_CUT=0's prices: v0.2's own tables as it shipped them (measured on v0.2's kernels), so that `0`
++/// schedules as v0.2 does, the same depths from the same rates; `tp4_costs` and `depth_costs` serve the cut and `ab`.
++const v02_window_ms = [_]f64{ 34.1, 42.4, 46.9, 51.7, 57.6, 60.2, 65.5, 67.3 };
++const v02_draft_ms = 8.4;
++const v02_costs = costs: {
++    var c: [v02_window_ms.len]lanes.config.Cost = undefined;
++    for (&c, v02_window_ms, 0..) |*x, ms, i| x.* = .{ .width = i + 1, .ms = ms + if (i > 0) v02_draft_ms else 0 };
++    break :costs c;
++};
++const v02_depth_costs = [_]lanes.depth.ContextCost{
++    .{ .context = 600, .window_ms = &v02_window_ms, .draft_ms = v02_draft_ms },
 +    .{ .context = 3_040, .window_ms = &.{ 33.9, 41.1, 47.1, 50.9, 54.3, 61.4, 63.6, 68.2 }, .draft_ms = 8.5 },
 +    .{ .context = 32_768, .window_ms = &.{ 35.1, 42.2, 47.7, 52.6, 56.9, 65.4, 66.9, 72.2 }, .draft_ms = 9.4 },
 +    .{ .context = 131_072, .window_ms = &.{ 41.1, 48.1, 54.5, 62.2, 69.7, 73.5, 82.2, 90.3 }, .draft_ms = 16.1 },
@@ -1803,7 +2886,8 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +/// TF_INK2_DRAFT_DEPTH (rank 0; A/B tooling for the depth measurements, not a setting of the release: the recipe never
 +/// sets it): `0` prices a round by `tp4_costs` whatever the stream's context (v0.1's prices); `ab` prices new streams
 +/// in turn by their context, by `tp4_costs`, and plain (never drafted), each logged as it starts ("lanes depth a/b");
-+/// anything else (or unset) by the stream's context (`depth_costs`), the release's behaviour.
++/// anything else (or unset) by the stream's context (`depth_costs`), the release's behaviour. `ab` with
++/// TF_INK2_DRAFT_CUT=ab is refused at startup (`abSwitches`).
 +fn depthPriced() bool {
 +    const v = std.c.getenv("TF_INK2_DRAFT_DEPTH") orelse return true;
 +    return !(v[0] == '0' and v[1] == 0);
@@ -1812,6 +2896,20 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +fn depthAb() bool {
 +    const v = std.c.getenv("TF_INK2_DRAFT_DEPTH") orelse return false;
 +    return std.mem.eql(u8, std.mem.span(v), "ab");
++}
++
++/// The two A/B switches one at a time (rank 0, at startup): with TF_INK2_DRAFT_DEPTH=ab and TF_INK2_DRAFT_CUT=ab
++/// together a table-priced stream falls in either cut arm, and both arms' rounds price it by one table
++/// (lanes/depth.zig Rule.ab_table_ms), so neither comparison would hold; refused, by name.
++pub fn abSwitches() !void {
++    abPair(depthAb(), draftCut()) catch |err| {
++        std.log.err("inkling2: TF_INK2_DRAFT_DEPTH=ab and TF_INK2_DRAFT_CUT=ab together are refused: the two A/B experiments would share one timing table; run one at a time", .{});
++        return err;
++    };
++}
++
++fn abPair(depth_ab: bool, cut: Cut) error{DraftAbTogether}!void {
++    if (depth_ab and cut == .ab) return error.DraftAbTogether;
 +}
 +
 +/// A shared forward's ms by its total rows at TP4 (several streams' rows as a captured graph, B2 C2; the same Sparks
@@ -1837,8 +2935,7 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +
 +/// TF_INK2_BATCH (rank 0): `0` keeps a forward a stream; anything else (or unset) shares rounds.
 +fn batching() bool {
-+    const v = std.c.getenv("TF_INK2_BATCH") orelse return true;
-+    return !(v[0] == '0' and v[1] == 0);
++    return !ic.dspark.switchedOff("TF_INK2_BATCH");
 +}
 +
 +/// TF_INK2_LATE_MASKS (rank 0): `0` reads a grammar stream's held drafts back before its window (a drafter pass of
@@ -1861,8 +2958,7 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +/// TF_INK2_DRAFT_STREAMS (rank 0): `0` drafts each stream of a shared round in a pass (and a header) of its own;
 +/// anything else (or unset) drafts them all in one pass (Leader.draftMany: each stream's drafts the same bits).
 +fn draftStreams() bool {
-+    const v = std.c.getenv("TF_INK2_DRAFT_STREAMS") orelse return true;
-+    return !(v[0] == '0' and v[1] == 0);
++    return !ic.dspark.switchedOff("TF_INK2_DRAFT_STREAMS");
 +}
 +
 +/// A shared round's drafter pass at TP4 (one pass for every drafting stream, Leader.draftMany), measured by the
@@ -1883,13 +2979,88 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +/// the plain-share rule in rounds of more than N streams (0: every shared round; default 4). TF_INK2_DRAFT_LOG=1: the
 +/// lane core logs each shared round's decision and observed overhead (diagnostics).
 +fn draftPass() ?lanes.depth.DraftPass {
-+    if (std.c.getenv("TF_INK2_DRAFT_PRICE")) |v| if (v[0] == '0' and v[1] == 0) return null;
++    if (ic.dspark.switchedOff("TF_INK2_DRAFT_PRICE")) return null;
 +    var p = shared_pass;
 +    p.deferred = deferDrafts();
 +    if (std.c.getenv("TF_INK2_DRAFT_LOG")) |v| p.log = v[0] == '1';
 +    if (std.c.getenv("TF_INK2_DRAFT_FAIR")) |v| p.fair_above = std.fmt.parseInt(u32, std.mem.span(v), 10) catch p.fair_above;
 +    if (std.c.getenv("TF_INK2_DRAFT_MOST")) |v| p.most_streams = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
 +    return p;
++}
++
++/// TF_INK2_SHARED_CUT (rank 0, read when the lanes start; lanes/windows.zig sharedChances): unset (the default) or
++/// `deepen` (or `2`): a shared round of 2 .. 4 streams (the pass's fair_above; one stream and 5 or more keep v0.2's
++/// rounds) prices its greedy streams' held drafts by the drafter's chances of this round through the lone cut's
++/// calibration map (`chainChances`; the deferred drafts then run before the verify, their chances read), and every
++/// drafting greedy stream drafts its whole block, so the rows go to the drafts likeliest to land, a confident stream's
++/// deeper ones too; `cut` (or `1`) the chances only, within the budget; `0` prices by each stream's learned rates, as
++/// v0.2 does. Greedy streams without a grammar in the cut arm; off with TF_INK2_DRAFT_CUT=0 (v0.2's rounds). Outputs are
++/// the same either way. GB10, four servers a setting (off, deepen), CONTEXT=32768 MAX_STREAMS=8, the bench prompts, the
++/// time to the last request's end: 2 streams +1.7%, 4 streams +3.9%; replayed on texts whose drafts seldom land (a
++/// first draft kept about 3 times in 10), 17-24% slower than v0.2 at 2 to 4 streams.
++const shared_cut_default: lanes.config.SharedCut = .deepen;
++
++fn parseSharedCut(v: ?[]const u8) lanes.config.SharedCut {
++    return switch (ic.dspark.parseSharedCut(v)) {
++        .off => .off,
++        .cut => .cut,
++        .deepen => shared_cut_default,
++    };
++}
++
++/// Whether a flush of streams a forward leaves out reads their chances (for their next shared window): only in a round
++/// the lane core prices by chances (`open`: 2 .. 4 live streams, Lanes.round_open) and only when shared rounds use
++/// chances in effect, which TF_INK2_DRAFT_CUT=0 turns off (the drafter then makes no chances, and asking for them
++/// fails the request), as `factsCut` does; else v0.2's flush, proposals only (no wait, no download).
++fn leftOutChances(open: bool, cut: Cut, shared: lanes.config.SharedCut) bool {
++    return open and cut != .off and shared != .off;
++}
++
++fn sharedRoundFn(ptr: *anyopaque, open: bool) void {
++    const self: *Lanes = @ptrCast(@alignCast(ptr));
++    self.round_open = open;
++}
++
++fn sharedCut() lanes.config.SharedCut {
++    return parseSharedCut(if (std.c.getenv("TF_INK2_SHARED_CUT")) |v| std.mem.span(v) else null);
++}
++
++/// TF_INK2_DRAFT_CUT (rank 0 cuts; every rank reads it, cuda_dspark.zig draftCut: off, the drafter makes no chances):
++/// unset (or anything else) cuts a lone greedy stream's held chain (at or below `depth_from`, without a grammar) to the
++/// drafts whose chances pay (lanes/depth.zig Rule.cut): the stream's draft runs before its window (`probabilities`: the
++/// undeferred draft) so its seven chances are on the host; `0` verifies the rule's whole chain and prices rounds by
++/// v0.2's tables (`v02_costs`, `v02_depth_costs`), v0.2's behaviour; `ab` cuts every other new stream (logged as it
++/// opens: "inkling2: draft cut a/b"), for a same-server A/B: each arm's rounds are timed and priced apart, deep ones
++/// too (lanes/depth.zig Rule.cut_arm_ms, cut_arm_context_ms). Outputs are the same either way (a window's rows are
++/// exact at any width); only the rows verified change. GB10, one server in `ab` mode (before the arms were timed
++/// apart), cut against whole (median tok/s): fibonacci-raw +12.6%, gpu-chat-no-think +5.9%, code-lru-chat +3.6%,
++/// tool-call-weather +6.6% (30 requests an arm), thinking-high +3.2%.
++const Cut = ic.dspark.Cut;
++const draftCut = ic.dspark.draftCut;
++
++/// The drafter's pick probability as the chance its draft lands (given the drafts before it landed): knots (pick
++/// probability, landed share) of the device's own chances on the chain's path, binned and pooled to rise
++/// (tf-inkling2-draft --chances over 12 replies of the five bench workloads and a long chat, 3,163 anchors), linear
++/// between knots, through 0 below the first and flat past the last. Fitted on the FP8 'mlp' drafter (the draft MLP's
++/// projections as MXFP8 weights, TF_INK2_DSPARK_FP8=mlp).
++const cut_map = [_][2]f64{ .{ 0.1659, 0.0000 }, .{ 0.2588, 0.1638 }, .{ 0.3553, 0.2903 }, .{ 0.4527, 0.3650 }, .{ 0.5510, 0.4632 }, .{ 0.6480, 0.4866 }, .{ 0.7521, 0.5960 }, .{ 0.8539, 0.6487 }, .{ 0.9272, 0.7179 }, .{ 0.9745, 0.8149 }, .{ 0.9961, 0.9354 }, .{ 0.9999, 0.9886 } };
++
++fn landing(p: f64) f64 {
++    if (!(p > cut_map[0][0])) return if (p > 0) cut_map[0][1] * p / cut_map[0][0] else 0;
++    for (cut_map[0 .. cut_map.len - 1], cut_map[1..]) |a, b| if (p <= b[0]) return a[1] + (p - a[0]) / (b[0] - a[0]) * (b[1] - a[1]);
++    return cut_map[cut_map.len - 1][1];
++}
++
++/// A lane's held drafts' chances of landing with every draft before them (the running product of `landing`); false
++/// when its block's chances were not read or it holds fewer drafts than asked.
++fn chainChances(l: *const Lane, out: []f64) bool {
++    if (!l.chances_ok or out.len > l.held_n) return false;
++    var run: f64 = 1;
++    for (out, l.chances[0..out.len]) |*o, c| {
++        run *= landing(c);
++        o.* = run;
++    }
++    return true;
 +}
 +
 +/// The drafter's acceptance by depth (offline, the checkpoint oracle's greedy replies on four prompts: each depth's
@@ -1910,6 +3081,8 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +    draft_end: ?i96 = null,
 +    /// Since start: the gaps measured, their sum (ns), and drafts made.
 +    gaps: u64 = 0,
++    /// shared_cut: whether the current round prices its drafts by chances (the lane core's Backend.shared_round)
++    round_open: bool = false,
 +    gap_ns: u64 = 0,
 +    drafts_made: u64 = 0,
 +    /// Since start: verify rounds, their rows, and the ns their draw loops took (the host tail after the head).
@@ -1936,6 +3109,8 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +    /// states' pages back before a stream's pages do not fit (the reclaim chain), and whether a state is borrowed
 +    /// (a resume in flight: its pages are not reclaimable).
 +    store: ?StoreHooks = null,
++    /// TF_INK2_DRAFT_CUT=ab: the streams opened so far (every other one is cut).
++    cut_streams: u64 = 0,
 +
 +    fn now(self: *const Lanes) i96 {
 +        return std.Io.Clock.awake.now(self.x.e.io).toNanoseconds();
@@ -1982,6 +3157,8 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +        .keep = keepFn,
 +        .draft = draftFn,
 +        .held = heldFn,
++        .probabilities = probabilitiesFn,
++        .shared_round = sharedRoundFn,
 +        .first_masked = firstMaskedFn,
 +        .release = releaseFn,
 +    };
@@ -1989,6 +3166,11 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +    /// One row a window without the drafter (two for a forced token; any width is exact); with it, the pending row
 +    /// and up to 7 held drafts. Several streams' windows share a forward unless TF_INK2_BATCH=0.
 +    pub fn facts(self: *const Lanes) lanes.Model {
++        return self.factsCut(draftCut());
++    }
++
++    /// `facts` under TF_INK2_DRAFT_CUT `cut`.
++    fn factsCut(self: *const Lanes, cut: Cut) lanes.Model {
 +        const shared = batching();
 +        if (self.x.e.drafter != null) return .{
 +            .copy_drafts = false,
@@ -2003,13 +3185,15 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +            .drafts = ic.dspark.drafts,
 +            .draft_prior = &draft_prior,
 +            .mtp_step_ms = 0, // the draft is a round's fixed cost, in tp4_costs (lone) or the round's overhead (shared)
-+            .window_costs = &tp4_costs,
++            .window_costs = if (cut == .off) &v02_costs else &tp4_costs,
 +            .window_costs_lone = shared,
-+            .context_costs = if (depthPriced()) &depth_costs else &.{},
++            .context_costs = if (!depthPriced()) &.{} else if (cut == .off) &v02_depth_costs else &depth_costs,
 +            .depth_from = depth_from,
 +            .depth_ab = depthAb(),
++            .lone_cut = cut != .off,
 +            .draft_streams = shared and draftStreams(), // a shared round's drafts in one call: one pass for all
 +            .draft_pass = if (shared and draftStreams()) draftPass() else null,
++            .shared_cut = if (cut == .off) .off else sharedCut(),
 +            .hidden_rows = shared,
 +            .batch_rows = batch_rows,
 +            .max_streams = batch_streams,
@@ -2176,6 +3360,21 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +        if (n != hb.len + mask.len * 4 + logits.len * 4) std.log.err("inkling2: TF_INK2_MASK_DUMP: short write", .{});
 +    }
 +
++    /// Whether a new stream's held chains are cut (TF_INK2_DRAFT_CUT); a stream opening again keeps its choice.
++    fn cutting(self: *Lanes, s: *const lanes.Stream, again: bool) bool {
++        if (again) if (self.lanes.getPtr(s)) |l| return l.cut;
++        switch (draftCut()) {
++            .off => return false,
++            .on => return true,
++            .ab => {
++                const on = self.cut_streams % 2 == 1;
++                std.log.info("inkling2: draft cut a/b: stream {d} (prompt {d} tokens) {s}", .{ self.cut_streams, s.prompt().len, if (on) "cut" else "whole" });
++                self.cut_streams += 1;
++                return on;
++            },
++        }
++    }
++
 +    /// A prompt begins: the stream's slot, and on the KV page pool its pages (`pagesFor`).
 +    fn opening(self: *Lanes, s: *lanes.Stream) !*Lane {
 +        const ids = s.prompt();
@@ -2188,7 +3387,7 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +            l.dropRow(self.gpa);
 +            break :had l.slot;
 +        } else self.freeSlot();
-+        try self.lanes.put(self.gpa, s, .{ .slot = slot });
++        try self.lanes.put(self.gpa, s, .{ .slot = slot, .cut = self.cutting(s, again) });
 +        errdefer {
 +            _ = self.lanes.remove(s);
 +            self.x.e.unmapPages(slot);
@@ -2200,6 +3399,7 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +        // a round)
 +        if (self.x.e.drafter == null and s.grammar != null) s.drafts = false;
 +        const l = self.lanes.getPtr(s).?;
++        s.cut_arm = l.cut and draftCut() == .ab; // `ab`: each arm's rounds timed apart from the other's
 +        // a kept state's pages adopted and its fixed part restored (the prompt cache on pages), else the slot's pages
 +        l.from = if (s.prompt_logprobs != null) 0 else try self.resumeFrom(s, slot, ids.len, again);
 +        if (l.from == 0) try self.pagesFor(s, slot, ids.len, s.max_new, again, null);
@@ -2420,14 +3620,16 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +
 +    /// Every deferred draft run now, in one pass (each its keep, then the blocks; their drafts to the host).
 +    fn flush(self: *Lanes) !void {
-+        return self.flushWhere(.all);
++        return self.flushWhere(.all, false);
 +    }
 +
-+    /// `flush` of every deferred draft, or of grammar streams' alone.
-+    fn flushWhere(self: *Lanes, which: enum { all, grammar }) !void {
++    /// `flush` of every deferred draft, or of grammar streams' alone; `chances`: each stream's chances of the pass
++    /// to its lane too (the lone cut: a lane's chances are always its own block's).
++    fn flushWhere(self: *Lanes, which: enum { all, grammar }, chances: bool) !void {
 +        var items: [engine.max_segs]engine.DraftItem = undefined;
 +        var keeps: [engine.max_segs]usize = undefined;
 +        var outs: [engine.max_segs]*[ic.dspark.drafts]u32 = undefined;
++        var lns: [engine.max_segs]*Lane = undefined;
 +        var m: usize = 0;
 +        var it = self.lanes.valueIterator();
 +        while (it.next()) |l| {
@@ -2438,13 +3640,42 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +            items[m] = .{ .slot = l.slot, .anchor = p.anchor };
 +            keeps[m] = p.n;
 +            outs[m] = &l.held;
++            lns[m] = l;
 +            m += 1;
 +            if (m == engine.max_segs) {
 +                try self.x.draftMany(items[0..m], keeps[0..m], outs[0..m]);
++                if (chances) try readChances(self.x.e, lns[0..m]);
 +                m = 0;
 +            }
 +        }
 +        if (m == 1) try self.x.draft(items[0].slot, keeps[0], items[0].anchor, outs[0]) else if (m > 1) try self.x.draftMany(items[0..m], keeps[0..m], outs[0..m]);
++        if (chances and m > 0) try readChances(self.x.e, lns[0..m]);
++    }
++
++    /// The last drafter pass's chances, its streams' in its order, each to its own lane (`e`: the engine).
++    fn readChances(e: anytype, lns: []const *Lane) !void {
++        var outs: [engine.max_segs]*[ic.dspark.drafts]f32 = undefined;
++        for (outs[0..lns.len], lns) |*o, l| o.* = &l.chances;
++        try e.chances(outs[0..lns.len]);
++        for (lns) |l| l.chances_ok = true;
++    }
++
++    /// An eager drafter pass (TF_INK2_DRAFT_DEFER=0) of `lns`' blocks, `streams` theirs (one stream: `draft`,
++    /// several: `draftMany`; `x` the leader, `e` its engine). When one of its streams can use its chances at its next
++    /// window (`nextCut`), the pass's chances go to its lanes now, in the pass's order, before another pass
++    /// overwrites them: the lone cut reads them there (`probabilitiesFn`). Otherwise none are read (no wait).
++    fn eagerPass(x: anytype, e: anytype, items: []const engine.DraftItem, keeps: []const usize, lns: []const *Lane, streams: []const *const lanes.Stream) !void {
++        var outs: [engine.max_segs]*[ic.dspark.drafts]u32 = undefined;
++        for (outs[0..lns.len], lns) |*o, l| o.* = &l.held;
++        if (lns.len == 1) try x.draft(items[0].slot, keeps[0], items[0].anchor, outs[0]) else try x.draftMany(items, keeps, outs[0..lns.len]);
++        for (lns, streams) |l, s| if (nextCut(l, s)) return readChances(e, lns);
++    }
++
++    /// Whether the lone cut can take a lane's chances at its stream's next window (lanes/windows.zig cutLone): the cut
++    /// on (it needs the context prices: not with TF_INK2_DRAFT_DEPTH=0), a stream in the cut arm, greedy, without a
++    /// grammar, at or below `depth_from` (its context is the same at its next window as when its draft runs).
++    fn nextCut(l: *const Lane, s: *const lanes.Stream) bool {
++        return l.cut and depthPriced() and s.sampling == null and s.grammar == null and s.cache_len <= depth_from;
 +    }
 +
 +    /// A draft about to run from taps another forward wrote since its stream's last one (it changes no output, only
@@ -2482,7 +3713,7 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +                    if (w.stream == kv.key_ptr.*) break;
 +                } else break true;
 +            } else false;
-+            if (others) try self.flush();
++            if (others) try self.flushWhere(.all, leftOutChances(self.round_open, draftCut(), sharedCut())); // shared_cut: their chances for their next window, in a C2 round only
 +        }
 +        // the windows in slot order (ord[i]: the window of segment i); row0[j]: window j's first row in the forward
 +        var ord: [engine.max_segs]usize = undefined;
@@ -2583,6 +3814,7 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +            for (0..rows) |r| o.sampled[r] = try self.drawAt(r0 + r, w.stream, w.positions[r], if (words == 0 or r >= masked) &.{} else masks[r * words ..][0..words]);
 +            @memcpy(o.drafts[0..drafts.len], drafts);
 +            l.held_n = 0;
++            l.chances_ok = false;
 +        }
 +        self.draw_rounds += 1;
 +        self.draw_rows += R;
@@ -2618,10 +3850,7 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +            self.draft_end = self.now();
 +        };
 +        if (requests.len > engine.max_segs) return error.TooManyWindows;
-+        var items: [engine.max_segs]engine.DraftItem = undefined;
-+        var keeps: [engine.max_segs]usize = undefined;
-+        var outs: [engine.max_segs]*[ic.dspark.drafts]u32 = undefined;
-+        var m: usize = 0;
++        var d: Dispatch = .{ .how = if (deferDrafts()) .deferred else if (!draftStreams()) .each else .one };
 +        for (requests) |r| {
 +            if (r.lanes != null) return error.TreesNotServed;
 +            const l = self.lanes.getPtr(r.stream) orelse return error.UnknownStream;
@@ -2644,24 +3873,46 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +                continue;
 +            }
 +            if (l.pending != null) try self.flush(); // (not expected: a verify consumes it)
-+            if (!deferDrafts()) self.stale(l.slot, r.stream); // deferred: counted where it runs
-+            if (deferDrafts()) {
-+                l.pending = .{ .n = n, .anchor = anchor, .stream = r.stream };
-+            } else if (!draftStreams()) {
-+                try self.x.draft(l.slot, n, anchor, &l.held);
-+            } else {
-+                items[m] = .{ .slot = l.slot, .anchor = anchor };
-+                keeps[m] = n;
-+                outs[m] = &l.held;
-+                m += 1;
-+            }
-+            l.held_n = @min(r.depth, ic.dspark.drafts);
++            if (d.how != .deferred) self.stale(l.slot, r.stream); // deferred: counted where it runs
++            try d.add(self.x, self.x.e, l, .{ .slot = l.slot, .anchor = anchor }, n, r.stream, r.depth);
 +            drafted = true;
 +            self.drafts_made += 1;
 +        }
-+        // every drafting stream's block in one pass (one header)
-+        if (m == 1) try self.x.draft(items[0].slot, keeps[0], items[0].anchor, outs[0]) else if (m > 1) try self.x.draftMany(items[0..m], keeps[0..m], outs[0..m]);
++        try d.finish(self.x, self.x.e);
 +    }
++
++    /// `draftFn`'s blocks (`x` the leader, `e` its engine): deferred to each stream's next verify
++    /// (TF_INK2_DRAFT_DEFER), else eager: a pass a stream (TF_INK2_DRAFT_STREAMS=0) or one pass of every drafting
++    /// stream after the last (`finish`: one header). A lane's chances are its old block's until its draft: they stop
++    /// counting before it runs, so that an eager pass's read (`eagerPass`) is what holds after it.
++    const Dispatch = struct {
++        how: enum { deferred, each, one },
++        items: [engine.max_segs]engine.DraftItem = undefined,
++        keeps: [engine.max_segs]usize = undefined,
++        lns: [engine.max_segs]*Lane = undefined,
++        streams: [engine.max_segs]*const lanes.Stream = undefined,
++        m: usize = 0,
++
++        fn add(d: *Dispatch, x: anytype, e: anytype, l: *Lane, item: engine.DraftItem, n: usize, s: *lanes.Stream, depth: u32) !void {
++            l.chances_ok = false;
++            switch (d.how) {
++                .deferred => l.pending = .{ .n = n, .anchor = item.anchor, .stream = s },
++                .each => try eagerPass(x, e, &.{item}, &.{n}, &.{l}, &.{s}),
++                .one => {
++                    d.items[d.m] = item;
++                    d.keeps[d.m] = n;
++                    d.lns[d.m] = l;
++                    d.streams[d.m] = s;
++                    d.m += 1;
++                },
++            }
++            l.held_n = @min(depth, ic.dspark.drafts);
++        }
++
++        fn finish(d: *const Dispatch, x: anytype, e: anytype) !void {
++            if (d.m > 0) try eagerPass(x, e, d.items[0..d.m], d.keeps[0..d.m], d.lns[0..d.m], d.streams[0..d.m]);
++        }
++    };
 +
 +    /// The host tail since start (one log line): the heads' downloads (the logits, or the argmax rows alone) and the
 +    /// verify rounds' draw loops, ms each and rows on average.
@@ -2691,10 +3942,23 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +    fn heldFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
 +        const self = of(ptr);
 +        const l0 = self.lanes.getPtr(s) orelse return error.UnknownStream;
-+        if (l0.pending != null) try self.flushWhere(if (s.grammar != null) .grammar else .all);
++        if (l0.pending != null) try self.flushWhere(if (s.grammar != null) .grammar else .all, false);
 +        const l = self.lanes.getPtr(s) orelse return error.UnknownStream;
 +        if (out.len > l.held_n) return error.NoHeldDrafts;
 +        @memcpy(out, l.held[0..out.len]);
++    }
++
++    /// The lone cut (lanes/windows.zig cutLone): the chance that each of the first `out.len` held drafts lands with
++    /// every draft before it, from the drafter's pick probabilities of the stream's own block through `cut_map`. A
++    /// deferred draft runs now (with any other's), its chances read with its drafts; false for a stream not cut or a
++    /// block whose chances were not read (its draft ran in a verify's step).
++    fn probabilitiesFn(ptr: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
++        const self = of(ptr);
++        const l0 = self.lanes.getPtr(s) orelse return false;
++        if (!l0.cut or out.len == 0 or out.len > ic.dspark.drafts) return false;
++        if (l0.pending != null) try self.flushWhere(.all, true);
++        const l = self.lanes.getPtr(s) orelse return false;
++        return chainChances(l, out);
 +    }
 +
 +    /// The stream left: its slot is free for the next stream (its state stays allocated on every rank).
@@ -2793,6 +4057,293 @@ index 0000000000000000000000000000000000000000..ecefd7c0a391728c4c231e4f0cdef5db
 +    try std.testing.expect(for (depth_costs) |n| {
 +        if (n.context == depth_from) break true;
 +    } else false);
++}
++
++test "inkling2 lanes: TF_INK2_DRAFT_CUT=0 prices rounds as v0.2 did: at the 0.84 / 0.20 boundary it picks v0.2's width" {
++    const gpa = std.testing.allocator;
++    // v0.2's tables as it shipped them: the shallow windows and draft, and the context nodes
++    const window = [_]f64{ 34.1, 42.4, 46.9, 51.7, 57.6, 60.2, 65.5, 67.3 };
++    const nodes = [_]lanes.depth.ContextCost{
++        .{ .context = 600, .window_ms = &window, .draft_ms = 8.4 },
++        .{ .context = 3_040, .window_ms = &.{ 33.9, 41.1, 47.1, 50.9, 54.3, 61.4, 63.6, 68.2 }, .draft_ms = 8.5 },
++        .{ .context = 32_768, .window_ms = &.{ 35.1, 42.2, 47.7, 52.6, 56.9, 65.4, 66.9, 72.2 }, .draft_ms = 9.4 },
++        .{ .context = 131_072, .window_ms = &.{ 41.1, 48.1, 54.5, 62.2, 69.7, 73.5, 82.2, 90.3 }, .draft_ms = 16.1 },
++        .{ .context = 262_144, .window_ms = &.{ 48.3, 56.1, 65.3, 74.7, 86.8, 91.3, 103.9, 115.9 }, .draft_ms = 23.0 },
++        .{ .context = 524_000, .window_ms = &.{ 63.2, 72.0, 82.7, 99.9, 110.1, 121.7, 140.7, 150.3 }, .draft_ms = 39.7 },
++    };
++    var costs: [window.len]lanes.config.Cost = undefined;
++    for (&costs, window, 0..) |*c, ms, i| c.* = .{ .width = @intCast(i + 1), .ms = ms + if (i > 0) @as(f64, 8.4) else 0 };
++    var e: engine.Engine = undefined;
++    e.drafter = @ptrFromInt(@alignOf(ic.dspark.Drafter)); // never read: facts only ask whether a drafter is loaded
++    const l: Lanes = .{ .x = .{ .e = &e }, .gpa = gpa };
++    const off = l.factsCut(.off);
++    var base = off;
++    base.window_costs = &costs;
++    base.context_costs = &nodes;
++    // the tables `0` installs are v0.2's, cell for cell
++    try std.testing.expectEqualDeep(base.window_costs, off.window_costs);
++    try std.testing.expectEqualDeep(base.context_costs, off.context_costs);
++    try std.testing.expect(!off.lone_cut);
++    // `0` plans shared rounds as v0.2 did too: no chances, no deepened drafts (whatever TF_INK2_SHARED_CUT says)
++    try std.testing.expectEqual(lanes.config.SharedCut.off, off.shared_cut);
++    // the cut on: shared rounds by TF_INK2_SHARED_CUT, `deepen` when unset
++    if (std.c.getenv("TF_INK2_SHARED_CUT") == null) try std.testing.expectEqual(lanes.config.SharedCut.deepen, l.factsCut(.on).shared_cut);
++    // a shallow greedy stream's round with room for two drafts, nothing timed yet and no probe, its first two drafts
++    // landing at 0.84 and 0.20 given the ones before: 1.84 and 2.008 expected tokens; v0.2's 50.8 and 55.3 ms take
++    // two drafts, the re-measured 46.8 and 51.2 ms one
++    const width = struct {
++        fn of(m: lanes.Model) !i64 {
++            var cfg = try lanes.Config.init(gpa, m, ic.state.spec_rows, ic.state.spec_rows - 1);
++            defer cfg.deinit(gpa);
++            var lane_engine = lanes.Engine.init(gpa, &cfg, undefined, undefined);
++            defer lane_engine.deinit();
++            var st: ?lanes.depth.State = null;
++            defer if (st) |*x| x.deinit(gpa);
++            const who: lanes.depth.Who = .{ .state = &st, .draft_room = 3, .finished = false, .forced = false, .context = 600 };
++            const p = try lane_engine.rule.rates(who);
++            p[0] = 0.84;
++            p[1] = 0.20;
++            return lane_engine.rule.depth(who);
++        }
++    };
++    try std.testing.expectEqual(@as(i64, 2), try width.of(base));
++    try std.testing.expectEqual(try width.of(base), try width.of(off));
++    try std.testing.expectEqual(@as(i64, 1), try width.of(l.factsCut(.on)));
++    try std.testing.expectEqual(@as(i64, 1), try width.of(l.factsCut(.ab)));
++}
++
++test "inkling2 lanes: TF_INK2_DRAFT_DEPTH=ab with TF_INK2_DRAFT_CUT=ab is refused, either A/B alone is not" {
++    try std.testing.expectError(error.DraftAbTogether, abPair(true, .ab));
++    for ([_]Cut{ .off, .on }) |cut| try abPair(true, cut);
++    for ([_]Cut{ .off, .on, .ab }) |cut| try abPair(false, cut);
++}
++
++test "inkling2 lanes: TF_INK2_SHARED_CUT: `deepen` unset, `cut`, `0` off" {
++    const t = std.testing;
++    try t.expectEqual(lanes.config.SharedCut.deepen, parseSharedCut(null)); // the default
++    // a flush of left-out streams reads chances only when shared rounds use them in effect: never with the cut off
++    try t.expect(!leftOutChances(true, .off, .deepen) and !leftOutChances(true, .off, .cut) and !leftOutChances(true, .off, .off));
++    try t.expect(leftOutChances(true, .on, .deepen) and leftOutChances(true, .ab, .cut) and !leftOutChances(true, .on, .off));
++    // a lone round or one of 5 or more live streams (not open): v0.2's proposals-only flush whatever the switches say
++    try t.expect(!leftOutChances(false, .on, .deepen) and !leftOutChances(false, .ab, .cut));
++    try t.expectEqual(lanes.config.SharedCut.off, parseSharedCut("0"));
++    try t.expectEqual(lanes.config.SharedCut.deepen, parseSharedCut("yes"));
++    try t.expectEqual(lanes.config.SharedCut.cut, parseSharedCut("cut"));
++    try t.expectEqual(lanes.config.SharedCut.cut, parseSharedCut("1"));
++    try t.expectEqual(lanes.config.SharedCut.deepen, parseSharedCut("deepen"));
++    try t.expectEqual(lanes.config.SharedCut.deepen, parseSharedCut("2"));
++    // the fact reaches the lane core's config only with the priced shared pass and the drafter
++    const m: lanes.Model = .{ .exact_width = ic.state.spec_rows, .gpu_tokens = false, .mtp = true, .speculate = true, .drafts = ic.dspark.drafts, .draft_prior = &draft_prior, .window_costs = &tp4_costs, .window_costs_lone = true, .hidden_rows = true, .batch_rows = batch_rows, .max_streams = batch_streams, .shared_costs = &shared_costs, .draft_streams = true, .draft_pass = shared_pass, .shared_cut = .deepen };
++    var c = try lanes.config.Config.init(t.allocator, m, ic.state.spec_rows, ic.state.spec_rows - 1);
++    defer c.deinit(t.allocator);
++    try t.expectEqual(lanes.config.SharedCut.deepen, c.shared_cut);
++}
++
++test "inkling2 lanes: the lone cut's chances: a rising map under 1, each lane's own block, none unread" {
++    var last: f64 = 0;
++    var p: f64 = 0;
++    while (p <= 1.0) : (p += 0.0005) {
++        const y = landing(p);
++        try std.testing.expect(y >= last and y < 1);
++        last = y;
++    }
++    try std.testing.expectEqual(@as(f64, 0), landing(0));
++    for (cut_map) |k| try std.testing.expectApproxEqAbs(k[1], landing(k[0]), 1e-12);
++    // two streams' blocks: each lane gives its own chances; a block whose chances were not read gives none
++    var a: Lane = .{ .slot = 0, .held_n = 7, .cut = true, .chances_ok = true };
++    var b: Lane = .{ .slot = 1, .held_n = 3, .cut = true };
++    a.chances = @splat(0.999);
++    b.chances = @splat(0.3);
++    var out: [7]f64 = undefined;
++    try std.testing.expect(chainChances(&a, &out));
++    for (out, 1..) |x, j| try std.testing.expectApproxEqAbs(std.math.pow(f64, landing(@as(f32, 0.999)), @floatFromInt(j)), x, 1e-12);
++    try std.testing.expect(!chainChances(&b, out[0..3]));
++    b.chances_ok = true;
++    try std.testing.expect(chainChances(&b, out[0..3]));
++    for (out[0..3], 1..) |x, j| try std.testing.expectApproxEqAbs(std.math.pow(f64, landing(@as(f32, 0.3)), @floatFromInt(j)), x, 1e-12);
++    try std.testing.expect(!chainChances(&b, out[0..4])); // more than it holds
++}
++
++/// A drafter for `eagerPass` (host tests): each pass writes its streams' drafts and chances (slot-dependent) into its
++/// own buffer a stream, as the device does, so a later pass overwrites an earlier one's.
++const FakeDrafter = struct {
++    last: [engine.max_segs][ic.dspark.drafts]f32 = undefined,
++    passes: [2]usize = .{ 0, 0 }, // one-stream (`draft`) and several-stream (`draftMany`) passes
++    reads: usize = 0,
++
++    fn chance(slot: u32, j: usize) f32 {
++        return @as(f32, @floatFromInt(slot + 1)) / 16 + @as(f32, @floatFromInt(j)) / 128;
++    }
++
++    fn fill(d: *FakeDrafter, s: usize, slot: u32, out: *[ic.dspark.drafts]u32) void {
++        for (out, &d.last[s], 0..) |*t, *c, j| {
++            t.* = slot * 100 + @as(u32, @intCast(j));
++            c.* = chance(slot, j);
++        }
++    }
++
++    fn draft(d: *FakeDrafter, slot: u32, n: usize, anchor: u32, out: *[ic.dspark.drafts]u32) !void {
++        _ = .{ n, anchor };
++        d.passes[0] += 1;
++        d.fill(0, slot, out);
++    }
++
++    fn draftMany(d: *FakeDrafter, items: []const engine.DraftItem, keeps: []const usize, out: []const *[ic.dspark.drafts]u32) !void {
++        _ = keeps;
++        d.passes[1] += 1;
++        for (items, out, 0..) |it, o, s| d.fill(s, it.slot, o);
++    }
++
++    fn chances(d: *FakeDrafter, out: []const *[ic.dspark.drafts]f32) !void {
++        d.reads += 1;
++        for (out, 0..) |o, s| o.* = d.last[s];
++    }
++
++    fn expectOwn(l: *const Lane) !void {
++        try std.testing.expect(l.chances_ok);
++        for (l.chances, 0..) |c, j| try std.testing.expectEqual(chance(l.slot, j), c);
++        for (l.held, 0..) |t, j| try std.testing.expectEqual(l.slot * 100 + @as(u32, @intCast(j)), t);
++    }
++};
++
++/// A stream for `eagerPass` (host tests): greedy, no grammar, its context `context`.
++fn testStream(id: []const u8, context: u64) !lanes.Stream {
++    var s = try lanes.Stream.init(std.testing.allocator, .{ .id = id, .prompt = &.{ 1, 2, 3 }, .max_new = 8 });
++    s.cache_len = context;
++    return s;
++}
++
++test "inkling2 lanes: an eager draft keeps its chances, each lane its own, one stream a pass or several in one" {
++    var d: FakeDrafter = .{};
++    var s = try testStream("shallow", 600); // every lane's stream: greedy, at 600
++    defer s.deinit(std.testing.allocator);
++    var a: Lane = .{ .slot = 2, .cut = true };
++    var b: Lane = .{ .slot = 5 };
++    var c: Lane = .{ .slot = 7, .cut = true };
++    // TF_INK2_DRAFT_STREAMS=0: a pass a stream, one after the other; the cut lane's chances are read before the next
++    // pass overwrites them, a lane not cut reads none
++    try Lanes.eagerPass(&d, &d, &.{.{ .slot = a.slot, .anchor = 1 }}, &.{1}, &.{&a}, &.{&s});
++    try Lanes.eagerPass(&d, &d, &.{.{ .slot = b.slot, .anchor = 1 }}, &.{1}, &.{&b}, &.{&s});
++    try std.testing.expectEqual([2]usize{ 2, 0 }, d.passes);
++    try std.testing.expectEqual(@as(usize, 1), d.reads);
++    try FakeDrafter.expectOwn(&a);
++    try std.testing.expect(!b.chances_ok);
++    // the cut reads them: the chain's chances of the lane's own block
++    a.held_n = ic.dspark.drafts;
++    var out: [ic.dspark.drafts]f64 = undefined;
++    try std.testing.expect(chainChances(&a, &out));
++    try std.testing.expectApproxEqAbs(landing(FakeDrafter.chance(a.slot, 0)), out[0], 1e-12);
++    // the drafting streams in one pass (one stream: `draft`, several: `draftMany`), each lane its own stream's chances
++    a.chances_ok = false;
++    try Lanes.eagerPass(&d, &d, &.{ .{ .slot = b.slot, .anchor = 1 }, .{ .slot = c.slot, .anchor = 1 }, .{ .slot = a.slot, .anchor = 1 } }, &.{ 1, 1, 1 }, &.{ &b, &c, &a }, &.{ &s, &s, &s });
++    try std.testing.expectEqual([2]usize{ 2, 1 }, d.passes);
++    try std.testing.expectEqual(@as(usize, 2), d.reads);
++    for ([_]*const Lane{ &a, &b, &c }) |l| try FakeDrafter.expectOwn(l);
++    c.chances_ok = false;
++    try Lanes.eagerPass(&d, &d, &.{.{ .slot = c.slot, .anchor = 1 }}, &.{1}, &.{&c}, &.{&s});
++    try std.testing.expectEqual([2]usize{ 3, 1 }, d.passes);
++    try FakeDrafter.expectOwn(&c);
++    // no lane cut (TF_INK2_DRAFT_CUT=0: the drafter makes no chances): nothing read
++    var e: Lane = .{ .slot = 3 };
++    var f: Lane = .{ .slot = 4 };
++    try Lanes.eagerPass(&d, &d, &.{ .{ .slot = e.slot, .anchor = 1 }, .{ .slot = f.slot, .anchor = 1 } }, &.{ 1, 1 }, &.{ &e, &f }, &.{ &s, &s });
++    try std.testing.expectEqual(@as(usize, 3), d.reads);
++    try std.testing.expect(!e.chances_ok and !f.chances_ok);
++}
++
++test "inkling2 lanes: an eager pass reads no chances that no next window can use, and every lane's in order when one can" {
++    const gpa = std.testing.allocator;
++    var d: FakeDrafter = .{};
++    var deep = try testStream("deep", depth_from + 1);
++    defer deep.deinit(gpa);
++    var sampled = try testStream("sampled", 600);
++    defer sampled.deinit(gpa);
++    sampled.sampling = .{ .seed = 1 };
++    var walked = try testStream("grammar", 600);
++    defer walked.deinit(gpa);
++    var k: lanes.grammar.Constraint = undefined; // never read: only whether the stream has one
++    walked.grammar = &k;
++    defer walked.grammar = null;
++    var at = try testStream("at depth_from", depth_from);
++    defer at.deinit(gpa);
++    var a: Lane = .{ .slot = 1, .cut = true };
++    var b: Lane = .{ .slot = 2, .cut = true };
++    var c: Lane = .{ .slot = 3, .cut = true };
++    var w: Lane = .{ .slot = 4 }; // not in the cut arm (TF_INK2_DRAFT_CUT=ab's whole arm)
++    var g: Lane = .{ .slot = 6, .cut = true };
++    // none can: a cut lane past depth_from, sampled or with a grammar, and a lane not cut at a context the cut takes;
++    // a pass a stream (TF_INK2_DRAFT_STREAMS=0) or all in one, nothing is read
++    const lns = [_]*Lane{ &a, &b, &c, &w };
++    const streams = [_]*const lanes.Stream{ &deep, &sampled, &walked, &at };
++    for (lns, streams) |l, s| try Lanes.eagerPass(&d, &d, &.{.{ .slot = l.slot, .anchor = 1 }}, &.{1}, &.{l}, &.{s});
++    const items = [_]engine.DraftItem{ .{ .slot = a.slot, .anchor = 1 }, .{ .slot = b.slot, .anchor = 1 }, .{ .slot = c.slot, .anchor = 1 }, .{ .slot = w.slot, .anchor = 1 }, .{ .slot = g.slot, .anchor = 1 } };
++    try Lanes.eagerPass(&d, &d, items[0..4], &.{ 1, 1, 1, 1 }, &lns, &streams);
++    try std.testing.expectEqual([2]usize{ 4, 1 }, d.passes);
++    try std.testing.expectEqual(@as(usize, 0), d.reads);
++    for (lns) |l| try std.testing.expect(!l.chances_ok);
++    // a cut lane at depth_from, greedy, without a grammar: its pass's chances are read, every lane's in the pass's
++    // order (the batch's order kept, each its own stream's), alone or among the others
++    try Lanes.eagerPass(&d, &d, items[4..], &.{1}, &.{&g}, &.{&at});
++    try std.testing.expectEqual(@as(usize, 1), d.reads);
++    try FakeDrafter.expectOwn(&g);
++    g.chances_ok = false;
++    try Lanes.eagerPass(&d, &d, &.{ items[0], items[4], items[1], items[2], items[3] }, &.{ 1, 1, 1, 1, 1 }, &.{ &a, &g, &b, &c, &w }, &.{ &deep, &at, &sampled, &walked, &at });
++    try std.testing.expectEqual(@as(usize, 2), d.reads);
++    for ([_]*const Lane{ &a, &g, &b, &c, &w }) |l| try FakeDrafter.expectOwn(l);
++    // TF_INK2_DRAFT_DEPTH=0: no context prices, so the lane core cuts nothing (lanes/config.zig lone_cut): none read
++    const env = struct {
++        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
++        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
++    };
++    _ = env.setenv("TF_INK2_DRAFT_DEPTH", "0", 1);
++    defer _ = env.unsetenv("TF_INK2_DRAFT_DEPTH");
++    g.chances_ok = false;
++    try Lanes.eagerPass(&d, &d, items[4..], &.{1}, &.{&g}, &.{&at});
++    try std.testing.expectEqual(@as(usize, 2), d.reads);
++    try std.testing.expect(!g.chances_ok);
++}
++
++test "inkling2 lanes: once draftFn's dispatch returns a lane's chances are its new block's, or none" {
++    const gpa = std.testing.allocator;
++    var d: FakeDrafter = .{};
++    var s = try testStream("shallow", 600);
++    defer s.deinit(gpa);
++    var deep = try testStream("deep", depth_from + 1);
++    defer deep.deinit(gpa);
++    // each lane holds its last block's chances, read
++    var a: Lane = .{ .slot = 2, .cut = true, .chances_ok = true };
++    var b: Lane = .{ .slot = 5, .cut = true, .chances_ok = true };
++    a.chances = @splat(0.5);
++    b.chances = @splat(0.5);
++    // a pass a stream (TF_INK2_DRAFT_STREAMS=0): a lane whose stream can be cut at its next window holds the new
++    // block's chances; one whose next window cannot use them holds none (not its last block's)
++    var each: Lanes.Dispatch = .{ .how = .each };
++    try each.add(&d, &d, &a, .{ .slot = a.slot, .anchor = 1 }, 1, &s, ic.dspark.drafts);
++    try FakeDrafter.expectOwn(&a);
++    try each.add(&d, &d, &b, .{ .slot = b.slot, .anchor = 1 }, 1, &deep, ic.dspark.drafts);
++    try std.testing.expect(!b.chances_ok);
++    try each.finish(&d, &d);
++    try std.testing.expectEqual([2]usize{ 2, 0 }, d.passes);
++    var out: [ic.dspark.drafts]f64 = undefined;
++    try std.testing.expect(chainChances(&a, &out) and !chainChances(&b, &out));
++    // one pass of every drafting stream: none count until it runs, then each lane's own
++    a.chances_ok = true;
++    b.chances_ok = true;
++    var one: Lanes.Dispatch = .{ .how = .one };
++    try one.add(&d, &d, &a, .{ .slot = a.slot, .anchor = 1 }, 1, &s, ic.dspark.drafts);
++    try one.add(&d, &d, &b, .{ .slot = b.slot, .anchor = 1 }, 1, &s, ic.dspark.drafts);
++    try std.testing.expect(!a.chances_ok and !b.chances_ok);
++    try one.finish(&d, &d);
++    try std.testing.expectEqual([2]usize{ 2, 1 }, d.passes);
++    try FakeDrafter.expectOwn(&a);
++    try FakeDrafter.expectOwn(&b);
++    // deferred (the default): no pass now; the last block's chances stop counting, the draft waits for the verify
++    var later: Lanes.Dispatch = .{ .how = .deferred };
++    try later.add(&d, &d, &a, .{ .slot = a.slot, .anchor = 1 }, 1, &s, ic.dspark.drafts);
++    try later.finish(&d, &d);
++    try std.testing.expect(!a.chances_ok and a.pending != null and a.held_n == ic.dspark.drafts);
++    try std.testing.expectEqual([2]usize{ 2, 1 }, d.passes);
++    try std.testing.expectEqual(@as(usize, 2), d.reads);
 +}
 +
 +test "inkling2 lanes: a mask sets every disallowed token to -inf, the row's last word partial, and refuses a row it empties" {

@@ -1,11 +1,11 @@
-From 4b6c0fe8f7a6c615ec7c19b4f1eea085aa9fef8b Mon Sep 17 00:00:00 2001
+From 3a4ca65601a46722c656472f47212a6f3213eb1b Mon Sep 17 00:00:00 2001
 From: Scott Biggart <297695+swbiggart@users.noreply.github.com>
-Date: Mon, 16 Nov 2026 01:00:00 -0800
+Date: Tue, 17 Nov 2026 19:30:00 -0800
 Subject: [PATCH 5/8] inkling2: prompt cache: exact prefix snapshots,
  shared_first rules, store budget
 
 9 files (2 new, 7 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
-Part of the engine changes behind Inkling-2-Small TP4 v0.1 (github.com/swbiggart/inkling2-sparks).
+Part of the engine changes behind Inkling-2-Small TP4 v0.2 (github.com/swbiggart/inkling2-sparks).
 Apply the whole series in order with git am (scripts/build-engine.sh does); only the full series is built and gated.
 ---
  docs/profiles.md                              |   2 +-

@@ -1,36 +1,37 @@
-From 18431ab3defd7ce88c6a62f51b9bf2e0e234600e Mon Sep 17 00:00:00 2001
+From 2b4c163c3a5e8653ebd6f2de3625c04123b0698e Mon Sep 17 00:00:00 2001
 From: Scott Biggart <297695+swbiggart@users.noreply.github.com>
-Date: Mon, 16 Nov 2026 01:00:00 -0800
+Date: Tue, 17 Nov 2026 19:30:00 -0800
 Subject: [PATCH 1/8] inkling2: the Inkling-2 family: config, plan and weights,
  tensor-parallel CUDA runner and KV page pool, server text layer, structured
  output and chat template
 
-69 files (43 new, 26 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
-Part of the engine changes behind Inkling-2-Small TP4 v0.1 (github.com/swbiggart/inkling2-sparks).
+70 files (43 new, 27 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
+Part of the engine changes behind Inkling-2-Small TP4 v0.2 (github.com/swbiggart/inkling2-sparks).
 Apply the whole series in order with git am (scripts/build-engine.sh does); only the full series is built and gated.
 ---
  zig/src/core/engine_api.zig                   |    1 +
  zig/src/core/engine_status.zig                |   28 +
  zig/src/core/lane_cache_queue.zig             |   19 +-
  zig/src/core/lane_host_status.zig             |    1 +
+ zig/src/core/root.zig                         |    2 +
  zig/src/core/template/filters.zig             |   20 +-
  zig/src/core/template/provenance_test.zig     |    2 +-
  zig/src/core/template/pyfloat.zig             |   92 +
  zig/src/core/template/template.zig            |   29 +-
  zig/src/families/inkling2/config.zig          |  520 +++++
  zig/src/families/inkling2/cuda.zig            |   64 +
- .../families/inkling2/cuda_decode_main.zig    | 1811 ++++++++++++++++
+ .../families/inkling2/cuda_decode_main.zig    | 1822 ++++++++++++++++
  zig/src/families/inkling2/cuda_embed.zig      |  133 ++
- zig/src/families/inkling2/cuda_engine.zig     | 1632 ++++++++++++++
+ zig/src/families/inkling2/cuda_engine.zig     | 1858 ++++++++++++++++
  zig/src/families/inkling2/cuda_follow.zig     |  504 +++++
- zig/src/families/inkling2/cuda_forward.zig    |  682 ++++++
+ zig/src/families/inkling2/cuda_forward.zig    |  749 +++++++
  zig/src/families/inkling2/cuda_mem_check.zig  |  105 +
- zig/src/families/inkling2/cuda_native.zig     |  670 ++++++
+ zig/src/families/inkling2/cuda_native.zig     |  675 ++++++
  zig/src/families/inkling2/cuda_pages.zig      |  811 +++++++
  zig/src/families/inkling2/cuda_run_main.zig   |  926 ++++++++
- zig/src/families/inkling2/cuda_scratch.zig    |  188 ++
+ zig/src/families/inkling2/cuda_scratch.zig    |  193 ++
  zig/src/families/inkling2/cuda_serve.zig      |   11 +
- zig/src/families/inkling2/cuda_state.zig      |  675 ++++++
+ zig/src/families/inkling2/cuda_state.zig      |  680 ++++++
  zig/src/families/inkling2/cuda_synth.zig      |  212 ++
  zig/src/families/inkling2/cuda_tp.zig         |  189 ++
  zig/src/families/inkling2/cuda_weights.zig    |  854 ++++++++
@@ -78,7 +79,7 @@ Apply the whole series in order with git am (scripts/build-engine.sh does); only
  zig/src/server/status_routes.zig              |   69 +
  zig/src/server/tool_grammar.zig               |    6 +-
  zig/src/server/tool_grammar_xgrammar_test.zig |    4 +
- 69 files changed, 20496 insertions(+), 53 deletions(-)
+ 70 files changed, 20817 insertions(+), 53 deletions(-)
  create mode 100644 zig/src/core/template/pyfloat.zig
  create mode 100644 zig/src/families/inkling2/config.zig
  create mode 100644 zig/src/families/inkling2/cuda.zig
@@ -251,6 +252,26 @@ index 954f5871c7a037bab0f74400caf0d2ed72e2408d..54f122e984b2ea1362ed7b1df4cc62e8
      };
      fillTotals(h, out);
  }
+diff --git a/zig/src/core/root.zig b/zig/src/core/root.zig
+index a34a9aa843734ae948ba345116cac88397ea4074..ca5598d591ae8199572acdb13262bd02103a0ffe 100644
+--- a/zig/src/core/root.zig
++++ b/zig/src/core/root.zig
+@@ -62,6 +62,7 @@ pub const dspine = @import("dspine.zig");
+ pub const tree_round = @import("tree_round.zig");
+ pub const attention_ref = @import("attention_ref.zig");
+ pub const attention_range = @import("attention_range.zig");
++pub const relbias_attention_ref = @import("relbias_attention_ref.zig");
+ pub const gdn_prep_ref = @import("gdn_prep_ref.zig");
+ pub const qk_ref = @import("qk_ref.zig");
+ pub const moe_ref = @import("moe_ref.zig");
+@@ -103,6 +104,7 @@ test {
+     _ = tree_round;
+     _ = attention_ref;
+     _ = attention_range;
++    _ = relbias_attention_ref;
+     _ = gdn_prep_ref;
+     _ = qk_ref;
+     _ = moe_ref;
 diff --git a/zig/src/core/template/filters.zig b/zig/src/core/template/filters.zig
 index 00e498686c2b132224ff8abf815c9c8197bfcea0..b3e1b9d493019e5a4ac4fe224585e409459aecbf 100644
 --- a/zig/src/core/template/filters.zig
@@ -1056,10 +1077,10 @@ index 0000000000000000000000000000000000000000..91206d6aa2b7cb7a60d66c88ab14f1ca
 +}
 diff --git a/zig/src/families/inkling2/cuda_decode_main.zig b/zig/src/families/inkling2/cuda_decode_main.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..48aba4c313e9bfdc6b75b71c5b463780dd4bff21
+index 0000000000000000000000000000000000000000..f2cfa0041f000fe33b0efa7ed9e8023f169e5133
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_decode_main.zig
-@@ -0,0 +1,1811 @@
+@@ -0,0 +1,1822 @@
 +//! tf-inkling2-decode: the serving engine's decode path against whole-prompt forwards. On slot 0 a prompt of T
 +//! tokens runs in 2048-row chunks, then S greedy decode steps of one row each (the per-stream state carried across
 +//! forwards: global keys and values, the sliding ring, the four convolution states a layer). Then on slot 1 the
@@ -1171,6 +1192,7 @@ index 0000000000000000000000000000000000000000..48aba4c313e9bfdc6b75b71c5b463780
 +    \\  --drafts D      drafts a round (default 7)
 +    \\  --price N       adds price (N windows a width) to the list
 +    \\  --ab N          the fuse experiment's steps; without --exp, adds fuse after the check (as before --exp)
++    \\  --ab-rows R     the fuse experiment's rows a step (default 1; up to 16): windows of R rows, every row compared
 +    \\  --budget-steps N  (default 8)   --ab-reps N (default 10)   --ab-steps N (default 8)
 +    \\  --cuts LIST    resume's cuts (default 1,2,3,8,9,1000,1023,1024,2047,2048,2049 and T - 1; those below T)
 +    \\  --draft-cuts LIST  resume-draft's cuts (default 1000 and T - 1)
@@ -1194,6 +1216,8 @@ index 0000000000000000000000000000000000000000..48aba4c313e9bfdc6b75b71c5b463780
 +    \\                  alternated N times a width (default 10): each width's medians and paired difference
 +    \\  --shared-price N  adds shared-price (the drafter loaded): forwards of 1 .. 32 rows in all as the fewest streams
 +    \\                  of at most 8 rows (slots 3 .. 6), N timed a size (default 10): the lane core's shared prices
++    \\  --shared-grid 1 with shared-price: also S streams of r rows each (2 x 1, 4, 8; 4 x 1, 2, 4, 8; 8 x 1 .. 4) on
++    \\                  slots 3 .. 10, the shapes of 2-, 4- and 8-stream shared rounds
 +    \\  --argmax N      adds argmax (B2 C4, rank 0): the device argmax's op check (10,000 rows: ties, NaNs, -inf)
 +    \\                  against the host's greedy loop, then on slot 0 (after the check) windows of 1 and 8 rows
 +    \\                  with the logits downloaded and drawn on the host against the argmax rows alone, alternated N
@@ -1246,6 +1270,8 @@ index 0000000000000000000000000000000000000000..48aba4c313e9bfdc6b75b71c5b463780
 +    drafts: usize = 7,
 +    price: usize = 0,
 +    fuse_steps: usize = 0,
++    /// the fuse A/B's rows a step (--ab-rows; 1, or windows of up to 16)
++    ab_rows: usize = 1,
 +    budget_steps: usize = 8,
 +    ab_reps: usize = 10,
 +    ab_steps: usize = 8,
@@ -1254,6 +1280,7 @@ index 0000000000000000000000000000000000000000..48aba4c313e9bfdc6b75b71c5b463780
 +    op_check: bool = false,
 +    win_ab: usize = 0,
 +    shared_price: usize = 0,
++    shared_grid: bool = false,
 +    argmax: usize = 0,
 +    context: usize = 0,
 +    /// deep's state before the depth: the prompt's prefill, or synthetic values (--fill synth)
@@ -1401,7 +1428,7 @@ index 0000000000000000000000000000000000000000..48aba4c313e9bfdc6b75b71c5b463780
 +        const int = std.fmt.parseInt;
 +        if (eql(u8, k, "--layers")) o.layers = try int(u32, v, 10) else if (eql(u8, k, "--ids")) o.ids = v else if (eql(u8, k, "--prompt")) o.prompt = try int(usize, v, 10) else if (eql(u8, k, "--steps")) o.steps = try int(usize, v, 10) else if (eql(u8, k, "--chunk")) o.chunk = try int(usize, v, 10) else if (eql(u8, k, "--kl-max")) o.kl_max = try std.fmt.parseFloat(f64, v) else if (eql(u8, k, "--world")) o.world = try int(u32, v, 10) else if (eql(u8, k, "--rank")) o.rank = try int(u32, v, 10) else if (eql(u8, k, "--digests")) o.digests = v else if (eql(u8, k, "--draft")) {
 +            draft = if (eql(u8, v, "real")) .@"draft-real" else if (eql(u8, v, "mixed")) .@"draft-mixed" else return null;
-+        } else if (eql(u8, k, "--drafts")) o.drafts = try int(usize, v, 10) else if (eql(u8, k, "--price")) o.price = try int(usize, v, 10) else if (eql(u8, k, "--exp")) exp = v else if (eql(u8, k, "--budget-steps")) o.budget_steps = try int(usize, v, 10) else if (eql(u8, k, "--ab-reps")) o.ab_reps = try int(usize, v, 10) else if (eql(u8, k, "--ab-steps")) o.ab_steps = try int(usize, v, 10) else if (eql(u8, k, "--ab")) o.fuse_steps = try int(usize, v, 10) else if (eql(u8, k, "--solo")) o.solo = try int(u32, v, 10) else if (eql(u8, k, "--streams")) o.streams = try int(usize, v, 10) else if (eql(u8, k, "--op-check")) o.op_check = eql(u8, v, "1") else if (eql(u8, k, "--win-ab")) o.win_ab = try int(usize, v, 10) else if (eql(u8, k, "--shared-price")) o.shared_price = try int(usize, v, 10) else if (eql(u8, k, "--argmax")) o.argmax = try int(usize, v, 10) else if (eql(u8, k, "--src-rows")) o.src_rows = try int(usize, v, 10) else if (eql(u8, k, "--cuts")) o.cuts = v else if (eql(u8, k, "--draft-cuts")) o.draft_cuts = v else if (eql(u8, k, "--resume-back")) {
++        } else if (eql(u8, k, "--drafts")) o.drafts = try int(usize, v, 10) else if (eql(u8, k, "--price")) o.price = try int(usize, v, 10) else if (eql(u8, k, "--exp")) exp = v else if (eql(u8, k, "--budget-steps")) o.budget_steps = try int(usize, v, 10) else if (eql(u8, k, "--ab-reps")) o.ab_reps = try int(usize, v, 10) else if (eql(u8, k, "--ab-steps")) o.ab_steps = try int(usize, v, 10) else if (eql(u8, k, "--ab")) o.fuse_steps = try int(usize, v, 10) else if (eql(u8, k, "--ab-rows")) o.ab_rows = try int(usize, v, 10) else if (eql(u8, k, "--solo")) o.solo = try int(u32, v, 10) else if (eql(u8, k, "--streams")) o.streams = try int(usize, v, 10) else if (eql(u8, k, "--op-check")) o.op_check = eql(u8, v, "1") else if (eql(u8, k, "--win-ab")) o.win_ab = try int(usize, v, 10) else if (eql(u8, k, "--shared-price")) o.shared_price = try int(usize, v, 10) else if (eql(u8, k, "--shared-grid")) o.shared_grid = eql(u8, v, "1") else if (eql(u8, k, "--argmax")) o.argmax = try int(usize, v, 10) else if (eql(u8, k, "--src-rows")) o.src_rows = try int(usize, v, 10) else if (eql(u8, k, "--cuts")) o.cuts = v else if (eql(u8, k, "--draft-cuts")) o.draft_cuts = v else if (eql(u8, k, "--resume-back")) {
 +            o.resume_back = !eql(u8, v, "0");
 +        } else if (eql(u8, k, "--poison")) {
 +            o.poison = if (eql(u8, v, "none")) null else try int(u8, v, 10);
@@ -1566,7 +1593,7 @@ index 0000000000000000000000000000000000000000..48aba4c313e9bfdc6b75b71c5b463780
 +    const S = o.steps;
 +    // the check's context as before the experiments list (a slot's capacity sets a captured step's attention grid);
 +    // more only when the budget's and the A/B's slot needs it
-+    const need = @max(T + S + 64 + 10 * o.price + (if (o.has(.fuse)) o.fuse_steps else 0) + (if (o.has(.@"shared-price")) ic.batch_check.sharedPositions(o.shared_price) else 0) + (if (o.has(.argmax)) ic.argmax_check.tailPositions(o.argmax) else 0), T + o.benchSteps() + 8, if (o.has(.mixprice)) ic.batch_check.mixPositions(o.mix_reps, o.mix_depths[0..o.mix_ndepths], o.mix_decs[0..o.mix_ndecs]) else 0);
++    const need = @max(T + S + 64 + 10 * o.price + (if (o.has(.fuse)) (o.fuse_steps + 2) * o.ab_rows else 0) + (if (o.has(.@"shared-price")) ic.batch_check.sharedPositions(o.shared_price, o.shared_grid) else 0) + (if (o.has(.argmax)) ic.argmax_check.tailPositions(o.argmax) else 0), T + o.benchSteps() + 8, if (o.has(.mixprice)) ic.batch_check.mixPositions(o.mix_reps, o.mix_depths[0..o.mix_ndepths], o.mix_decs[0..o.mix_ndecs]) else 0);
 +    const context = @max(need, o.context);
 +    const e = try engine.Engine.init(gpa, io, &driver, o.dir, .{ .rank = o.rank, .world = o.world, .layers = o.layers, .context = context, .group = if (group) |*g| g else null, .digests = o.digests, .drafter = o.spec(), .solo = o.solo != null, .scratch_gib = ic.scratch.gib() });
 +    defer e.deinit();
@@ -1612,7 +1639,7 @@ index 0000000000000000000000000000000000000000..48aba4c313e9bfdc6b75b71c5b463780
 +        },
 +        .@"shared-price" => {
 +            only_deep = false;
-+            n = @max(n, ic.batch_check.first_slot + 4);
++            n = @max(n, ic.batch_check.first_slot + ic.batch_check.sharedStreams(o.shared_grid));
 +        },
 +        .mixprice => {
 +            only_deep = false;
@@ -1707,7 +1734,7 @@ index 0000000000000000000000000000000000000000..48aba4c313e9bfdc6b75b71c5b463780
 +        .streams => ok = try ic.batch_check.streams(gpa, io, x, seq, T, S, o.streams) and ok,
 +        .@"op-check" => ok = try ic.batch_check.opCheck(gpa, e) and ok,
 +        .@"win-ab" => try winAb(io, &x, o, seq, &bench),
-+        .@"shared-price" => try ic.batch_check.sharedPrice(io, x, seq, T, o.shared_price),
++        .@"shared-price" => try ic.batch_check.sharedPrice(io, x, seq, T, o.shared_price, o.shared_grid),
 +        .chunks => ok = try ic.batch_check.chunks(gpa, io, x, seq, T, S, if (o.ndepths == 1) first_hash else null) and ok,
 +        .mixprice => try ic.batch_check.mixPrice(io, x, seq, T, o.mix_reps, o.mix_depths[0..o.mix_ndepths], o.mix_decs[0..o.mix_ndecs]),
 +        .@"resume" => ok = try resumeGate(gpa, io, x, o, seq, first_hash.?) and ok,
@@ -2824,25 +2851,29 @@ index 0000000000000000000000000000000000000000..48aba4c313e9bfdc6b75b71c5b463780
 +    const U = e.vocab();
 +    const L = o.prompt + o.steps - 1;
 +    if (e.pos(0) != L or e.pos(1) != L) return error.AbSlotsApart;
-+    const rows = try gpa.alloc(f32, 2 * U);
++    const RR = o.ab_rows;
++    if (RR == 0 or RR > 16) return error.BadAbRows;
++    const rows = try gpa.alloc(f32, 2 * RR * U);
 +    defer gpa.free(rows);
 +    const t = try gpa.alloc(f64, 2 * o.fuse_steps);
 +    defer gpa.free(t);
 +    const warm = 2;
 +    var same: usize = 0;
 +    var tok = seq[L];
++    // --ab-rows R: windows of R rows (every row the last step's token; every row's logits compared)
++    var ids_buf: [16]u32 = undefined;
 +    for (0..o.fuse_steps + warm) |i| {
 +        const first: u32 = @intCast(i % 2);
 +        for ([2]u32{ first, 1 - first }) |slot| {
-+            const ids = [1]u32{tok};
++            @memset(ids_buf[0..RR], tok);
 +            const t0 = clock.now(io).toNanoseconds();
-+            try x.forward(slot, L + i, &ids, .{ .lo = 0, .n = 1 });
++            try x.forward(slot, L + i * RR, ids_buf[0..RR], .{ .lo = 0, .n = RR });
 +            const lg = try e.logits();
 +            if (i >= warm) t[slot * o.fuse_steps + i - warm] = ms(clock.now(io).toNanoseconds() - t0, 1);
-+            @memcpy(rows[slot * U ..][0..U], lg[0..U]);
++            @memcpy(rows[slot * RR * U ..][0 .. RR * U], lg[0 .. RR * U]);
 +        }
-+        if (i >= warm) same += @intFromBool(std.mem.eql(u8, std.mem.sliceAsBytes(rows[0..U]), std.mem.sliceAsBytes(rows[U..])));
-+        tok = argmax(rows[0..U]);
++        if (i >= warm) same += @intFromBool(std.mem.eql(u8, std.mem.sliceAsBytes(rows[0 .. RR * U]), std.mem.sliceAsBytes(rows[RR * U ..])));
++        tok = argmax(rows[(RR - 1) * U ..][0..U]);
 +    }
 +    const pass = same == o.fuse_steps;
 +    const n: f64 = @floatFromInt(o.fuse_steps);
@@ -2861,6 +2892,7 @@ index 0000000000000000000000000000000000000000..48aba4c313e9bfdc6b75b71c5b463780
 +    const med0 = median(t[0..o.fuse_steps]);
 +    const med1 = median(t[o.fuse_steps..]);
 +    const v = if (std.c.getenv("TF_INK2_FUSE")) |p| std.mem.span(p) else "lat";
++    if (RR > 1) std.debug.print("fuse A/B windows of {d} rows a step\n", .{RR});
 +    std.debug.print("{s} fuse A/B: {d} steps on slot 0 (TF_INK2_FUSE={s}) and slot 1 (the release's ops), logits bit-equal {d}/{d}; ms a step slot 0 {d:.3} (median {d:.3}), slot 1 {d:.3} (median {d:.3}); saved {d:.3} +- {d:.3} ms (paired mean +- standard error), medians {d:.3}\n", .{ if (pass) "PASS" else "FAIL", o.fuse_steps, v, same, o.fuse_steps, sum[0] / n, med0, sum[1] / n, med1, dmean, se, med1 - med0 });
 +    return pass;
 +}
@@ -3012,10 +3044,10 @@ index 0000000000000000000000000000000000000000..fe08e9487f9f25dfb781e3fb4ea976a9
 +}
 diff --git a/zig/src/families/inkling2/cuda_engine.zig b/zig/src/families/inkling2/cuda_engine.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..ac1b1c14f350482455b835e55cb6f450ec9ebee9
+index 0000000000000000000000000000000000000000..a85ab8d78bcb8f854ab1be00eaa3fd9e9be10060
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_engine.zig
-@@ -0,0 +1,1632 @@
+@@ -0,0 +1,1858 @@
 +//! One rank's Inkling-2 serving engine (`full` mode): the rank's weights of layers [0, N), one activation set for
 +//! forwards of up to `prompt_rows` rows, and a pool of per-stream states (slots) carried across forwards: each
 +//! layer's keys and values (global layers a slot a position, sliding layers a ring of 1023 + prompt_rows), its four
@@ -3051,6 +3083,7 @@ index 0000000000000000000000000000000000000000..ac1b1c14f350482455b835e55cb6f450
 +const tp = @import("cuda_tp.zig");
 +const dspark = @import("cuda_dspark.zig");
 +const moe = @import("cuda_moe.zig");
++const fuse = @import("cuda_fuse.zig");
 +const scratch = @import("cuda_scratch.zig");
 +const conv_rows = @import("cuda_conv.zig").state_rows;
 +const synth_fill = @import("cuda_synth.zig");
@@ -3474,6 +3507,10 @@ index 0000000000000000000000000000000000000000..ac1b1c14f350482455b835e55cb6f450
 +        if (o.group) |g| try e.agree(g, dir, manifest, mode);
 +        e.k = try kernels.Kernels.load(d);
 +        errdefer e.k.unload();
++        {
++            var cb: [160]u8 = undefined;
++            std.debug.print("{s}\n", .{e.k.attn.census(&cb)}); // the form census, on every rank (gates grep it)
++        }
 +        e.k.moe.mode = mode; // the mode the ranks agreed on
 +        try e.checkExperts();
 +        // cuBLASLt for ops.Ctx.linear, which no forward calls (the projections take the lane matmul); not required
@@ -3560,6 +3597,7 @@ index 0000000000000000000000000000000000000000..ac1b1c14f350482455b835e55cb6f450
 +        e.w.deinit();
 +        e.scratch.deinit();
 +        e.gemms.deinit();
++        e.k.attn.printExceptions(e.d); // kx's exception counters over the engine's life (real weights: rows 0)
 +        e.k.unload();
 +        e.hdr.free();
 +        e.stream.deinit();
@@ -3982,6 +4020,13 @@ index 0000000000000000000000000000000000000000..ac1b1c14f350482455b835e55cb6f450
 +        const dr = e.drafter orelse return error.NoDrafter;
 +        const c = e.ctx();
 +        try dr.proposalsMany(&c, out);
++    }
++
++    /// The last draft pass's pick probabilities of each of its streams, in its order (rank 0; the lone cut).
++    pub fn chances(e: *Engine, out: []const *[dspark.drafts]f32) !void {
++        const dr = e.drafter orelse return error.NoDrafter;
++        const c = e.ctx();
++        try dr.chancesMany(&c, out);
 +    }
 +
 +    /// A forward's launches, after its inputs are on the device: the embedding (W > 1: an eager forward's ids from the
@@ -4491,18 +4536,28 @@ index 0000000000000000000000000000000000000000..ac1b1c14f350482455b835e55cb6f450
 +        {
 +            var h = Sha.init(.{});
 +            var buf: [768]u8 = undefined;
++            var ab: [256]u8 = undefined;
++            // the switches hashed on their own (`settingsHash`): TF_INK2_DRAFT_CUT=0 and TF_INK2_UNEMBED_WIDE=0
++            const draft_cut_off = o.drafter and dspark.draftCut() == .off;
 +            // every switch that changes a rank's arithmetic, its collectives' shapes or whether decode steps run as
 +            // graphs: a rank set differently would hang a collective or mix arithmetic, so the ranks must agree
-+            h.update(try std.fmt.bufPrint(&buf, "world {d} layers {d} context {d} scratch {d} rows {d} mode {t} TF_INK2_ATTN={s} TF_INK2_XROWS={s} TF_INK2_TIME_EXCHANGE={s} TF_INK2_CK_PROFILE={s} TF_INK2_CK_SHAPE1={s} TF_INK2_GRAPHS_MAX={d} dspark {} TF_INK2_ROCE_MULTI={s} TF_ROCE={s} TF_INK2_PAGES={} TF_KV_POISON={} TF_INK2_PAGE_ORDER={s} TF_INK2_RUN_RING={}", .{ o.world, o.layers, o.context, o.scratch_gib, prompt_rows, mode, env("TF_INK2_ATTN"), env("TF_INK2_XROWS"), env("TF_INK2_TIME_EXCHANGE"), env("TF_INK2_CK_PROFILE"), env("TF_INK2_CK_SHAPE1"), graphsMax(), o.drafter, env("TF_INK2_ROCE_MULTI"), env("TF_ROCE"), pages.enabled(), pages.poisoned(), env("TF_INK2_PAGE_ORDER"), pages.ringOnRun() }));
++            const base = try std.fmt.bufPrint(&buf, "world {d} layers {d} context {d} scratch {d} rows {d} mode {t} {s} TF_INK2_XROWS={s} TF_INK2_TIME_EXCHANGE={s} TF_INK2_CK_PROFILE={s} TF_INK2_CK_SHAPE1={s} TF_INK2_GRAPHS_MAX={d} dspark {} TF_INK2_DSPARK_FP8={t} TF_INK2_ROCE_MULTI={s} TF_ROCE={s} TF_INK2_PAGES={} TF_KV_POISON={} TF_INK2_PAGE_ORDER={s} TF_INK2_RUN_RING={}", .{ o.world, o.layers, o.context, o.scratch_gib, prompt_rows, mode, ic_attn.fingerprintText(&ab), env("TF_INK2_XROWS"), env("TF_INK2_TIME_EXCHANGE"), env("TF_INK2_CK_PROFILE"), env("TF_INK2_CK_SHAPE1"), graphsMax(), o.drafter, dspark.fp8Mode(), env("TF_INK2_ROCE_MULTI"), env("TF_ROCE"), pages.enabled(), pages.poisoned(), env("TF_INK2_PAGE_ORDER"), pages.ringOnRun() });
++            // TF_INK2_SHARED_CUT is not hashed: rank 0 alone picks the shared rounds' widths and sends the segments
++            // (cuda_follow.zig), so ranks set differently still agree on every forward; the bytes stay v0.2's
++            settingsHash(&h, base, draft_cut_off, @import("cuda_head.zig").wideOn());
++            // the kernels' launch choices (fusion forms, the experts' shapes and grids): the same bits whatever they
++            // are, but a rank set differently launches different kernels, so the ranks must agree too
++            hashLaunchChoices(&h, .{ envOpt("TF_INK2_FUSE"), envOpt("TF_INK2_CK_SHAPEK1"), envOpt("TF_INK2_CK_BLOCKS"), envOpt("TF_INK2_CK_SHAPEW") }, moe.windowShapes(e.d) catch @splat(@splat(@splat(null))));
 +            h.final(&fp.settings);
 +        }
 +        var all: [ink.plan.max_world]Fingerprint = undefined;
 +        try g.gather(Fingerprint, e.d, e.stream, fp, all[0..o.world]);
 +        var ok = true;
 +        for (all[0..o.world], 0..) |y, r| {
-+            const why: ?[]const u8 = if (y.rank != r or y.world != o.world) "rank or world" else if (!std.mem.eql(u8, &y.program, &fp.program)) "the executable" else if (!std.mem.eql(u8, &y.checkpoint, &fp.checkpoint)) "the checkpoint or its digest manifest (TF_INK2_DIGESTS)" else if (!std.mem.eql(u8, &y.settings, &fp.settings)) "the settings (layers, --context, TF_INK2_SCRATCH_GIB, TF_INK2_MODE, TF_INK2_ATTN*, TF_INK2_XROWS, TF_INK2_TIME_EXCHANGE, TF_INK2_CK_PROFILE, TF_INK2_CK_SHAPE1, TF_INK2_GRAPHS_MAX, TF_INK2_DSPARK, TF_INK2_ROCE_MULTI, TF_ROCE, TF_INK2_PAGES, TF_KV_POISON, TF_INK2_PAGE_ORDER, TF_INK2_RUN_RING)" else null;
++            const why: ?[]const u8 = if (y.rank != r or y.world != o.world) "rank or world" else if (!std.mem.eql(u8, &y.program, &fp.program)) "the executable" else if (!std.mem.eql(u8, &y.checkpoint, &fp.checkpoint)) "the checkpoint or its digest manifest (TF_INK2_DIGESTS)" else if (!std.mem.eql(u8, &y.settings, &fp.settings)) "the settings (layers, --context, TF_INK2_SCRATCH_GIB, TF_INK2_MODE, TF_INK2_ATTN*, TF_INK2_XROWS, TF_INK2_TIME_EXCHANGE, TF_INK2_CK_PROFILE, TF_INK2_CK_SHAPE1, TF_INK2_CK_SHAPEK1, TF_INK2_CK_SHAPEW, TF_INK2_CK_BLOCKS, TF_INK2_FUSE, TF_INK2_GRAPHS_MAX, TF_INK2_DSPARK, TF_INK2_DSPARK_FP8, TF_INK2_UNEMBED_WIDE, TF_INK2_ROCE_MULTI, TF_ROCE, TF_INK2_PAGES, TF_KV_POISON, TF_INK2_PAGE_ORDER, TF_INK2_RUN_RING)" else null;
 +            if (why) |w| {
 +                std.log.err("inkling2 rank {d}: rank {d} differs from this rank in {s}", .{ o.rank, r, w });
++                if (o.drafter and std.mem.startsWith(u8, w, "the settings")) std.log.err("inkling2 rank {d}: the settings also cover TF_INK2_DRAFT_CUT (0 on some ranks only: their drafter makes no chances)", .{o.rank});
 +                ok = false;
 +            }
 +        }
@@ -4510,6 +4565,19 @@ index 0000000000000000000000000000000000000000..ac1b1c14f350482455b835e55cb6f450
 +        std.log.info("inkling2 rank {d} of {d}: fingerprint agreed (executable {x}, checkpoint and digest manifest {x}, settings {x}; {t} mode, {s})", .{ o.rank, o.world, fp.program[0..6], fp.checkpoint[0..6], fp.settings[0..6], mode, if (manifest != null) "contents checked" else "contents NOT checked" });
 +    }
 +};
++
++/// The settings part of the ranks' fingerprint (`Engine.agree`): `base`, the formatted settings (v0.2's text and 768-byte
++/// buffer), with the switches hashed on their own, each only when it is off its default. So a rank at the defaults has
++/// v0.2's digest, and a switch never decides whether `base` fits its buffer: ranks set differently all reach the gather
++/// and refuse at the comparison (`error.RankMismatch`) instead of one rank failing before it while the others wait.
++fn settingsHash(h: *std.crypto.hash.sha2.Sha256, base: []const u8, draft_cut_off: bool, wide: bool) void {
++    // TF_INK2_DRAFT_CUT=0: the drafter's argmax-only picks (cuda_dspark.zig draftCut); nothing is added when the
++    // drafter makes its chances, so that fingerprint is unchanged
++    if (draft_cut_off) h.update("TF_INK2_DRAFT_CUT=0 ");
++    h.update(base);
++    // TF_INK2_UNEMBED_WIDE=0: the unembed's row tiles at every row count (cuda_head.wideOn; the same bits)
++    if (!wide) h.update(" TF_INK2_UNEMBED_WIDE=0");
++}
 +
 +/// A captured forward (Engine.graphStep): the activations' ping-pong buffers as the capture found and left them,
 +/// the blocks it completed, and when it was last replayed (the cache's clock).
@@ -4607,6 +4675,174 @@ index 0000000000000000000000000000000000000000..ac1b1c14f350482455b835e55cb6f450
 +    return @as(f64, @floatFromInt(b)) / (1 << 30);
 +}
 +
++test "inkling2 cuda engine: the settings fingerprint hashes the wide unembed's switch beside v0.2's settings text" {
++    const Sha = std.crypto.hash.sha2.Sha256;
++    const digest = struct {
++        fn of(base: []const u8, cut_off: bool, wide: bool) [32]u8 {
++            var h = Sha.init(.{});
++            settingsHash(&h, base, cut_off, wide);
++            var d: [32]u8 = undefined;
++            h.final(&d);
++            return d;
++        }
++    }.of;
++    // a settings text that fills v0.2's 768-byte buffer to the last byte (the review's case: a long TF_INK2_CK_PROFILE)
++    var long: [768]u8 = undefined;
++    @memset(&long, '0');
++    for ([_][]const u8{ "world 4 layers 48", long[0..742], long[0..760], long[0..768] }) |base| {
++        for ([_]bool{ false, true }) |cut_off| {
++            // at the default (wide on) the digest is v0.2's: the draft cut's text, then the settings text, nothing else
++            var v = Sha.init(.{});
++            if (cut_off) v.update("TF_INK2_DRAFT_CUT=0 ");
++            v.update(base);
++            var dv: [32]u8 = undefined;
++            v.final(&dv);
++            try std.testing.expectEqualSlices(u8, &dv, &digest(base, cut_off, true));
++            // the switch set differently changes the digest (a refusal at the comparison), whatever the text's length
++            try std.testing.expect(!std.mem.eql(u8, &digest(base, cut_off, true), &digest(base, cut_off, false)));
++        }
++    }
++}
++
++fn envOpt(name: [*:0]const u8) ?[]const u8 {
++    return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
++}
++
++/// The kernels' launch choices as the kernels will make them (TF_INK2_FUSE, TF_INK2_CK_SHAPEK1, TF_INK2_CK_BLOCKS,
++/// TF_INK2_CK_SHAPEW, in that order; null: unset), parsed, resolved and hashed in a fixed binary form, each only where
++/// it differs from the resolved built-in default (a spelled-out default adds no byte either): equivalent spellings (unset or `lat`, flags in any order, 0 or unset blocks, an
++/// empty table) hash alike and an all-default run adds no byte, while two ranks whose choices differ cannot hash alike.
++/// A value the kernels would refuse is hashed as refused (its name), so ranks that differ in it stop at the agreement
++/// and ranks that agree on it all stop at the kernels' load.
++/// `win`: the window shapes a K1 row left unset falls back to (Kernels.ck_rows: TF_INK2_CK_SHAPE1, else the GB10 table
++/// on an integrated GPU), else ckShape's.
++fn hashLaunchChoices(h: anytype, v: [4]?[]const u8, win: moe.Rows) void {
++    if (v[0]) |x| {
++        if (fuse.Mode.parse(x)) |m| {
++            if (!std.meta.eql(m, fuse.Mode.lat)) {
++                h.update("fuse:");
++                inline for (@typeInfo(fuse.Mode).@"struct".field_names) |name| h.update(if (@field(m, name)) "1" else "0");
++                h.update(" ");
++            }
++        } else |_| h.update("fuse:refused ");
++    }
++    if (v[1]) |x| {
++        if (moe.parseK1(x)) |t| {
++            var r = t;
++            for (&r, 0..) |*pf, f| for (pf, 0..) |*pp, p| for (pp, 0..) |*e, i| {
++                if (e.* == null) e.* = win[f][p][i] orelse moe.ckShape(moe.topk * (i + 1));
++            };
++            if (!std.meta.eql(r, moe.k1Rows())) hashTable(h, "k1:", &r);
++        } else |_| h.update("k1:refused ");
++    }
++    if (v[2]) |x| {
++        if (moe.parseBlockCap(x)) |n| {
++            if (n != moe.block_cap_default) {
++                var b: [8]u8 = undefined;
++                std.mem.writeInt(u64, &b, n, .little);
++                h.update("blocks:");
++                h.update(&b);
++            }
++        } else |_| h.update("blocks:refused ");
++    }
++    if (v[3]) |x| {
++        if (moe.parseWide(x)) |t| {
++            // resolved: a band left to the default takes ckShape's shape 3 (calls of 9-64 rows), so an entry of 3:3
++            // and no entry are the same choice
++            var r = t;
++            for (&r) |*pf| for (pf) |*pp| for (pp) |*e| {
++                if (e.* == null) e.* = moe.ckShape(moe.topk * moe.window_rows + moe.topk);
++            };
++            var d: moe.Wide = undefined;
++            for (&d) |*pf| for (pf) |*pp| for (pp) |*e| {
++                e.* = moe.ckShape(moe.topk * moe.window_rows + moe.topk);
++            };
++            if (!std.meta.eql(r, d)) hashTable(h, "wide:", &r);
++        } else |_| h.update("wide:refused ");
++    }
++}
++
++/// A shape table ([format][pass][entry] ?u32) as a tag and one byte an entry (255: none; shapes are below 255).
++fn hashTable(h: anytype, tag: []const u8, t: anytype) void {
++    h.update(tag);
++    for (t) |pf| for (pf) |pp| for (pp) |e| h.update(&[_]u8{if (e) |x| @intCast(x) else 255});
++}
++
++test "inkling2 cuda engine: the launch choices hash by what they choose" {
++    const Sha = std.crypto.hash.sha2.Sha256;
++    // the GB10 window table (an integrated GPU, TF_INK2_CK_SHAPE1 unset)
++    const gb10: moe.Rows = comptime blk: {
++        var t: moe.Rows = undefined;
++        for (0..2) |f| for (0..2) |p| for (0..moe.window_rows) |r| {
++            t[f][p][r] = moe.gb10_rows[f][p][r];
++        };
++        break :blk t;
++    };
++    const Lc = struct {
++        fn of(v: [4]?[]const u8) [32]u8 {
++            return ofw(v, gb10);
++        }
++        fn ofw(v: [4]?[]const u8, win: moe.Rows) [32]u8 {
++            var h = Sha.init(.{});
++            hashLaunchChoices(&h, v, win);
++            var out: [32]u8 = undefined;
++            h.final(&out);
++            return out;
++        }
++    };
++    const none = Lc.of(.{ null, null, null, null });
++    var empty = Sha.init(.{});
++    try std.testing.expectEqual(none, empty.finalResult()); // all default: no byte added
++    // the raw-string form 1c442ae55 hashed (name=value, set ones only) got both of the review's examples wrong:
++    const Raw = struct {
++        fn of(v: [4]?[]const u8) [32]u8 {
++            var h = Sha.init(.{});
++            for ([_][]const u8{ "TF_INK2_FUSE", "TF_INK2_CK_SHAPEK1", "TF_INK2_CK_BLOCKS", "TF_INK2_CK_SHAPEW" }, v) |n, x| if (x) |y| {
++                h.update(n);
++                h.update("=");
++                h.update(y);
++                h.update(" ");
++            };
++            var out: [32]u8 = undefined;
++            h.final(&out);
++            return out;
++        }
++    };
++    const ex1a: [4]?[]const u8 = .{ null, null, "1 TF_INK2_CK_SHAPEW=4,4,4,4,4", null }; // cap: default, shapes: 3
++    const ex1b: [4]?[]const u8 = .{ null, null, "1", "4,4,4,4,4" }; // cap 1, shapes 4
++    const ex2a: [4]?[]const u8 = .{ null, null, null, null };
++    const ex2b: [4]?[]const u8 = .{ "lat", null, null, null }; // the same forms
++    try std.testing.expectEqual(Raw.of(ex1a), Raw.of(ex1b)); // different choices, one hash: agreed wrongly
++    try std.testing.expect(!std.mem.eql(u8, &Raw.of(ex2a), &Raw.of(ex2b))); // the same choices: refused wrongly
++    try std.testing.expect(!std.mem.eql(u8, &Lc.of(ex1a), &Lc.of(ex1b)));
++    try std.testing.expectEqual(Lc.of(ex2a), Lc.of(ex2b));
++    // equivalent spellings agree
++    try std.testing.expectEqual(none, Lc.of(.{ "lat", null, null, null }));
++    try std.testing.expectEqual(none, Lc.of(.{ "attn,mlp,route,proj,conv", "", "0", "" }));
++    try std.testing.expectEqual(Lc.of(.{ "conv,moe,attn", null, null, null }), Lc.of(.{ "attn,conv,moe", null, null, null }));
++    try std.testing.expectEqual(Lc.of(.{ null, null, "48", null }), Lc.of(.{ null, null, "048", null }));
++    // different choices differ, however their strings line up (one rank's BLOCKS swallowing the next setting)
++    try std.testing.expect(!std.mem.eql(u8, &Lc.of(.{ null, null, "1 TF_INK2_CK_SHAPEW=4,4,4,4,4", null }), &Lc.of(.{ null, null, "1", "4,4,4,4,4" })));
++    try std.testing.expect(!std.mem.eql(u8, &Lc.of(.{ null, null, null, "3,3,3,3,3" }), &Lc.of(.{ null, null, null, "3,3,3,3,10" })));
++    try std.testing.expect(!std.mem.eql(u8, &none, &Lc.of(.{ "attn,mlp,route,proj,conv,segs", null, null, null })));
++    try std.testing.expect(!std.mem.eql(u8, &none, &Lc.of(.{ null, "4", null, null })));
++    try std.testing.expect(!std.mem.eql(u8, &none, &Lc.of(.{ null, null, "x", null }))); // refused
++    // each setting spelled as its built-in default agrees with it unset
++    try std.testing.expectEqual(none, Lc.of(.{ "attn,mlp,route,proj,conv", null, null, null }));
++    try std.testing.expectEqual(none, Lc.of(.{ null, "", null, null }));
++    // K1 spelled out as its table (per format: its NVFP4 rows; the MXFP8 rows differ, so a one-list spelling of
++    // shape 10 everywhere is a different choice), and a K1 row left unset resolving to the window shape it takes
++    try std.testing.expect(!std.mem.eql(u8, &none, &Lc.of(.{ null, "10", null, null })));
++    const all4: moe.Rows = @splat(@splat(@splat(4)));
++    try std.testing.expectEqual(Lc.ofw(.{ null, "10,10,4", null, null }, all4), Lc.ofw(.{ null, "10,10", null, null }, all4));
++    try std.testing.expect(!std.mem.eql(u8, &Lc.of(.{ null, "10,10,4", null, null }), &Lc.of(.{ null, "10,10", null, null }))); // MXFP8's row 3 is 5 on GB10
++    try std.testing.expectEqual(none, Lc.of(.{ null, null, "1048576", null }));
++    try std.testing.expectEqual(none, Lc.of(.{ null, null, "99999999", null })); // above the cap's ceiling: no cap
++    try std.testing.expectEqual(none, Lc.of(.{ null, null, null, "3,3,3,3,3" }));
++    try std.testing.expectEqual(none, Lc.of(.{ null, null, null, "3:3,3,3,3,3;3,3,3,3,3:3" }));
++    try std.testing.expect(!std.mem.eql(u8, &none, &Lc.of(.{ null, null, null, "3,3,3,3,10" })));
++}
++
 +test "inkling2 cuda engine: a graph's key is its segments' slots and rows" {
 +    const k = try Key.of(&.{ .{ .slot = 2, .pos0 = 3000, .rows = 1 }, .{ .slot = 0, .pos0 = 77, .rows = 8 } });
 +    try std.testing.expectEqual(@as(u8, 2), k.n);
@@ -4647,6 +4883,28 @@ index 0000000000000000000000000000000000000000..ac1b1c14f350482455b835e55cb6f450
 +
 +test "inkling2 cuda engine: the graph cache holds every one-stream key at 8 slots" {
 +    try std.testing.expect(graphs_default >= 8 * graph_seg_rows and graph_rows <= head_rows);
++}
++
++test "inkling2 cuda engine: at the defaults the settings fingerprint is v0.2's digest of its settings text" {
++    // Engine.agree's settings part, composed as it calls it: the draft cut's and the wide unembed's switches
++    // (settingsHash), then the kernels' launch choices (hashLaunchChoices), each read from this process's environment.
++    // With every one of them at its default (none of TF_INK2_DRAFT_CUT, TF_INK2_UNEMBED_WIDE, TF_INK2_FUSE,
++    // TF_INK2_CK_SHAPEK1, TF_INK2_CK_BLOCKS, TF_INK2_CK_SHAPEW set) the digest must be v0.2's: sha256 of the settings
++    // text alone, as v0.2 hashed it (TF_INK2_SHARED_CUT is never hashed).
++    for ([_][*:0]const u8{ "TF_INK2_DRAFT_CUT", "TF_INK2_UNEMBED_WIDE", "TF_INK2_FUSE", "TF_INK2_CK_SHAPEK1", "TF_INK2_CK_BLOCKS", "TF_INK2_CK_SHAPEW" }) |n|
++        if (std.c.getenv(n) != null) return error.SkipZigTest;
++    const Sha = std.crypto.hash.sha2.Sha256;
++    const base = "world 4 layers 48 context 131072 scratch 0 rows 2048 mode default attn kx TF_INK2_XROWS= TF_INK2_TIME_EXCHANGE=";
++    for ([_]bool{ true, false }) |drafter| {
++        var h = Sha.init(.{});
++        settingsHash(&h, base, drafter and dspark.draftCut() == .off, @import("cuda_head.zig").wideOn());
++        hashLaunchChoices(&h, .{ envOpt("TF_INK2_FUSE"), envOpt("TF_INK2_CK_SHAPEK1"), envOpt("TF_INK2_CK_BLOCKS"), envOpt("TF_INK2_CK_SHAPEW") }, @splat(@splat(@splat(null))));
++        var got: [32]u8 = undefined;
++        h.final(&got);
++        var v02: [32]u8 = undefined;
++        Sha.hash(base, &v02, .{});
++        try std.testing.expectEqualSlices(u8, &v02, &got);
++    }
 +}
 diff --git a/zig/src/families/inkling2/cuda_follow.zig b/zig/src/families/inkling2/cuda_follow.zig
 new file mode 100644
@@ -5160,10 +5418,10 @@ index 0000000000000000000000000000000000000000..3db80ad444202fcd6b0e33eea3df7c4d
 +}
 diff --git a/zig/src/families/inkling2/cuda_forward.zig b/zig/src/families/inkling2/cuda_forward.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..954a8884c125395a8d72bf8f583ddb422c86edde
+index 0000000000000000000000000000000000000000..c19ce9fc30f55d9804438caa3d045fcddc43e978
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_forward.zig
-@@ -0,0 +1,682 @@
+@@ -0,0 +1,749 @@
 +//! Inkling-2's forward in `full` mode on one rank, written as the sequence of op-group entry points (cuda_res,
 +//! cuda_attn, cuda_conv, cuda_moe, cuda_head) over the activations of one forward (`Act`: R rows at positions
 +//! pos0 .. pos0 + R - 1 of one stream) and the stream's state (`State`). Every op runs between `before` and
@@ -5402,6 +5660,18 @@ index 0000000000000000000000000000000000000000..954a8884c125395a8d72bf8f583ddb42
 +        return f.c.k.fuse.mode.forRows(R);
 +    }
 +
++    /// Whether the convolutions take their commits in the same launch (TF_INK2_FUSE conv): up to 16 rows in all (a
++    /// thread walks every row of its channels), or with `segs` up to 16 rows in each of several streams (each
++    /// stream's rows are their own convolution; both forms give the same bits). Never under the prompt cache's capture.
++    fn convFused(f: *const Forward, R: usize, segs: []const Seg) bool {
++        const m = f.fuseMode(R);
++        if (f.capture != null or !m.conv) return false;
++        if (R <= conv.rows_a_thread) return true;
++        if (!m.segs or segs.len < 2) return false;
++        for (segs) |g| if (g.rows > conv.rows_a_thread) return false;
++        return true;
++    }
++
 +    fn before(f: *Forward, scope: Scope, op: []const u8, ins: []const Tensor, row0: usize) !void {
 +        try f.mark(scope, op);
 +        f.c.scratch.reset();
@@ -5544,8 +5814,11 @@ index 0000000000000000000000000000000000000000..954a8884c125395a8d72bf8f583ddb42
 +        const xq = xn[0];
 +        const xk = if (l.global) xn[1] else xn[0];
 +        const xv = if (l.global) xn[2] else xn[0];
-+        // projections (L3)
-+        const p: attn.Proj = .{
++        // projections (L3): up to attn.one_rows rows one launch a source (TF_INK2_FUSE proj) into a.one; at one row the
++        // outputs are views of it
++        const one_g: ?attn.Groups = if (R <= attn.one_rows and f.fuseMode(R).proj) attn.oneGroups(l) else null;
++        const one_on = one_g != null and R * attn.oneWidth(l.hq, l.hk) <= a.one.rows * a.one.cols;
++        const p: attn.Proj = if (one_on and R == 1) attn.oneViews(l, a.one.ptr) else .{
 +            .q = a.q.slice(0, R),
 +            .k = a.k.slice(0, R),
 +            .v = a.v.slice(0, R),
@@ -5562,7 +5835,7 @@ index 0000000000000000000000000000000000000000..954a8884c125395a8d72bf8f583ddb42
 +            .{ .name = "q", .m = p.q },       .{ .name = "k", .m = p.k },       .{ .name = "v", .m = p.v },
 +            .{ .name = "rel", .m = p.rel },   .{ .name = "gate", .m = p.gate }, .{ .name = "sink", .m = p.sink },
 +            .{ .name = "dk", .m = p.dk },     .{ .name = "dv", .m = p.dv },
-+        }, attn.project(c, l, xq, xk, xv, p), pos0);
++        }, if (one_on) attn.projectOne(c, l, one_g.?, xq, xk, xv, a.one.ptr, p) else attn.project(c, l, xq, xk, xv, p), pos0);
 +        // K and V convolutions (L4), the stream's state a segment
 +        var one: [1]Seg = undefined;
 +        const segs = try f.segments(R, pos0, &one);
@@ -5578,12 +5851,16 @@ index 0000000000000000000000000000000000000000..954a8884c125395a8d72bf8f583ddb42
 +            .{ .name = "state_k", .m = Mat.of(st.conv_k, conv.state_rows, kvc, .bf16), .whole = true },
 +            .{ .name = "state_v", .m = Mat.of(st.conv_v, conv.state_rows, kvc, .bf16), .whole = true },
 +        }, pos0);
-+        try f.after(s, "conv.kv", &.{ .{ .name = "kc", .m = kc }, .{ .name = "vc", .m = vc } }, convKv(c, l, li, segs, p, kc, vc), pos0);
-+        try f.mark(s, "state.conv");
-+        for (segs) |g| {
-+            const gs = g.st.layer(li);
-+            try f.commit(g.spec, gs.conv_k, gs.hist[0], p.k.slice(g.row0, g.rows));
-+            try f.commit(g.spec, gs.conv_v, gs.hist[1], p.v.slice(g.row0, g.rows));
++        // with the commits in the same launch up to 16 rows (TF_INK2_FUSE conv), else the commits after it
++        const kv_commit = f.convFused(R, segs);
++        try f.after(s, "conv.kv", &.{ .{ .name = "kc", .m = kc }, .{ .name = "vc", .m = vc } }, if (kv_commit) convKvCommit(c, l, li, segs, f.fuseMode(R).segs, p, kc, vc) else convKv(c, l, li, segs, p, kc, vc), pos0);
++        if (!kv_commit) {
++            try f.mark(s, "state.conv");
++            for (segs) |g| {
++                const gs = g.st.layer(li);
++                try f.commit(g.spec, gs.conv_k, gs.hist[0], p.k.slice(g.row0, g.rows));
++                try f.commit(g.spec, gs.conv_v, gs.hist[1], p.v.slice(g.row0, g.rows));
++            }
 +        }
 +        // heads (L5-L9) and the cache write (L11)
 +        const hd: attn.Heads = .{ .q = a.qh.slice(0, R), .k = a.kh.slice(0, R), .v = a.vh.slice(0, R), .rel = a.relh.slice(0, R) };
@@ -5634,11 +5911,14 @@ index 0000000000000000000000000000000000000000..954a8884c125395a8d72bf8f583ddb42
 +        const st = segs[0].st.layer(li);
 +        const ac = a.a.slice(0, R);
 +        try f.before(s, "conv.attn", &.{ .{ .name = "x", .m = ao }, .{ .name = "state", .m = Mat.of(st.conv_attn, conv.state_rows, H, .bf16), .whole = true } }, pos0);
-+        try f.after(s, "conv.attn", &.{.{ .name = "y", .m = ac }}, convPost(c, li, segs, l.attn_conv, ao, .attn, ac), pos0);
-+        try f.mark(s, "state.conv");
-+        for (segs) |g| {
-+            const gs = g.st.layer(li);
-+            try f.commit(g.spec, gs.conv_attn, gs.hist[2], ao.slice(g.row0, g.rows));
++        const post_commit = f.convFused(R, segs);
++        try f.after(s, "conv.attn", &.{.{ .name = "y", .m = ac }}, if (post_commit) convPostCommit(c, li, segs, f.fuseMode(R).segs, l.attn_conv, ao, .attn, ac) else convPost(c, li, segs, l.attn_conv, ao, .attn, ac), pos0);
++        if (!post_commit) {
++            try f.mark(s, "state.conv");
++            for (segs) |g| {
++                const gs = g.st.layer(li);
++                try f.commit(g.spec, gs.conv_attn, gs.hist[2], ao.slice(g.row0, g.rows));
++            }
 +        }
 +        // the block partial (L17), the MLP input (L18) and its norm
 +        const part = a.partial.slice(0, R);
@@ -5671,7 +5951,7 @@ index 0000000000000000000000000000000000000000..954a8884c125395a8d72bf8f583ddb42
 +        if (f.split()) {
 +            const x = f.x.?;
 +            const hm = Mat.of(x.hMine(R), R * moe.topk, moe.intermediate / x.world, .bf16);
-+            return f.after(s, "moe.experts", &.{.{ .name = "h", .m = hm }}, moe.splitUp(c, l, m, ids, wts, hm.ptr, x.split().?.plan, null), pos0);
++            return f.after(s, "moe.experts", &.{.{ .name = "h", .m = hm }}, moe.splitUp(c, l, m, ids, wts, hm.ptr, x.split().?.plan, null, .{ .k1 = f.fuseMode(R).moe }), pos0);
 +        }
 +        const y = if (f.x) |x| x.mine(.moe, R) else a.y.slice(0, R);
 +        try f.after(s, "moe.experts", &.{.{ .name = "y", .m = y }}, moe.experts(c, l, m, ids, wts, y), pos0);
@@ -5712,7 +5992,7 @@ index 0000000000000000000000000000000000000000..954a8884c125395a8d72bf8f583ddb42
 +        const s: Scope = .{ .layer = li };
 +        const ym = Mat.of(x.yMine(R), R, H / x.world, .bf16);
 +        try f.before(s, "moe.down", &.{}, pos0);
-+        try f.after(s, "moe.down", &.{.{ .name = "y", .m = ym }}, moe.splitDown(&f.c, l, R, sp.h, sp.plan, ym.ptr, null), pos0);
++        try f.after(s, "moe.down", &.{.{ .name = "y", .m = ym }}, moe.splitDown(&f.c, l, R, sp.h, sp.plan, ym.ptr, null, .{ .k1 = f.fuseMode(R).moe }), pos0);
 +    }
 +
 +    /// From the MoE sum (W > 1) to the layer's output in h[0].
@@ -5737,11 +6017,14 @@ index 0000000000000000000000000000000000000000..954a8884c125395a8d72bf8f583ddb42
 +        const st = segs[0].st.layer(li);
 +        const cm = a.cm.slice(0, R);
 +        try f.before(s, "conv.mlp", &.{ .{ .name = "x", .m = y }, .{ .name = "state", .m = Mat.of(st.conv_mlp, conv.state_rows, H, .bf16), .whole = true } }, pos0);
-+        try f.after(s, "conv.mlp", &.{.{ .name = "y", .m = cm }}, convPost(c, li, segs, l.mlp_conv, y, .mlp, cm), pos0);
-+        try f.mark(s, "state.conv");
-+        for (segs) |g| {
-+            const gs = g.st.layer(li);
-+            try f.commit(g.spec, gs.conv_mlp, gs.hist[3], y.slice(g.row0, g.rows));
++        const post_commit = f.convFused(R, segs);
++        try f.after(s, "conv.mlp", &.{.{ .name = "y", .m = cm }}, if (post_commit) convPostCommit(c, li, segs, f.fuseMode(R).segs, l.mlp_conv, y, .mlp, cm) else convPost(c, li, segs, l.mlp_conv, y, .mlp, cm), pos0);
++        if (!post_commit) {
++            try f.mark(s, "state.conv");
++            for (segs) |g| {
++                const gs = g.st.layer(li);
++                try f.commit(g.spec, gs.conv_mlp, gs.hist[3], y.slice(g.row0, g.rows));
++            }
 +        }
 +        try f.before(s, "res.output", &.{ .{ .name = "partial", .m = part }, .{ .name = "mconv", .m = cm } }, pos0);
 +        try f.after(s, "res.output", &.{.{ .name = "h", .m = h_out }}, res.output(c, part, cm, h_out), pos0);
@@ -5797,6 +6080,48 @@ index 0000000000000000000000000000000000000000..954a8884c125395a8d72bf8f583ddb42
 +        const dk = if (l.global) p.dk.slice(g.row0, g.rows) else p.dk;
 +        const dv = if (l.global) p.dv.slice(g.row0, g.rows) else p.dv;
 +        try conv.kv(c, l, p.k.slice(g.row0, g.rows), p.v.slice(g.row0, g.rows), dk, dv, gs.conv_k, gs.conv_v, kc.slice(g.row0, g.rows), vc.slice(g.row0, g.rows));
++    }
++}
++
++/// conv.kv and the K and V commits a segment as one launch (cuda_conv.zig kvCommit; `commit`'s choice of form), or
++/// with `one` (TF_INK2_FUSE segs) every segment's in one launch (kvCommitSegs, the same checks a segment). One
++/// segment keeps its own launch, so a one-stream forward (and its graph) is unchanged.
++fn convKvCommit(c: *const Ctx, l: *const weights.Layer, li: u32, segs: []const Seg, one: bool, p: attn.Proj, kc: Mat, vc: Mat) !void {
++    if (one and segs.len >= 2 and segs.len <= conv.max_segs) {
++        var t: [conv.max_segs]conv.Seg = undefined;
++        for (segs, t[0..segs.len]) |g, *e| {
++            const gs = g.st.layer(li);
++            e.* = .{ .row0 = g.row0, .rows = g.rows, .state = .{ gs.conv_k, gs.conv_v }, .hist = if (g.spec) .{ gs.hist[0], gs.hist[1] } else .{ 0, 0 } };
++        }
++        return conv.kvCommitSegs(c, l, p.k, p.v, p.dk, p.dv, kc, vc, t[0..segs.len]);
++    }
++    for (segs) |g| {
++        const gs = g.st.layer(li);
++        const dk = if (l.global) p.dk.slice(g.row0, g.rows) else p.dk;
++        const dv = if (l.global) p.dv.slice(g.row0, g.rows) else p.dv;
++        const hk: u64 = if (g.spec) gs.hist[0] else 0;
++        const hv: u64 = if (g.spec) gs.hist[1] else 0;
++        try conv.kvCommit(c, l, p.k.slice(g.row0, g.rows), p.v.slice(g.row0, g.rows), dk, dv, gs.conv_k, gs.conv_v, hk, hv, kc.slice(g.row0, g.rows), vc.slice(g.row0, g.rows));
++    }
++}
++
++/// conv.attn / conv.mlp and its commit a segment as one launch (cuda_conv.zig postCommit; `commit`'s choice of form),
++/// or with `one` every segment's in one launch (postCommitSegs; as convKvCommit).
++fn convPostCommit(c: *const Ctx, li: u32, segs: []const Seg, one: bool, taps: u64, x: Mat, which: enum { attn, mlp }, out: Mat) !void {
++    if (one and segs.len >= 2 and segs.len <= conv.max_segs) {
++        var t: [conv.max_segs]conv.Seg = undefined;
++        for (segs, t[0..segs.len]) |g, *e| {
++            const gs = g.st.layer(li);
++            const j: usize = if (which == .attn) 2 else 3;
++            e.* = .{ .row0 = g.row0, .rows = g.rows, .state = .{ if (which == .attn) gs.conv_attn else gs.conv_mlp, 0 }, .hist = .{ if (g.spec) gs.hist[j] else 0, 0 } };
++        }
++        return conv.postCommitSegs(c, taps, x, out, t[0..segs.len]);
++    }
++    for (segs) |g| {
++        const gs = g.st.layer(li);
++        const st = if (which == .attn) gs.conv_attn else gs.conv_mlp;
++        const h: u64 = if (g.spec) gs.hist[if (which == .attn) 2 else 3] else 0;
++        try conv.postCommit(c, taps, x.slice(g.row0, g.rows), st, h, out.slice(g.row0, g.rows));
 +    }
 +}
 +
@@ -5959,10 +6284,10 @@ index 0000000000000000000000000000000000000000..32e3e6101a770fc4a11d1040f54280c9
 +}
 diff --git a/zig/src/families/inkling2/cuda_native.zig b/zig/src/families/inkling2/cuda_native.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..ec042ffc643f824b963960f7d7c45afcef91a11d
+index 0000000000000000000000000000000000000000..339ca3496c5e9c2a94a8a1822a3f1d8a611ffc7b
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_native.zig
-@@ -0,0 +1,670 @@
+@@ -0,0 +1,675 @@
 +//! Inkling-2-Small behind the native CUDA registry (native/cuda.zig), `full` mode: `tensorfold-native serve MODEL
 +//! --backend cuda [--tp W --rank R]`. Rank 0 serves HTTP; ranks 1 .. W-1 (the same command with --rank R) load
 +//! their share, then run rank 0's forwards until it ends (cuda_follow.zig) and exit. The ranks meet over NCCL at
@@ -6108,6 +6433,11 @@ index 0000000000000000000000000000000000000000..ec042ffc643f824b963960f7d7c45afc
 +        };
 +    }
 +    errdefer if (own.group) |*g| g.close();
++    // A/B tooling, one experiment at a time: rank 0's refusal stops the other ranks with its reason
++    if (o.rank == 0) ink_lanes.abSwitches() catch |err| {
++        cuda.tp_watch.fail(@errorName(err));
++        return err;
++    };
 +    own.e = engine.Engine.init(gpa, io, ctx.d, dir, .{ .rank = o.rank, .world = world, .context = o.context + context_slack, .group = if (own.group) |*g| g else null, .scratch_gib = scratchGib() }) catch |err| {
 +        cuda.tp_watch.fail(@errorName(err)); // the other ranks stop with this rank's reason (a no-op at W = 1)
 +        return err;
@@ -8384,10 +8714,10 @@ index 0000000000000000000000000000000000000000..103ae569aeedaf6923eb9adb00845d7b
 +}
 diff --git a/zig/src/families/inkling2/cuda_scratch.zig b/zig/src/families/inkling2/cuda_scratch.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..52404b48c1ffc1b03a35a4cea2580db32a3cb2ef
+index 0000000000000000000000000000000000000000..abeef32fb571ce37ced988d684ae56fe36612ad3
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_scratch.zig
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,193 @@
 +//! The op scratch a forward takes (cuda_ops.zig Scratch: a bump arena the forward resets before every op), counted
 +//! from the ops' own sizes so a step can be checked before its header goes out: a short scratch found after the header
 +//! stops every rank (the others wait in a collective), one found before refuses only the step.
@@ -8480,6 +8810,11 @@ index 0000000000000000000000000000000000000000..52404b48c1ffc1b03a35a4cea2580db3
 +            n += 1;
 +        };
 +        most = @max(most, takes(pl[0..n]));
++        if (R <= attn.one_rows) if (attn.oneGroups(l)) |g| {
++            var ps: [3]usize = undefined; // attn.projectOne, its launches' takes
++            for (0..g.n) |i| ps[i] = k.attn.lane.partBytes(R, g.w[i]);
++            most = @max(most, takes(ps[0..g.n]));
++        };
 +        most = @max(most, part(k, l, .o, R));
 +        const E = &l.experts;
 +        if (E.count() == 0) continue;
@@ -8595,10 +8930,10 @@ index 0000000000000000000000000000000000000000..b9af131195068a5b7af4bacd80cfaf47
 +}
 diff --git a/zig/src/families/inkling2/cuda_state.zig b/zig/src/families/inkling2/cuda_state.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..ce8c7c848caca7a1587498a3e7ad0958a8c3b6d5
+index 0000000000000000000000000000000000000000..ce5a8e0a5b0383ee74412559ae26990442b38fb4
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_state.zig
-@@ -0,0 +1,675 @@
+@@ -0,0 +1,680 @@
 +//! A forward's activation buffers (`Act`, sized for the widest forward) and one stream's state across forwards
 +//! (`State`: each layer's keys and values and its four convolutions' last 3 input rows), with the scaffold's own
 +//! state steps: the cache write, the convolution state commits (a forward's, a verify window's keeping its inputs,
@@ -8637,6 +8972,8 @@ index 0000000000000000000000000000000000000000..ce8c7c848caca7a1587498a3e7ad0958
 +    rel: Mat = undefined,
 +    gate: Mat = undefined,
 +    sink: Mat = undefined,
++    /// attn.projectOne's output: [one_rows, attn.oneWidth] bf16 (at one row a layer's projections side by side).
++    one: Mat = undefined,
 +    dk: Mat = undefined,
 +    dv: Mat = undefined,
 +    kc: Mat = undefined,
@@ -8674,6 +9011,9 @@ index 0000000000000000000000000000000000000000..ce8c7c848caca7a1587498a3e7ad0958
 +        a.rel = try a.mat(d, hq * weights.d_rel, .bf16);
 +        a.gate = try a.mat(d, hq * D, .bf16);
 +        a.sink = try a.mat(d, hq, .bf16);
++        const ow = attn.oneWidth(hq, hk);
++        const orows = @min(cap, attn.one_rows);
++        a.one = Mat.of(try a.raw(d, orows * ow * 2), orows, ow, .bf16);
 +        a.dk = try a.mat(d, hk * weights.taps, .bf16);
 +        a.dv = try a.mat(d, hk * weights.taps, .bf16);
 +        a.kc = try a.mat(d, hk * D, .bf16);
@@ -9689,7 +10029,7 @@ index 0000000000000000000000000000000000000000..88d8b9a1c2c4bfca336be6b661614c6b
 +}
 diff --git a/zig/src/families/inkling2/cuda_weights.zig b/zig/src/families/inkling2/cuda_weights.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..56672ad3d66154100d3f1fdd2bdf0ec15f328628
+index 0000000000000000000000000000000000000000..083893be412774051b7a81d31c6f1ddcdfa98690
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_weights.zig
 @@ -0,0 +1,854 @@
@@ -9718,7 +10058,7 @@ index 0000000000000000000000000000000000000000..56672ad3d66154100d3f1fdd2bdf0ec1
 +//!   attn_conv, mlp_conv bf16 [H, 4] (post-attention / post-MLP conv1d weight, tap 3 = current row)
 +//!   in_norm[0..3] fp32 [H]: local attn_norm in [0]; global q, k, v input norms
 +//!   mlp_norm fp32 [H]; attn_query fp32 [nq, H] (0 at layer 0); mlp_query fp32 [H]
-+//!   router fp32 [384, H]; router_bias fp32 [384]
++//!   router bf16 [384, H] as stored (fp32 with TF_INK2_ROUTER=fp32, cuda_moe.zig routerBf16); router_bias fp32 [384]
 +//!   experts: see `Experts`.
 +const std = @import("std");
 +const cuda = @import("cuda");
@@ -10443,7 +10783,7 @@ index 0000000000000000000000000000000000000000..56672ad3d66154100d3f1fdd2bdf0ec1
 +        e[1].* = switch (e[2]) {
 +            .raw => try J.raw(r),
 +            .gain => try J.gain(r, dtype),
-+            .router => try J.router(r),
++            .router => if (@import("cuda_moe.zig").routerBf16()) try J.raw(r) else try J.router(r),
 +        };
 +        return;
 +    };

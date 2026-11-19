@@ -1,20 +1,20 @@
-From a649a693a9b08f68f57fdae4cd06ca29db6207d7 Mon Sep 17 00:00:00 2001
+From 91ff75ed66f10cb3858fd38f639f5d072a185184 Mon Sep 17 00:00:00 2001
 From: Scott Biggart <297695+swbiggart@users.noreply.github.com>
-Date: Mon, 16 Nov 2026 01:00:00 -0800
+Date: Tue, 17 Nov 2026 19:30:00 -0800
 Subject: [PATCH 4/8] inkling2: DSpark drafting: drafter kernel and runner,
  native fold tool, draft depth rule
 
 6 files (5 new, 1 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
-Part of the engine changes behind Inkling-2-Small TP4 v0.1 (github.com/swbiggart/inkling2-sparks).
+Part of the engine changes behind Inkling-2-Small TP4 v0.2 (github.com/swbiggart/inkling2-sparks).
 Apply the whole series in order with git am (scripts/build-engine.sh does); only the full series is built and gated.
 ---
- zig/kernels/cuda/inkling2_dspark.cu           |  580 ++++++++++
- zig/src/core/lanes/depth.zig                  |  538 ++++++++-
- zig/src/families/inkling2/cuda_dspark.zig     | 1003 +++++++++++++++++
- .../families/inkling2/cuda_dspark_main.zig    |  232 ++++
- zig/src/families/inkling2/fold.zig            |  422 +++++++
+ zig/kernels/cuda/inkling2_dspark.cu           |  878 +++++++++++++
+ zig/src/core/lanes/depth.zig                  |  618 ++++++++-
+ zig/src/families/inkling2/cuda_dspark.zig     | 1140 +++++++++++++++++
+ .../families/inkling2/cuda_dspark_main.zig    |  244 ++++
+ zig/src/families/inkling2/fold.zig            |  422 ++++++
  zig/src/families/inkling2/fold_main.zig       |  171 +++
- 6 files changed, 2926 insertions(+), 20 deletions(-)
+ 6 files changed, 3453 insertions(+), 20 deletions(-)
  create mode 100644 zig/kernels/cuda/inkling2_dspark.cu
  create mode 100644 zig/src/families/inkling2/cuda_dspark.zig
  create mode 100644 zig/src/families/inkling2/cuda_dspark_main.zig
@@ -23,10 +23,10 @@ Apply the whole series in order with git am (scripts/build-engine.sh does); only
 
 diff --git a/zig/kernels/cuda/inkling2_dspark.cu b/zig/kernels/cuda/inkling2_dspark.cu
 new file mode 100644
-index 0000000000000000000000000000000000000000..ebecf337261c943c326aeed8d13349bf6a19fed9
+index 0000000000000000000000000000000000000000..aa306a6369fa558eae9f147d7fa3619709eb0831
 --- /dev/null
 +++ b/zig/kernels/cuda/inkling2_dspark.cu
-@@ -0,0 +1,580 @@
+@@ -0,0 +1,878 @@
 +// Inkling-2's DSpark drafter (mtp.safetensors): the context mixtures of the target's taps, the draft layers' norms,
 +// head norms with rotary positions, the block attention (non-causal in the block, over the context before it), the
 +// SwiGLU, and the Markov head's recurrence, corrected logits and greedy pick. The entry points, shapes and math are
@@ -408,15 +408,181 @@ index 0000000000000000000000000000000000000000..ebecf337261c943c326aeed8d13349bf
 +    attn_body<true>(q, kc, vc, kv_ld, 0, nctx, bk, bv, bv_ld, R, hq, group, scale, ml, acc, pages, page);
 +}
 +
-+// Part 2: each (head, row)'s splits merged in order: out bf16 [R, hq * 128]. Grid (hq, R), 128 threads.
++// The global layer's block attention packed by key head (tf_ink2_dspark_attn_pk, _pk_pg): one CTA a (split, key
++// head), 256 threads, reads each key and value of its split once for the PK_G query heads of its group x R rows (pair
++// p = g * 8 + r, query head kvh * PK_G + g), where attn_body's CTA a (split, query head) reads them once a query head.
++// Every pair's arithmetic is attn_body's in the same order: the score an FMA chain over the 128 dims in order, then the
++// scale; the split max; the exp sum with thread t = key t, the same warp tree and the warps in order; p . v a chain over
++// the split's keys in order. So ml and acc are attn_body's bits, and the merge is unchanged. The probabilities go to
++// shared memory half the pairs at a time (two passes), aliasing the queries: pk_shared bytes of dynamic shared memory.
++constexpr int PK_G = 6;
++constexpr int PK_NP = PK_G * 8;   // pairs a CTA
++constexpr int PK_NPP = PK_NP / 2; // pairs a pass
++constexpr int PK_NPT = PK_NPP / 2; // pairs a thread in a pass's p . v (two halves of 128 threads)
++constexpr int pk_shared = (PK_NP * D > PK_NPP * SPLIT ? PK_NP * D : PK_NPP * SPLIT) * 4;
++
++template <bool PAGED>
++__device__ __forceinline__ void attn_pk_body(
++    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kc, const __nv_bfloat16* __restrict__ vc,
++    long long kv_ld, long long lo, int nctx, const __nv_bfloat16* __restrict__ bk, const __nv_bfloat16* __restrict__ bv,
++    long long bv_ld, int R, int hq, float scale, float* __restrict__ ml, float* __restrict__ acc,
++    const int* __restrict__ pages, long long page) {
++    if constexpr (PAGED) {
++        if ((int)blockIdx.x * SPLIT < nctx) {
++            const long long off = (long long)pages[blockIdx.x] * page - (long long)blockIdx.x * SPLIT * kv_ld;
++            kc += off;
++            vc += off;
++        }
++    }
++    extern __shared__ float4 pk_dyn[];
++    float(*qs)[D] = reinterpret_cast<float(*)[D]>(pk_dyn);          // [PK_NP][D]
++    float(*ps)[SPLIT] = reinterpret_cast<float(*)[SPLIT]>(pk_dyn);  // [PK_NPP][SPLIT], once the scores are done
++    __shared__ float red[PK_NP][8];
++    __shared__ float rm[PK_NP], rl[PK_NP];
++    const int split = blockIdx.x, nsplit = gridDim.x, kvh = blockIdx.y;
++    const int t = threadIdx.x;
++    const int hkD = (hq / PK_G) * D;
++    for (int i = t; i < PK_NP * D; i += 256) {
++        const int p = i / D, g = p >> 3, r = p & 7;
++        qs[p][i % D] = r < R ? __bfloat162float(q[r * (hq * D) + (kvh * PK_G + g) * D + i % D]) : 0.f;
++    }
++    __syncthreads();
++    const int nkeys = nctx + R;
++    const int key = split * SPLIT + t;
++    float s[PK_NP];
++#pragma unroll
++    for (int p = 0; p < PK_NP; ++p) s[p] = -INFINITY;
++    if (key < nkeys) {
++        const __nv_bfloat16* kr = key < nctx ? kc + (lo + key) * kv_ld + kvh * D : bk + (key - nctx) * hkD + kvh * D;
++        float a[PK_NP];
++#pragma unroll
++        for (int p = 0; p < PK_NP; ++p) a[p] = 0.f;
++        for (int d0 = 0; d0 < D; d0 += 8) {
++            float kf[8];
++            load8(kr + d0, kf);
++#pragma unroll
++            for (int p = 0; p < PK_NP; ++p) {
++                if ((p & 7) < R) {
++#pragma unroll
++                    for (int i = 0; i < 8; ++i) a[p] = __fmaf_rn(qs[p][d0 + i], kf[i], a[p]);
++                }
++            }
++        }
++#pragma unroll
++        for (int p = 0; p < PK_NP; ++p) if ((p & 7) < R) s[p] = __fmul_rn(a[p], scale);
++    }
++    const int w = t >> 5, ln = t & 31;
++#pragma unroll
++    for (int p = 0; p < PK_NP; ++p) {
++        float m = s[p];
++        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, o));
++        if (ln == 0) red[p][w] = m;
++    }
++    __syncthreads();  // the queries are read no more: ps may overwrite them
++    if (t < PK_NP) {
++        float m = -INFINITY;
++        for (int i = 0; i < 8; ++i) m = fmaxf(m, red[t][i]);
++        rm[t] = m;
++    }
++    __syncthreads();
++    const int d = t & (D - 1), hf = t >> 7;
++    const int kn = min(SPLIT, nkeys - split * SPLIT);
++#pragma unroll
++    for (int pass = 0; pass < 2; ++pass) {
++#pragma unroll
++        for (int i = 0; i < PK_NPP; ++i) {
++            const int p = pass * PK_NPP + i;
++            const float e = ((p & 7) < R && key < nkeys) ? expf(__fsub_rn(s[p], rm[p])) : 0.f;
++            ps[i][t] = e;
++            const float l = warp_sum(e);
++            if (ln == 0) red[p][w] = l;
++        }
++        __syncthreads();
++        if (t < PK_NPP) {
++            const int p = pass * PK_NPP + t;
++            float l = 0.f;
++            for (int i = 0; i < 8; ++i) l = __fadd_rn(l, red[p][i]);
++            rl[p] = l;
++        }
++        // p . v: thread t owns dim t % 128 for the pass's pairs hf * PK_NPT .. hf * PK_NPT + PK_NPT - 1
++        float o[PK_NPT];
++#pragma unroll
++        for (int i = 0; i < PK_NPT; ++i) o[i] = 0.f;
++        for (int j = 0; j < kn; ++j) {
++            const int k = split * SPLIT + j;
++            const __nv_bfloat16* vr = k < nctx ? vc + (lo + k) * kv_ld + kvh * D : bv + (k - nctx) * bv_ld + kvh * D;
++            const float v = __bfloat162float(vr[d]);
++#pragma unroll
++            for (int i = 0; i < PK_NPT; ++i) o[i] = __fmaf_rn(ps[hf * PK_NPT + i][j], v, o[i]);
++        }
++        __syncthreads();  // the pass's rl is written; its ps are read before the next pass overwrites them
++#pragma unroll
++        for (int i = 0; i < PK_NPT; ++i) {
++            const int p = pass * PK_NPP + hf * PK_NPT + i, r = p & 7;
++            if (r < R) {
++                const int64_t at = (static_cast<int64_t>(kvh * PK_G + (p >> 3)) * nsplit + split) * R + r;
++                acc[at * D + d] = o[i];
++                if (d == 0) {
++                    ml[at * 2] = rm[p];
++                    ml[at * 2 + 1] = rl[p];
++                }
++            }
++        }
++    }
++}
++
++extern "C" __global__ void __launch_bounds__(256) tf_ink2_dspark_attn_pk(
++    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kc, const __nv_bfloat16* __restrict__ vc,
++    long long kv_ld, long long lo, int nctx, const __nv_bfloat16* __restrict__ bk, const __nv_bfloat16* __restrict__ bv,
++    long long bv_ld, int R, int hq, float scale, float* __restrict__ ml, float* __restrict__ acc) {
++    attn_pk_body<false>(q, kc, vc, kv_ld, lo, nctx, bk, bv, bv_ld, R, hq, scale, ml, acc, nullptr, 0);
++}
++
++extern "C" __global__ void __launch_bounds__(256) tf_ink2_dspark_attn_pk_pg(
++    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kc, const __nv_bfloat16* __restrict__ vc,
++    long long kv_ld, int nctx, const __nv_bfloat16* __restrict__ bk, const __nv_bfloat16* __restrict__ bv,
++    long long bv_ld, int R, int hq, float scale, float* __restrict__ ml, float* __restrict__ acc,
++    const int* __restrict__ pages, long long page) {
++    attn_pk_body<true>(q, kc, vc, kv_ld, 0, nctx, bk, bv, bv_ld, R, hq, scale, ml, acc, pages, page);
++}
++
++// Part 2: each (head, row)'s splits merged in order: out bf16 [R, hq * 128]. Grid (hq, R), 128 threads. The loads
++// of 8 splits are issued together; the max and the two sums still take the splits one at a time in order.
 +extern "C" __global__ void tf_ink2_dspark_attn_merge(const float* __restrict__ ml, const float* __restrict__ acc,
 +                                                     int nsplit, int R, int hq, __nv_bfloat16* __restrict__ out) {
 +    const int h = blockIdx.x, r = blockIdx.y, d = threadIdx.x;
++    const int64_t base = static_cast<int64_t>(h) * nsplit * R + r;  // split s's partials at base + s * R
 +    float M = -INFINITY;
-+    for (int s = 0; s < nsplit; ++s) M = fmaxf(M, ml[((static_cast<int64_t>(h) * nsplit + s) * R + r) * 2]);
++    int s = 0;
++    for (; s + 8 <= nsplit; s += 8) {
++        float m[8];
++#pragma unroll
++        for (int u = 0; u < 8; ++u) m[u] = ml[(base + static_cast<int64_t>(s + u) * R) * 2];
++#pragma unroll
++        for (int u = 0; u < 8; ++u) M = fmaxf(M, m[u]);
++    }
++    for (; s < nsplit; ++s) M = fmaxf(M, ml[(base + static_cast<int64_t>(s) * R) * 2]);
 +    float L = 0.f, o = 0.f;
-+    for (int s = 0; s < nsplit; ++s) {
-+        const int64_t at = (static_cast<int64_t>(h) * nsplit + s) * R + r;
++    s = 0;
++    for (; s + 8 <= nsplit; s += 8) {
++        float m[8], l[8], a[8];
++#pragma unroll
++        for (int u = 0; u < 8; ++u) {
++            const int64_t at = base + static_cast<int64_t>(s + u) * R;
++            m[u] = ml[at * 2];
++            l[u] = ml[at * 2 + 1];
++            a[u] = acc[at * D + d];
++        }
++#pragma unroll
++        for (int u = 0; u < 8; ++u) {
++            if (m[u] == -INFINITY) continue;
++            const float f = expf(__fsub_rn(m[u], M));
++            L = __fadd_rn(L, __fmul_rn(l[u], f));
++            o = __fadd_rn(o, __fmul_rn(a[u], f));
++        }
++    }
++    for (; s < nsplit; ++s) {
++        const int64_t at = base + static_cast<int64_t>(s) * R;
 +        const float m = ml[at * 2];
 +        if (m == -INFINITY) continue;
 +        const float f = expf(__fsub_rn(m, M));
@@ -490,9 +656,147 @@ index 0000000000000000000000000000000000000000..ebecf337261c943c326aeed8d13349bf
 +// The corrected, capped logits of this rank's vocabulary slice for one step, and each CTA's best: a warp a column v:
 +// corr = bf16(fold_b[v] + latent . fold_w[v]); logit = bf16(base[v] + corr); capped = bf16(tanh(logit * fp32(1/cap))
 +// * cap); columns at or past `valid` (local) are skipped. best: (value, local column) of the CTA's columns, ties to the
-+// lower column. Grid nblk, 256 threads (8 warps); best fp32 / i32 [nblk]. Several streams: grid (nblk, streams),
-+// stream y's base row at base + y * base_ys, its latent at + RANK y, its bests at + nblk y.
++// lower column. Grid nblk, 256 threads (8 warps); best fp32 / i32 [nblk]. best_s fp32 [nblk]: the CTA's sum of
++// exp(capped - cap) over its valid columns (each warp's in column order, the warps' in warp order), for the pick's
++// probability (softmax over the valid vocabulary; the pick itself does not read it). Several streams: grid (nblk,
++// streams), stream y's base row at base + y * base_ys, its latent at + RANK y, its bests and sums at + nblk y.
 +extern "C" __global__ void __launch_bounds__(256) tf_ink2_dspark_mlogits(
++    const __nv_bfloat16* __restrict__ base, const __nv_bfloat16* __restrict__ latent,
++    const __nv_bfloat16* __restrict__ fold_w, const __nv_bfloat16* __restrict__ fold_b, int n, int valid, float cap,
++    float* __restrict__ best_v, int* __restrict__ best_i, long long base_ys, float* __restrict__ best_s) {
++    __shared__ float lt[RANK];
++    {
++        const int64_t y = blockIdx.y;
++        base += y * base_ys;
++        latent += y * RANK;
++        best_v += y * gridDim.x;
++        best_i += y * gridDim.x;
++        best_s += y * gridDim.x;
++    }
++    __shared__ float bv[8];
++    __shared__ int bi[8];
++    __shared__ float bs[8];
++    const int t = threadIdx.x, w = t >> 5, ln = t & 31;
++    lt[t] = __bfloat162float(latent[t]);
++    __syncthreads();
++    float mv = -INFINITY;
++    int mi = 0x7fffffff;
++    float se = 0.f;
++    const float inv = __fdiv_rn(1.0f, cap);
++    const int per = (n + gridDim.x - 1) / gridDim.x;
++    const int c0 = blockIdx.x * per, c1 = min(n, c0 + per);
++    for (int v = c0 + w; v < c1; v += 8) {
++        if (v >= valid) break;
++        float wf[8];
++        load8(fold_w + static_cast<int64_t>(v) * RANK + ln * 8, wf);
++        float a = 0.f;
++#pragma unroll
++        for (int i = 0; i < 8; ++i) a = __fmaf_rn(lt[ln * 8 + i], wf[i], a);
++        a = warp_sum(a);
++        const float corr = bfr(__fadd_rn(a, __bfloat162float(fold_b[v])));
++        const float lg = bfr(__fadd_rn(__bfloat162float(base[v]), corr));
++        const float cp = bfr(__fmul_rn(tanhf(__fmul_rn(lg, inv)), cap));
++        se = __fadd_rn(se, expf(__fsub_rn(cp, cap)));
++        if (cp > mv) {  // columns rise within the warp: the first of equals stays
++            mv = cp;
++            mi = v;
++        }
++    }
++    if (ln == 0) {
++        bv[w] = mv;
++        bi[w] = mi;
++        bs[w] = se;
++    }
++    __syncthreads();
++    if (t == 0) {
++        float v = -INFINITY;
++        int i = 0x7fffffff;
++        float ss = 0.f;
++        for (int k = 0; k < 8; ++k) {
++            if (bv[k] > v || (bv[k] == v && bi[k] < i)) {
++                v = bv[k];
++                i = bi[k];
++            }
++            ss = __fadd_rn(ss, bs[k]);
++        }
++        best_v[blockIdx.x] = v;
++        best_i[blockIdx.x] = i;
++        best_s[blockIdx.x] = ss;
++    }
++}
++
++// The rank's pick over the CTAs' bests (ties to the lower column), as (value, global id, the CTAs' exp sum in CTA
++// order) at pair (float, int, float: 12 bytes); with walk != null (one rank) also walk[s + 1] = the id and chances[s
++// + 1] = its probability exp(value - cap) / sum. One CTA, 32 threads. Several streams: grid (1, streams), stream y's
++// bests and sums at + nblk y, its pair at pair + pair_ys bytes y, its walk and chances at + 8 y.
++extern "C" __global__ void tf_ink2_dspark_mpick(const float* __restrict__ best_v, const int* __restrict__ best_i,
++                                                int nblk, int vocab_lo, float* __restrict__ pair, int* walk, int s,
++                                                int pair_ys, const float* __restrict__ best_s, float cap,
++                                                float* chances) {
++    if (threadIdx.x != 0) return;
++    {
++        const int64_t y = blockIdx.y;
++        best_v += y * nblk;
++        best_i += y * nblk;
++        best_s += y * nblk;
++        pair = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(pair) + y * pair_ys);
++        if (walk != nullptr) {
++            walk += y * 8;
++            chances += y * 8;
++        }
++    }
++    float v = -INFINITY;
++    int i = 0x7fffffff;
++    float ss = 0.f;
++    for (int k = 0; k < nblk; ++k) {
++        if (best_v[k] > v || (best_v[k] == v && best_i[k] < i)) {
++            v = best_v[k];
++            i = best_i[k];
++        }
++        ss = __fadd_rn(ss, best_s[k]);
++    }
++    const int id = (i == 0x7fffffff) ? 0 : vocab_lo + i;
++    pair[0] = v;
++    reinterpret_cast<int*>(pair)[1] = id;
++    pair[2] = ss;
++    if (walk != nullptr) {
++        walk[s + 1] = id;
++        chances[s + 1] = ss > 0.f ? __fdiv_rn(expf(__fsub_rn(v, cap)), ss) : 0.f;
++    }
++}
++
++// Every rank's pair (rank order, `stride` bytes apart) merged: the best value, ties to the lower rank (its ids are
++// lower); walk[s + 1] = its id, chances[s + 1] = its probability exp(value - cap) / (the ranks' sums in rank order).
++// One thread. Several streams: grid (1, streams), stream y's pairs at + pair_ys bytes y within each rank's, its walk
++// and chances at + 8 y.
++extern "C" __global__ void tf_ink2_dspark_mmerge(const unsigned char* __restrict__ pairs, int world, int stride,
++                                                 int* walk, int s, int pair_ys, float cap, float* chances) {
++    if (threadIdx.x != 0) return;
++    {
++        const int64_t y = blockIdx.y;
++        pairs += y * pair_ys;
++        walk += y * 8;
++        chances += y * 8;
++    }
++    float v = -INFINITY;
++    int id = 0;
++    float ss = 0.f;
++    for (int r = 0; r < world; ++r) {
++        const float pv = *reinterpret_cast<const float*>(pairs + r * stride);
++        const int pi = *reinterpret_cast<const int*>(pairs + r * stride + 4);
++        if (r == 0 || pv > v) {
++            v = pv;
++            id = pi;
++        }
++        ss = __fadd_rn(ss, *reinterpret_cast<const float*>(pairs + r * stride + 8));
++    }
++    walk[s + 1] = id;
++    chances[s + 1] = ss > 0.f ? __fdiv_rn(expf(__fsub_rn(v, cap)), ss) : 0.f;
++}
++
++// v0.2's argmax-only forms of mlogits, mpick and mmerge, for a drafter that makes no chances (TF_INK2_DRAFT_CUT=0):
++// the same picks as the forms above, without the exp sums, their stores or the chances (a pair's first 8 bytes).
++extern "C" __global__ void __launch_bounds__(256) tf_ink2_dspark_mlogits_argmax(
 +    const __nv_bfloat16* __restrict__ base, const __nv_bfloat16* __restrict__ latent,
 +    const __nv_bfloat16* __restrict__ fold_w, const __nv_bfloat16* __restrict__ fold_b, int n, int valid, float cap,
 +    float* __restrict__ best_v, int* __restrict__ best_i, long long base_ys) {
@@ -548,12 +852,9 @@ index 0000000000000000000000000000000000000000..ebecf337261c943c326aeed8d13349bf
 +    }
 +}
 +
-+// The rank's pick over the CTAs' bests (ties to the lower column), as (value, global id) at pair (a float and an
-+// int, 8 bytes); with walk != null (one rank) also walk[s + 1] = the id. One CTA, 32 threads. Several streams: grid
-+// (1, streams), stream y's bests at + nblk y, its pair at pair + pair_ys bytes y, its walk at + 8 y.
-+extern "C" __global__ void tf_ink2_dspark_mpick(const float* __restrict__ best_v, const int* __restrict__ best_i,
-+                                                int nblk, int vocab_lo, float* __restrict__ pair, int* walk, int s,
-+                                                int pair_ys) {
++extern "C" __global__ void tf_ink2_dspark_mpick_argmax(const float* __restrict__ best_v, const int* __restrict__ best_i,
++                                                       int nblk, int vocab_lo, float* __restrict__ pair, int* walk,
++                                                       int s, int pair_ys) {
 +    if (threadIdx.x != 0) return;
 +    {
 +        const int64_t y = blockIdx.y;
@@ -575,11 +876,8 @@ index 0000000000000000000000000000000000000000..ebecf337261c943c326aeed8d13349bf
 +    if (walk != nullptr) walk[s + 1] = id;
 +}
 +
-+// Every rank's pair (rank order, `stride` bytes apart) merged: the best value, ties to the lower rank (its ids are
-+// lower); walk[s + 1] = its id. One thread. Several streams: grid (1, streams), stream y's pairs at + pair_ys bytes y
-+// within each rank's, its walk at + 8 y.
-+extern "C" __global__ void tf_ink2_dspark_mmerge(const unsigned char* __restrict__ pairs, int world, int stride,
-+                                                 int* walk, int s, int pair_ys) {
++extern "C" __global__ void tf_ink2_dspark_mmerge_argmax(const unsigned char* __restrict__ pairs, int world, int stride,
++                                                        int* walk, int s, int pair_ys) {
 +    if (threadIdx.x != 0) return;
 +    {
 +        const int64_t y = blockIdx.y;
@@ -608,7 +906,7 @@ index 0000000000000000000000000000000000000000..ebecf337261c943c326aeed8d13349bf
 +    *reinterpret_cast<uint4*>(x + r * 2 * H + H + c0) = *reinterpret_cast<const uint4*>(feat + c0);
 +}
 diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
-index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c2864d4216d 100644
+index fd65b6149910d44a0a322ed5c56c6df0772f178c..be99496cc202c84983b068d41622b7cae776c943 100644
 --- a/zig/src/core/lanes/depth.zig
 +++ b/zig/src/core/lanes/depth.zig
 @@ -10,6 +10,10 @@ pub const Constants = @import("depth_constants.zig").Constants;
@@ -631,11 +929,12 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
  
      pub fn deinit(st: *State, gpa: Allocator) void {
          gpa.free(st.p);
-@@ -35,14 +41,59 @@ pub const Who = struct {
+@@ -35,17 +41,67 @@ pub const Who = struct {
      gain: ?f64 = null, // the drafts its last grant expected to keep (null: none priced)
      stream: ?*anyopaque = null,
      sampled: bool = false, // keyed draws: host work a row that a greedy round does not have
 +    context: u64 = 0, // the stream's context length (positions held): what its round costs at depth (ContextCost)
++    cut_arm: bool = false, // lone_cut A/B tooling: a cut-arm stream's rounds time and price apart (Rule.cut_arm_ms)
  };
  
 +/// A lone round's prices at one context length: the window's ms by rows (`window_ms[w]`: w + 1 rows, the head over
@@ -691,7 +990,14 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
  /// A shared round's time past its forward: `ms` without its head steps, `head` the steps' modeled time.
  pub const Overhead = struct { streams: u32, ms: f64, head: f64 = 0.0 };
  
-@@ -55,12 +106,29 @@ pub const Rule = struct {
++/// lone_cut: the newest cut round's weight in `Rule.cut_ms`, and the most ms one round's surprise counts for.
++const cut_rate = 0.2;
++const cut_band = 4.0;
++
+ pub const Rule = struct {
+     gpa: Allocator,
+     k: Constants = .{},
+@@ -55,12 +111,36 @@ pub const Rule = struct {
      shared_costs: *const Table,
      mtp_step_ms: f64,
      draft_step_ms: f64 = 0, // a shared round's draft past a stream's first (budgets price it)
@@ -707,6 +1013,13 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
 +    ab_modes: bool = false,
 +    ab_next: u64 = 0,
 +    ab_table_ms: Table = .{}, // ab_modes: the table-priced streams' round times (the others keep times past prices)
++    cut_ms: f64 = 0, // lone_cut: what cut rounds took past their prices (`cutPrice`), one figure for every depth
++    /// lone_cut A/B tooling: the cut arm's round_ms and greedy_ms (Who.cut_arm), so that neither arm's round times
++    /// price the other's depths.
++    cut_arm_ms: [2]Table = .{ .{}, .{} },
++    /// and its context_ms: a cut round that crosses depth_from is timed at the context it ends at, past depth_from,
++    /// so the cut arm's deep rounds are kept apart too (each arm prices its deep streams as it would alone).
++    cut_arm_context_ms: Table = .{},
      plain_guard: bool,
      node_probabilities: bool,
      granted_depth: bool = false, // node_probabilities: a stream drafts its last grant plus draft_slack, lone ones too
@@ -721,11 +1034,27 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
      row_cost: @import("row_cost.zig").RowCost = .{}, // what a row costs past shared_costs here, under k.learn_rows
      round_ms: Table = .{}, // a round's wall time by drafts, every stream's: what sampled streams price by
      overhead: std.ArrayList(Overhead) = .empty, // a shared round's ms past its forward, by streams (insertion order)
-@@ -74,19 +142,58 @@ pub const Rule = struct {
+@@ -70,23 +150,74 @@ pub const Rule = struct {
+ 
+     hold_order: []usize = &.{}, // reused hold ordering, at most batch_rows entries
+ 
++    /// shared_cut: whether a shared round may be priced by its chances (and deepened), `live` the streams live at the
++    /// step (before the round takes its turns: a round that leaves streams out is still a round of that many): with the
++    /// priced pass, 2 .. shared_cut_most live streams, whatever the plain-share rule's own threshold (TF_INK2_DRAFT_FAIR
++    /// moves fair_above, not this); past it the round is v0.2's, with its rates, its feed and the plain-share rule.
++    pub fn sharedOpen(r: *const Rule, live: usize) bool {
++        if (r.draft_pass == null) return false;
++        return live >= 2 and live <= shared_cut_most;
++    }
++    pub const shared_cut_most = 4;
++
+     pub fn deinit(r: *Rule) void {
          r.gpa.free(r.hold_order);
          r.row_cost.deinit(r.gpa);
          r.round_ms.deinit(r.gpa);
 +        r.ab_table_ms.deinit(r.gpa);
++        for (&r.cut_arm_ms) |*t| t.deinit(r.gpa);
++        r.cut_arm_context_ms.deinit(r.gpa);
 +        r.context_ms.deinit(r.gpa);
          r.overhead.deinit(r.gpa);
          r.greedy_ms.deinit(r.gpa);
@@ -780,7 +1109,7 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
      /// Draft j was tried when drafts 1 .. j - 1 were kept; its estimate moves toward whether it was kept.
      pub fn observeDepth(r: *Rule, who: Who, proposed: i64, accepted: i64) !void {
          const p = try r.rates(who);
-@@ -98,11 +205,22 @@ pub const Rule = struct {
+@@ -98,11 +229,23 @@ pub const Rule = struct {
              const at: usize = @intCast(j);
              p[at] += r.k.depth_rate * (hit - p[at]);
          }
@@ -798,12 +1127,13 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
      /// Round times by depth: the stream's own under `plain_guard`, else greedy rounds' for a greedy stream.
      fn costs(r: *Rule, who: ?Who) !*Table {
          const w = who orelse return &r.round_ms;
-+        if (try r.byContext(w)) return &r.context_ms;
++        if (try r.byContext(w)) return if (w.cut_arm) &r.cut_arm_context_ms else &r.context_ms;
 +        if (r.ab_modes and try r.modeOf(w) == .table) return &r.ab_table_ms;
++        if (!r.plain_guard and w.cut_arm) return if (w.sampled) &r.cut_arm_ms[0] else &r.cut_arm_ms[1];
          if (!r.plain_guard) return if (w.sampled) &r.round_ms else &r.greedy_ms;
          _ = try r.rates(w);
          const st = &w.state.*.?;
-@@ -110,12 +228,15 @@ pub const Rule = struct {
+@@ -110,12 +253,16 @@ pub const Rule = struct {
          return &st.ms.?;
      }
  
@@ -820,10 +1150,11 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
 +        const v = if (priced) ms - (priceAt(r.context_costs, drafts, who.?.context) orelse return) else ms;
 +        try r.blend(table, drafts, v);
 +        if (table == &r.greedy_ms) try r.blend(&r.round_ms, drafts, v); // a greedy round counts for every stream too
++        if (table == &r.cut_arm_ms[1]) try r.blend(&r.cut_arm_ms[0], drafts, v); // within its arm
      }
  
      fn blend(r: *Rule, table: *Table, drafts: i64, ms: f64) !void {
-@@ -123,8 +244,10 @@ pub const Rule = struct {
+@@ -123,8 +270,10 @@ pub const Rule = struct {
          try table.put(r.gpa, drafts, if (before) |b| b + r.k.cost_rate * (ms - b) else ms);
      }
  
@@ -835,7 +1166,7 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
          const table = try r.costs(who);
          if (table.get(drafts)) |v| return v;
          const forward = r.family_costs.get(drafts + 1) orelse return null;
-@@ -144,21 +267,48 @@ pub const Rule = struct {
+@@ -144,21 +293,102 @@ pub const Rule = struct {
          return modeled;
      }
  
@@ -853,6 +1184,60 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
 +            least = if (least) |l| @min(l, x) else x;
 +        }
 +        return model + @max(0, least orelse 0);
++    }
++
++    /// lone_cut: a lone round verifying `drafts` of its held drafts (1 or more; the draft that made them is run) at
++    /// `context`: the windows of 2 .. 8 rows priced there (context_costs) on their least-squares line in rows, so one
++    /// cell's run-to-run noise does not pick the depth, plus the draft, plus what cut rounds took past that price
++    /// (`cut_ms`). Null without context_costs or below one draft.
++    pub fn cutPrice(r: *const Rule, drafts: i64, context: u64) ?f64 {
++        if (drafts < 1) return null;
++        var n: f64 = 0;
++        var sx: f64 = 0;
++        var sy: f64 = 0;
++        var sxx: f64 = 0;
++        var sxy: f64 = 0;
++        var d: i64 = 1;
++        while (d <= 7) : (d += 1) {
++            const y = priceAt(r.context_costs, d, context) orelse break;
++            const x: f64 = @floatFromInt(d);
++            n += 1;
++            sx += x;
++            sy += y;
++            sxx += x * x;
++            sxy += x * y;
++        }
++        if (n == 0) return null;
++        const slope = if (n > 1) (n * sxy - sx * sy) / (n * sxx - sx * sx) else 0;
++        const at = (sy - slope * sx) / n + slope * @as(f64, @floatFromInt(drafts));
++        return at + r.cut_ms;
++    }
++
++    /// lone_cut: how many of a lone stream's held drafts to verify: the prefix (1 .. chances.len) with the most
++    /// expected tokens a ms of the round, `chances[j]` the chance drafts 0 .. j all land (the draft is made: every
++    /// option pays for it, and at least one draft is verified). All of them without prices.
++    pub fn cut(r: *const Rule, chances: []const f64, context: u64) usize {
++        var best: usize = chances.len;
++        var best_rate: f64 = -1;
++        var expected: f64 = 1;
++        for (chances, 1..) |c, k| {
++            expected += c;
++            const ms = r.cutPrice(@intCast(k), context) orelse return chances.len;
++            if (ms <= 0) return chances.len;
++            if (expected / ms > best_rate) {
++                best = k;
++                best_rate = expected / ms;
++            }
++        }
++        return best;
++    }
++
++    /// lone_cut: a cut round of `drafts` drafts took `ms`: `cut_ms` moves toward what it took past its price, by at
++    /// most `cut_rate * cut_band` a round (a round of a graph capture or a stall moves it by under 1 ms).
++    pub fn observeCut(r: *Rule, drafts: i64, ms: f64, context: u64) void {
++        const price = r.cutPrice(drafts, context) orelse return;
++        const past = ms - (price - r.cut_ms);
++        r.cut_ms += cut_rate * std.math.clamp(past - r.cut_ms, -cut_band, cut_band);
 +    }
 +
 +    /// The most expected tokens a ms, probing one depth farther every `depth_probe_every` rounds. With plain_guard or
@@ -888,7 +1273,7 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
                      best = 0;
                      best_rate = r.k.plain_margin / plain;
                  }
-@@ -183,6 +333,7 @@ pub const Rule = struct {
+@@ -183,6 +413,7 @@ pub const Rule = struct {
          st.plain = 0;
          st.wait = r.k.depth_probe_every;
          if (best < most and st.rounds % r.k.depth_probe_every == 0) best += 1;
@@ -896,7 +1281,7 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
          return best;
      }
  
-@@ -298,6 +449,20 @@ pub const Rule = struct {
+@@ -298,6 +529,20 @@ pub const Rule = struct {
  
      /// Head drafts for the streams of a shared round, sized by allocation over their chain chances.
      pub fn budgets(r: *Rule, whos: []Who, probe: Probe, sampled: bool, out: []i64) !void {
@@ -917,7 +1302,7 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
          if (r.confidence_floor != null) {
              for (whos, out) |*w, *o| o.* = try r.headDepth(w, null, probe);
              return;
-@@ -320,20 +485,56 @@ pub const Rule = struct {
+@@ -320,20 +565,56 @@ pub const Rule = struct {
          defer for (probs[0..made]) |p| r.gpa.free(p);
          for (whos, most, probs) |w, *m, *p| {
              m.* = @min(@as(i64, r.most_drafts), @max(1, w.draft_room - 1));
@@ -978,7 +1363,7 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
              // no draft where none pays; a probe after a growing run of plain rounds
              for (whos, counts) |w, *c| {
                  const st = &w.state.*.?;
-@@ -349,6 +550,67 @@ pub const Rule = struct {
+@@ -349,6 +630,67 @@ pub const Rule = struct {
          for (whos, most, counts, out) |*w, m, c, *o| o.* = try r.headDepth(w, @min(m, @max(1, @as(i64, c))), probe);
      }
  
@@ -1046,7 +1431,7 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
      // One extra offered row, rotating streams; the normal window allocator still prices and trims it.
      fn probeShared(r: *Rule, whos: []const Who, most: []const i64, counts: []u32) void {
          r.shared_rounds +%= 1;
-@@ -379,13 +641,7 @@ pub const Rule = struct {
+@@ -379,13 +721,7 @@ pub const Rule = struct {
      }
  
      fn nearest(r: *const Rule, streams: usize, sampled: bool) ?Overhead {
@@ -1061,7 +1446,7 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
      }
  
      /// Shared pricing can retain a family policy while lone rounds use a measured head step.
-@@ -395,6 +651,7 @@ pub const Rule = struct {
+@@ -395,6 +731,7 @@ pub const Rule = struct {
  
      /// The modeled time of a shared round's head steps for the depths it drafted.
      pub fn headMs(r: *const Rule, depths: []const i64) f64 {
@@ -1069,7 +1454,7 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
          var steps: i64 = 0;
          for (depths) |d| steps = if (r.batched_heads) @max(steps, d) else steps + d;
          return r.sharedStepMs() * @as(f64, @floatFromInt(steps));
-@@ -402,6 +659,13 @@ pub const Rule = struct {
+@@ -402,6 +739,13 @@ pub const Rule = struct {
  
      /// `sampled`: the round drew keyed samples, so it counts for sampled streams' overhead alone; `head_ms` its drafts.
      pub fn observeOverhead(r: *Rule, streams: u32, rows: u64, ms: f64, sampled: bool, head_ms: f64) !void {
@@ -1083,7 +1468,7 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
          const forward = r.shared_costs.get(@intCast(rows)) orelse return;
          if (r.k.learn_rows) try r.row_cost.observe(r.gpa, streams, rows, ms - forward - head_ms, sampled);
          // rows the table underprices are no fixed cost: called fixed, they would make the next draft look cheaper
-@@ -413,6 +677,10 @@ pub const Rule = struct {
+@@ -413,6 +757,10 @@ pub const Rule = struct {
          const fixed = if (extra - head_ms > 0.0) extra - head_ms else 0.0;
          try r.addOverhead(&r.overhead, streams, fixed, extra - fixed);
          if (!sampled) try r.addOverhead(&r.greedy_overhead, streams, fixed, extra - fixed);
@@ -1094,7 +1479,7 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
      }
  
      fn addOverhead(r: *Rule, list: *std.ArrayList(Overhead), streams: u32, fixed: f64, head: f64) !void {
-@@ -427,11 +695,127 @@ pub const Rule = struct {
+@@ -427,11 +775,127 @@ pub const Rule = struct {
      }
  };
  
@@ -1222,7 +1607,7 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
  test "a depth's acceptance estimate moves by the configured weight of the newest round" {
      const gpa = std.testing.allocator;
      const empty: Table = .{};
-@@ -595,4 +979,118 @@ test "a granted hold stays only while its stream's expected drafts pay for the v
+@@ -595,4 +1059,118 @@ test "a granted hold stays only while its stream's expected drafts pay for the v
  
  test {
      _ = @import("shared_step_test.zig");
@@ -1343,10 +1728,10 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..3942d24cf2bfe7280f2aa7133cee3c28
  }
 diff --git a/zig/src/families/inkling2/cuda_dspark.zig b/zig/src/families/inkling2/cuda_dspark.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e921452b3
+index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5ad0e7b944
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_dspark.zig
-@@ -0,0 +1,1003 @@
+@@ -0,0 +1,1140 @@
 +//! Inkling-2-Small's DSpark drafter (the checkpoint's mtp.safetensors: 5 dense layers, a block of 8, a recurrent Markov
 +//! head of rank 256) on the ranks' group, split as the target is: rank r of W holds query heads 48r/W.., key heads
 +//! 8r/W.., a W-th of the MLP's 18,432 and a W-th of the vocabulary (its unembed rows and the head folds). Every rank
@@ -1397,6 +1782,35 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +const kv_all = 8;
 +const inter_all = 18432;
 +const split_keys = 256;
++/// Query heads a key head serves, the packed global attention's group (inkling2_dspark.cu PK_G).
++const pack_group = 6;
++/// The packed attention's dynamic shared bytes (inkling2_dspark.cu pk_shared).
++const pack_shared = 48 * 128 * 4;
++/// Splits from which the global layer's block attention is packed by key head (TF_INK2_DSPARK_PACK=N; 0 never). The
++/// packed form has the bits of the unpacked one, so the switch changes speed only. GB10, W=4 rank (12 q heads, 2 key
++/// heads, 8 rows), attention ms unpacked -> packed: 12 splits 0.138 -> 0.151, 17 0.192 -> 0.154, 129 1.03 -> 0.44,
++/// 513 5.81 -> 1.49, 2,047 22.7 -> 5.40.
++pub const pack_from_default: usize = 16;
++
++/// TF_INK2_DSPARK_FP8: the draft layers' projections as MXFP8 weights (bf16 rounded to e4m3 with a power-of-two scale
++/// a 32 inputs, `cuda.mxfp8.quantize`, at load): unset or "mlp" gate/up and down; "all" also qkv and o; "0" bf16 as
++/// stored (v0.2's drafter). The context projections (kv) stay bf16. Drafter only: proposals may change, outputs never
++/// (drafted = plain holds whatever the drafter proposes). Part of the settings the ranks agree on: a draft is a sum
++/// over ranks. "mlp" is the default because "all" lost accepted tokens past the bar on 16 texts at W=1 (pooled -0.56%,
++/// code -1.07%; "mlp" -0.32% and -0.79%).
++pub const Fp8 = enum { none, mlp, all };
++
++pub fn fp8Mode() Fp8 {
++    const v = std.mem.span(std.c.getenv("TF_INK2_DSPARK_FP8") orelse return .mlp);
++    if (std.mem.eql(u8, v, "0")) return .none;
++    if (std.mem.eql(u8, v, "all")) return .all;
++    return .mlp;
++}
++
++fn packFrom() usize {
++    const v = std.c.getenv("TF_INK2_DSPARK_PACK") orelse return pack_from_default;
++    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch pack_from_default;
++}
 +const pick_stride = 16;
 +const logit_blocks = 512;
 +
@@ -1407,6 +1821,42 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +pub fn tapOf(layer: u32) ?usize {
 +    for (tap_layers, 0..) |l, i| if (l == layer) return i;
 +    return null;
++}
++
++/// TF_INK2_DRAFT_CUT (the lone cut, cuda_lanes.zig): `0` off, `ab` cut against whole by turns, anything else (or
++/// unset) on. Every rank reads it: off, the drafter makes no chances and its pick runs v0.2's argmax-only kernels (no
++/// exponentials, sums or chance stores); on and `ab`, each pick also writes its probability. The ranks agree on it
++/// (cuda_engine.zig's settings fingerprint), so every rank's pick runs the same kernels.
++pub const Cut = enum { off, on, ab };
++
++pub fn draftCut() Cut {
++    const v = std.mem.span(std.c.getenv("TF_INK2_DRAFT_CUT") orelse return .on);
++    if (std.mem.eql(u8, v, "0")) return .off;
++    if (std.mem.eql(u8, v, "ab")) return .ab;
++    return .on;
++}
++
++/// TF_INK2_SHARED_CUT, normalized (cuda_lanes.zig reads it on rank 0 for its shared rounds; every rank puts the
++/// effective value in the settings fingerprint, cuda_engine.zig): unset (and any unread spelling) `deepen`, `cut` or
++/// `1`, `deepen` or `2`, `0` off.
++pub const SharedCut = enum { off, cut, deepen };
++
++pub fn parseSharedCut(v: ?[]const u8) SharedCut {
++    const x = v orelse return .deepen;
++    if (std.mem.eql(u8, x, "cut") or std.mem.eql(u8, x, "1")) return .cut;
++    if (std.mem.eql(u8, x, "deepen") or std.mem.eql(u8, x, "2")) return .deepen;
++    if (std.mem.eql(u8, x, "0")) return .off;
++    return .deepen;
++}
++
++pub fn sharedCut() SharedCut {
++    return parseSharedCut(if (std.c.getenv("TF_INK2_SHARED_CUT")) |v| std.mem.span(v) else null);
++}
++
++/// A switch set to `0` (TF_INK2_BATCH, TF_INK2_DRAFT_STREAMS, TF_INK2_DRAFT_PRICE: each turns its feature off).
++pub fn switchedOff(name: [*:0]const u8) bool {
++    const v = std.c.getenv(name) orelse return false;
++    return v[0] == '0' and v[1] == 0;
 +}
 +
 +pub const Kernels = struct {
@@ -1423,11 +1873,19 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +    mpick: cuda.Function,
 +    mmerge: cuda.Function,
 +    mcat: cuda.Function,
++    /// v0.2's argmax-only pick (`Drafter.chances_on` false)
++    mlogits_argmax: cuda.Function,
++    mpick_argmax: cuda.Function,
++    mmerge_argmax: cuda.Function,
 +    /// the global layer's cache sites in the KV page pool (inkling2_dspark.cu `_pg`: rope's and rows' writes, the
 +    /// block attention's reads), one source with the table forms above
 +    rope_pg: cuda.Function,
 +    rows_pg: cuda.Function,
 +    attn_pg: cuda.Function,
++    /// the global layer's block attention packed by key head (inkling2_dspark.cu `attn_pk_body`: attn's bits, each key
++    /// and value read once for the group's query heads), table and paged forms
++    attn_pk: cuda.Function,
++    attn_pk_pg: cuda.Function,
 +
 +    pub fn load(d: *const cuda.Driver) !Kernels {
 +        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -1435,10 +1893,12 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +        errdefer mod.unload();
 +        var k: Kernels = undefined;
 +        k.mod = mod;
-+        inline for (.{ "mix", "addnorm", "rope", "rows", "attn", "merge", "swiglu", "mstep", "mlogits", "mpick", "mmerge", "mcat" }) |n| {
++        inline for (.{ "mix", "addnorm", "rope", "rows", "attn", "merge", "swiglu", "mstep", "mlogits", "mpick", "mmerge", "mcat", "mlogits_argmax", "mpick_argmax", "mmerge_argmax" }) |n| {
 +            @field(k, n) = try mod.function(if (comptime std.mem.eql(u8, n, "merge")) "tf_ink2_dspark_attn_merge" else "tf_ink2_dspark_" ++ n);
 +        }
 +        inline for (.{ "rope", "rows", "attn" }) |n| @field(k, n ++ "_pg") = try mod.function("tf_ink2_dspark_" ++ n ++ "_pg");
++        k.attn_pk = try mod.function("tf_ink2_dspark_attn_pk");
++        k.attn_pk_pg = try mod.function("tf_ink2_dspark_attn_pk_pg");
 +        return k;
 +    }
 +};
@@ -1595,14 +2055,19 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +    latent: u64 = 0, // bf16 [S][256]
 +    best_v: u64 = 0, // [S][logit_blocks]
 +    best_i: u64 = 0,
-+    pairs: u64 = 0, // [world][S][pick_stride]
++    best_s: u64 = 0, // fp32 [S][logit_blocks]: each CTA's sum of exp(capped - cap) (the pick's probability)
++    pairs: u64 = 0, // [world][S][pick_stride]: (value, id, exp sum) a rank's pick
 +    walk: u64 = 0, // i32 [S][8]
++    chances: u64 = 0, // fp32 [S][8]: chances[8s + 1 + j] = the head's probability of walk's pick j (`chancesMany`)
++    chances_on: bool = true, // `draftCut` at load: each pick also makes its chance; false: the argmax-only kernels
 +    lane_part: u64 = 0,
 +    lane_part_bytes: usize = 0,
 +    caches: std.ArrayList(?Caches) = .empty,
 +    /// The global layer of every slot on the KV page pool (the engine's `paged`; stage 2c): a slot's caches hold the
 +    /// local layers alone and `bindOn` names its pages.
 +    paged: bool = false,
++    /// `packFrom` at load: the global layer's attention is packed by key head from this many splits (0 never).
++    pack_from: usize = pack_from_default,
 +
 +    pub fn deinit(dr: *Drafter) void {
 +        for (dr.caches.items) |*c| if (c.*) |*x| x.buf.free();
@@ -1699,8 +2164,12 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +    }
 +
 +    fn launch(dr: *const Drafter, c: *const Ctx, f: cuda.Function, grid: [3]usize, threads: usize, a: *cuda.Args) !void {
++        return dr.launchShared(c, f, grid, threads, 0, a);
++    }
++
++    fn launchShared(dr: *const Drafter, c: *const Ctx, f: cuda.Function, grid: [3]usize, threads: usize, shared: u32, a: *cuda.Args) !void {
 +        _ = dr;
-+        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = @intCast(threads) } }, c.stream, a);
++        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = @intCast(threads) }, .shared = shared }, c.stream, a);
 +    }
 +
 +    fn lin(dr: *Drafter, c: *const Ctx, x: u64, ldx: usize, rows: usize, w: cuda.qmmf.Weight, out: u64, f32out: bool) !void {
@@ -1854,6 +2323,8 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +                if (ring != 0 and nctx > window) return error.DraftRing;
 +                const nsplit = (nctx + T + split_keys - 1) / split_keys;
 +                if (nsplit > dr.nsplit_max) return error.DraftContext;
++                // the global layer packed by key head (the same bits): one CTA a (split, key head)
++                const pk = !local[i] and hq == pack_group * hk and dr.pack_from != 0 and nsplit >= dr.pack_from;
 +                if (!local[i] and cs.pg != null) {
 +                    // the global layer on pages (lo = 0: split s is page s; its id read once a split)
 +                    const pg = cs.pg.?;
@@ -1868,13 +2339,13 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +                    a.add(@as(i64, @intCast(qw)));
 +                    a.add(@as(i32, @intCast(T)));
 +                    a.add(@as(i32, @intCast(hq)));
-+                    a.add(@as(i32, @intCast(hq / hk)));
++                    if (!pk) a.add(@as(i32, @intCast(hq / hk)));
 +                    a.add(@as(f32, 1.0 / @sqrt(@as(f32, D))));
 +                    a.add(dr.ml);
 +                    a.add(dr.acc);
 +                    a.add(pg.table);
 +                    a.add(@as(i64, @intCast(pg.page)));
-+                    try dr.launch(c, dr.k.attn_pg, .{ nsplit, hq, 1 }, 256, &a);
++                    if (pk) try dr.launchShared(c, dr.k.attn_pk_pg, .{ nsplit, hk, 1 }, 256, pack_shared, &a) else try dr.launch(c, dr.k.attn_pg, .{ nsplit, hq, 1 }, 256, &a);
 +                } else {
 +                    var a: cuda.Args = .{};
 +                    a.add(q);
@@ -1888,11 +2359,11 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +                    a.add(@as(i64, @intCast(qw)));
 +                    a.add(@as(i32, @intCast(T)));
 +                    a.add(@as(i32, @intCast(hq)));
-+                    a.add(@as(i32, @intCast(hq / hk)));
++                    if (!pk) a.add(@as(i32, @intCast(hq / hk)));
 +                    a.add(@as(f32, 1.0 / @sqrt(@as(f32, D))));
 +                    a.add(dr.ml);
 +                    a.add(dr.acc);
-+                    try dr.launch(c, dr.k.attn, .{ nsplit, hq, 1 }, 256, &a);
++                    if (pk) try dr.launchShared(c, dr.k.attn_pk, .{ nsplit, hk, 1 }, 256, pack_shared, &a) else try dr.launch(c, dr.k.attn, .{ nsplit, hq, 1 }, 256, &a);
 +                }
 +                {
 +                    var a: cuda.Args = .{};
@@ -1969,7 +2440,8 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +                a.add(dr.best_v);
 +                a.add(dr.best_i);
 +                a.add(@as(i64, @intCast(drafts * dr.vn)));
-+                try dr.launch(c, dr.k.mlogits, .{ logit_blocks, S, 1 }, 256, &a);
++                if (dr.chances_on) a.add(dr.best_s);
++                try dr.launch(c, if (dr.chances_on) dr.k.mlogits else dr.k.mlogits_argmax, .{ logit_blocks, S, 1 }, 256, &a);
 +            }
 +            const mine = dr.pairs + @as(u64, dr.rank) * rank_pairs;
 +            {
@@ -1982,7 +2454,12 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +                a.add(if (dr.world > 1) @as(u64, 0) else dr.walk);
 +                a.add(@as(i32, @intCast(s)));
 +                a.add(@as(i32, @intCast(pair_ys)));
-+                try dr.launch(c, dr.k.mpick, .{ 1, S, 1 }, 32, &a);
++                if (dr.chances_on) {
++                    a.add(dr.best_s);
++                    a.add(cap);
++                    a.add(dr.chances);
++                }
++                try dr.launch(c, if (dr.chances_on) dr.k.mpick else dr.k.mpick_argmax, .{ 1, S, 1 }, 32, &a);
 +            }
 +            if (dr.world > 1) {
 +                if (dr.group) |g| try g.allGather(c.stream, mine, dr.pairs, rank_pairs);
@@ -1993,7 +2470,11 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +                a.add(dr.walk);
 +                a.add(@as(i32, @intCast(s)));
 +                a.add(@as(i32, @intCast(pair_ys)));
-+                try dr.launch(c, dr.k.mmerge, .{ 1, S, 1 }, 32, &a);
++                if (dr.chances_on) {
++                    a.add(cap);
++                    a.add(dr.chances);
++                }
++                try dr.launch(c, if (dr.chances_on) dr.k.mmerge else dr.k.mmerge_argmax, .{ 1, S, 1 }, 32, &a);
 +            }
 +        }
 +    }
@@ -2013,10 +2494,24 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +            t.* = @intCast(g);
 +        };
 +    }
++
++    /// The last `draftMany`'s pick probabilities (each of its 7 drafts' softmax over the valid vocabulary, uncalibrated)
++    /// of each of its streams, in its order (synchronizes the stream).
++    pub fn chancesMany(dr: *const Drafter, c: *const Ctx, out: []const *[drafts]f32) !void {
++        if (!dr.chances_on) return error.NoDraftChances; // TF_INK2_DRAFT_CUT=0
++        if (out.len == 0 or out.len > most_streams) return error.DraftStreams;
++        try c.stream.synchronize();
++        var got: [most_streams * block]f32 = undefined;
++        try cuda.memory.download(dr.d, dr.chances, std.mem.sliceAsBytes(got[0 .. out.len * block]));
++        for (out, 0..) |o, s| @memcpy(o, got[s * block + 1 ..][0..drafts]);
++    }
 +};
 +
-+/// rows [n] of x (ld elements) . w[v]^T for v < vn: out bf16 [n][vn] (cuda_head's row-invariant unembed kernel).
++/// rows [n] of x (ld elements) . w[v]^T for v < vn: out bf16 [n][vn] (cuda_head's row-invariant unembed kernels; from
++/// cuda_head.wide_from rows a wide form, the same bits).
 +fn unembedRows(c: *const Ctx, x: u64, ld: usize, w: u64, vn: usize, out: u64, n: usize) !void {
++    const head = @import("cuda_head.zig");
++    if (c.k.head.wide) if (head.wideForm(n)) |f| return head.unembedWide(c, f, x, ld, w, out, vn, n, vn, H);
 +    const tiles = [_]usize{ 1, 4, 16, 32 };
 +    const i: usize = if (n == 1) 0 else if (n <= 4) 1 else if (n <= 16) 2 else 3;
 +    var a: cuda.Args = .{};
@@ -2059,7 +2554,7 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +    if (V % W != 0) return error.BadDraftSplit;
 +    const dr = try gpa.create(Drafter);
 +    errdefer gpa.destroy(dr);
-+    dr.* = .{ .gpa = gpa, .d = d, .k = try Kernels.load(d), .rank = o.rank, .world = o.world, .group = o.group, .hq = heads_all / W, .hk = kv_all / W, .inter = inter_all / W, .vn = V / W, .vlo = o.rank * (V / W), .valid = 0, .context = o.context, .cap = o.cap };
++    dr.* = .{ .gpa = gpa, .d = d, .k = try Kernels.load(d), .rank = o.rank, .world = o.world, .group = o.group, .hq = heads_all / W, .hk = kv_all / W, .inter = inter_all / W, .vn = V / W, .vlo = o.rank * (V / W), .valid = 0, .context = o.context, .cap = o.cap, .pack_from = packFrom() };
 +    errdefer {
 +        for (dr.own.items) |*b| b.free();
 +        dr.own.deinit(gpa);
@@ -2082,6 +2577,8 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +    const q0 = o.rank * hq * D;
 +    const k0 = o.rank * hk * D;
 +    const m0 = o.rank * I;
++    const fp8 = fp8Mode();
++    if (o.rank == 0) std.log.info("inkling2 dspark: draft projections {s} (TF_INK2_DSPARK_FP8={t})", .{ if (fp8 == .none) "bf16" else "as MXFP8 weights", fp8 });
 +    for (&dr.L, 0..) |*l, i| {
 +        var nb: [8][96]u8 = undefined;
 +        const n = struct {
@@ -2095,11 +2592,14 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +        l.q_norm = try P.gain(try n(&nb[0], i, "self_attn.q_norm.weight"));
 +        l.k_norm = try P.gain(try n(&nb[0], i, "self_attn.k_norm.weight"));
 +        l.k_norm_ctx = try P.gain(try n(&nb[0], i, "self_attn.k_norm_ctx.weight"));
++        P.mx = fp8 == .all;
 +        l.qkv = try P.rows(&.{ .{ try n(&nb[1], i, "self_attn.q_proj.weight"), q0, hq * D }, .{ try n(&nb[2], i, "self_attn.k_proj.weight"), k0, hk * D }, .{ try n(&nb[3], i, "self_attn.v_proj.weight"), k0, hk * D } }, H);
-+        l.kv = try P.rows(&.{ .{ try n(&nb[1], i, "self_attn.k_proj_ctx.weight"), k0, hk * D }, .{ try n(&nb[2], i, "self_attn.v_proj_ctx.weight"), k0, hk * D } }, H);
 +        l.o = try P.cols(try n(&nb[1], i, "self_attn.o_proj.weight"), H, heads_all * D, q0, hq * D);
++        P.mx = fp8 != .none;
 +        l.gu = try P.rows(&.{ .{ try n(&nb[1], i, "mlp.gate_proj.weight"), m0, I }, .{ try n(&nb[2], i, "mlp.up_proj.weight"), m0, I } }, H);
 +        l.down = try P.cols(try n(&nb[1], i, "mlp.down_proj.weight"), H, inter_all, m0, I);
++        P.mx = false;
++        l.kv = try P.rows(&.{ .{ try n(&nb[1], i, "self_attn.k_proj_ctx.weight"), k0, hk * D }, .{ try n(&nb[2], i, "self_attn.v_proj_ctx.weight"), k0, hk * D } }, H);
 +    }
 +    {
 +        const fw = try r.alloc(gpa, "fuse_weight", .bf16);
@@ -2195,8 +2695,12 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +    dr.latent = try dr.alloc(most_streams * mrank * 2);
 +    dr.best_v = try dr.alloc(most_streams * logit_blocks * 4);
 +    dr.best_i = try dr.alloc(most_streams * logit_blocks * 4);
++    dr.best_s = try dr.alloc(most_streams * logit_blocks * 4);
 +    dr.pairs = try dr.alloc(W * most_streams * pick_stride);
 +    dr.walk = try dr.alloc(most_streams * block * 4);
++    dr.chances = try dr.alloc(most_streams * block * 4);
++    dr.chances_on = draftCut() != .off;
++    if (o.rank == 0 and !dr.chances_on) std.log.info("inkling2 dspark: no chances (TF_INK2_DRAFT_CUT=0): v0.2's argmax-only picks", .{});
 +    // the lane matmul's slice partials: the largest any call takes (one stream's block up to every stream's)
 +    {
 +        var most: usize = 0;
@@ -2221,6 +2725,8 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +    r: *ink.st.Reader,
 +    packer: *cuda.modelopt.Packer,
 +    s: cuda.Stream,
++    /// pack() quantizes to MXFP8 (TF_INK2_DSPARK_FP8)
++    mx: bool = false,
 +
 +    fn entry(P: *Pack, name: []const u8) !ink.st.Entry {
 +        const e = P.r.find(name) orelse {
@@ -2289,6 +2795,22 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +
 +    fn pack(P: *Pack, host: []const u8, n: usize, k: usize) !cuda.qmmf.Weight {
 +        if (k % cuda.qmmf.group != 0) return error.BadDraftCheckpoint;
++        if (P.mx) {
++            const mx = cuda.mxfp8;
++            const gpa = P.dr.gpa;
++            const codes = try gpa.alloc(u8, n * k);
++            defer gpa.free(codes);
++            const sc = try gpa.alloc(u8, n * (k / mx.group));
++            defer gpa.free(sc);
++            mx.quantize(codes, sc, host, n, k) catch return error.BadDraftCheckpoint;
++            const pc = try gpa.alloc(u8, mx.padded(n) * k);
++            defer gpa.free(pc);
++            mx.packCodes(pc, codes, n, k);
++            const psc = try gpa.alloc(u8, mx.padded(n) * (k / mx.group));
++            defer gpa.free(psc);
++            mx.packScales(psc, sc, n, k);
++            return mx.weight(try P.dr.put(pc), try P.dr.put(psc), n, k);
++        }
 +        var src = try cuda.DeviceBuffer.fromHost(P.dr.d, host);
 +        defer src.free();
 +        const out = try P.dr.alloc(cuda.modelopt.padded(n) * k * 2);
@@ -2352,14 +2874,15 @@ index 0000000000000000000000000000000000000000..acce5c5de6a55d8542e185603197e26e
 +}
 diff --git a/zig/src/families/inkling2/cuda_dspark_main.zig b/zig/src/families/inkling2/cuda_dspark_main.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..aef4231e5f4056009c4b7e1d0dc3ab99ce967768
+index 0000000000000000000000000000000000000000..0e5149003f1f4edc6a97391128fbfafadd1d9e46
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_dspark_main.zig
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,244 @@
 +//! tf-inkling2-draft: the CUDA drafter alone on a taps file (inkling2_dspark_ref.py gen: ids, n_prompt, taps
 +//! [T, 8, 4608]): positions 0 .. P - 1 absorbed from the file's taps, then the block at anchor P (the token ids[P]),
 +//! its intermediates written to OUT for `inkling2_dspark_ref.py check` against the torch reference's `dump`.
-+//! With --all, every anchor from n_prompt on: the proposals and the accepted lengths against the file's tokens.
++//! With --all, every anchor from n_prompt on: the proposals and the accepted lengths against the file's tokens;
++//! --chances (with --all's lines) also each draft's pick probability (the lone cut's chances, uncalibrated).
 +const std = @import("std");
 +const cuda = @import("cuda");
 +const ink = @import("inkling2");
@@ -2370,7 +2893,7 @@ index 0000000000000000000000000000000000000000..aef4231e5f4056009c4b7e1d0dc3ab99
 +const H = ic.weights.hidden;
 +
 +const usage =
-+    \\usage: tf-inkling2-draft <model dir> <taps file> (--anchor P --out FILE | --all)
++    \\usage: tf-inkling2-draft <model dir> <taps file> (--anchor P --out FILE | --all | --chances)
 +    \\
 +;
 +
@@ -2384,6 +2907,7 @@ index 0000000000000000000000000000000000000000..aef4231e5f4056009c4b7e1d0dc3ab99
 +    var anchor: ?usize = null;
 +    var out: ?[]const u8 = null;
 +    var all = false;
++    var chances = false;
 +    var i: usize = 3;
 +    while (i < args.len) : (i += 1) {
 +        if (std.mem.eql(u8, args[i], "--anchor") and i + 1 < args.len) {
@@ -2392,18 +2916,21 @@ index 0000000000000000000000000000000000000000..aef4231e5f4056009c4b7e1d0dc3ab99
 +        } else if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
 +            out = args[i + 1];
 +            i += 1;
-+        } else if (std.mem.eql(u8, args[i], "--all")) all = true else {
++        } else if (std.mem.eql(u8, args[i], "--all")) all = true else if (std.mem.eql(u8, args[i], "--chances")) {
++            all = true;
++            chances = true;
++        } else {
 +            std.debug.print("{s}", .{usage});
 +            return 2;
 +        }
 +    }
-+    return run(init.gpa, init.io, args[1], args[2], anchor, out, all) catch |e| {
++    return run(init.gpa, init.io, args[1], args[2], anchor, out, all, chances) catch |e| {
 +        std.debug.print("FAIL tf-inkling2-draft: {t}\n", .{e});
 +        return 1;
 +    };
 +}
 +
-+fn run(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, taps_path: []const u8, anchor: ?usize, out: ?[]const u8, all: bool) !u8 {
++fn run(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, taps_path: []const u8, anchor: ?usize, out: ?[]const u8, all: bool, chances: bool) !u8 {
 +    var driver = try cuda.Driver.open();
 +    defer driver.close();
 +    var ctx = try cuda.Context.init(&driver, 0);
@@ -2538,7 +3065,14 @@ index 0000000000000000000000000000000000000000..aef4231e5f4056009c4b7e1d0dc3ab99
 +        total += 1;
 +        std.debug.print("anchor {d}:", .{p});
 +        for (props) |t| std.debug.print(" {d}", .{t});
-+        std.debug.print(" | {d}\n", .{m});
++        std.debug.print(" | {d}", .{m});
++        if (chances) {
++            var ch: [dspark.drafts]f32 = undefined;
++            try dr.chancesMany(&c, &.{&ch});
++            std.debug.print(" |", .{});
++            for (ch) |x| std.debug.print(" {d:.5}", .{x});
++        }
++        std.debug.print("\n", .{});
 +    }
 +    std.debug.print("anchors {d}, accepted-prefix histogram at 7:", .{total});
 +    for (hist, 0..) |h, j| std.debug.print(" {d}:{d}", .{ j, h });

@@ -1,11 +1,11 @@
-From dee0906d3d18db50231d63c3112b5bf19942c210 Mon Sep 17 00:00:00 2001
+From c55b38d7931b63f26d3cca5a80bfacca3088e053 Mon Sep 17 00:00:00 2001
 From: Scott Biggart <297695+swbiggart@users.noreply.github.com>
-Date: Mon, 16 Nov 2026 01:00:00 -0800
+Date: Tue, 17 Nov 2026 19:30:00 -0800
 Subject: [PATCH 8/8] inkling2: notices: Inkling-2 credits in NOTICE and
  THIRD_PARTY_NOTICES.md, license texts
 
 11 files (9 new, 2 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
-Part of the engine changes behind Inkling-2-Small TP4 v0.1 (github.com/swbiggart/inkling2-sparks).
+Part of the engine changes behind Inkling-2-Small TP4 v0.2 (github.com/swbiggart/inkling2-sparks).
 Apply the whole series in order with git am (scripts/build-engine.sh does); only the full series is built and gated.
 ---
  LICENSES/NCCL-LICENSE.txt          |  237 +++++
@@ -17,9 +17,9 @@ Apply the whole series in order with git am (scripts/build-engine.sh does); only
  LICENSES/picojson-BSD-2-Clause.txt |   25 +
  LICENSES/xgrammar-Apache-2.0.txt   |  201 ++++
  LICENSES/xgrammar-NOTICE.txt       |    3 +
- NOTICE                             |   21 +
- THIRD_PARTY_NOTICES.md             |  257 ++++-
- 11 files changed, 2598 insertions(+), 1 deletion(-)
+ NOTICE                             |   27 +
+ THIRD_PARTY_NOTICES.md             |  286 ++++-
+ 11 files changed, 2633 insertions(+), 1 deletion(-)
  create mode 100644 LICENSES/NCCL-LICENSE.txt
  create mode 100644 LICENSES/NVIDIA-CUDA-EULA.txt
  create mode 100644 LICENSES/TokenSpeed-MIT.txt
@@ -2406,10 +2406,10 @@ index 0000000000000000000000000000000000000000..2d56df4754f7ebeba356393e69df5e2e
 +
 +Copyright (c) 2024 by XGrammar Contributors
 diff --git a/NOTICE b/NOTICE
-index 50e45b9ac90ea00ca45ab7afbdf3590b696e53d1..2ec1f111537e679d5a83def813219134271f9dce 100644
+index 50e45b9ac90ea00ca45ab7afbdf3590b696e53d1..735c628b8f9e974c3ec4279d13e3fa2820628254 100644
 --- a/NOTICE
 +++ b/NOTICE
-@@ -6,3 +6,24 @@ TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.
+@@ -6,3 +6,30 @@ TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.
  Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
  MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
  THIRD_PARTY_NOTICES.md.
@@ -2425,6 +2425,12 @@ index 50e45b9ac90ea00ca45ab7afbdf3590b696e53d1..2ec1f111537e679d5a83def813219134
 +Outside code they include keeps its own license and notice, and the outside sources
 +they follow are credited, in the "Inkling-2-Small" section of THIRD_PARTY_NOTICES.md.
 +
++The Inkling-2 attention core follows the fp32 attention arithmetic of tf_ik_attention
++in kortexa-ai's TensorFold fork (https://github.com/kortexa-ai/TensorFold, by francip)
++at commit e2614fe, Apache License 2.0. Files adapted from it keep their Apache-2.0
++header, name that source and commit, and say that they were modified. That fork's
++NOTICE is TensorFold's own, above.
++
 +The Inkling-2-Small release assets bundle NVIDIA NCCL 2.30.7 (Copyright (c) 2015-2026 NVIDIA CORPORATION &
 +AFFILIATES; Apache License 2.0 and BSD 3-Clause, LICENSES/NCCL-LICENSE.txt) and NVIDIA cuBLAS / cuBLASLt 13.1.1.3
 +(proprietary, redistributed unmodified under the NVIDIA CUDA Toolkit EULA, LICENSES/NVIDIA-CUDA-EULA.txt) in lib/,
@@ -2435,7 +2441,7 @@ index 50e45b9ac90ea00ca45ab7afbdf3590b696e53d1..2ec1f111537e679d5a83def813219134
 +dlpack (Apache License 2.0) and picojson (BSD 2-Clause License, Copyright 2009-2010 Cybozu Labs, Inc. and 2011-2014
 +Kazuho Oku). Their licenses are in LICENSES/ and lib/; xgrammar's notice is LICENSES/xgrammar-NOTICE.txt.
 diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
-index c894ea02bd1ae14e1b4f7b6b093c3ba6141bb4cc..6fc1c26b0978f9fd822e52102bd9b7a1321b6718 100644
+index c894ea02bd1ae14e1b4f7b6b093c3ba6141bb4cc..45f31780658fb6a72300b68475bf0234d66063e4 100644
 --- a/THIRD_PARTY_NOTICES.md
 +++ b/THIRD_PARTY_NOTICES.md
 @@ -303,7 +303,9 @@ without derivatives; only the Python engine reads that drafter. Each checkpoint
@@ -2449,7 +2455,7 @@ index c894ea02bd1ae14e1b4f7b6b093c3ba6141bb4cc..6fc1c26b0978f9fd822e52102bd9b7a1
  
  Redistribution and use in source and binary forms, with or without modification, are permitted provided that the
  following conditions are met:
-@@ -495,3 +497,256 @@ The fixtures in `zig/src/server/fixtures/thinking/` are unmodified release files
+@@ -495,3 +497,285 @@ The fixtures in `zig/src/server/fixtures/thinking/` are unmodified release files
    [LiquidAI/LFM2.5-24B-A2B-MLX-4bit](https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-MLX-4bit) at revision
    `667408d494bde191c2cb9dd4f4549827816b9275`, under the LFM Open License v1.0. See
    [`LICENSES/LFM-Open-1.0.txt`](LICENSES/LFM-Open-1.0.txt).
@@ -2489,10 +2495,10 @@ index c894ea02bd1ae14e1b4f7b6b093c3ba6141bb4cc..6fc1c26b0978f9fd822e52102bd9b7a1
 +  `reasoning_content`, and into `thinking` when the message has none. It applies to every chat template, not only
 +  Inkling-2's.
 +
-+The other oracle tools (`inkling2_ref_check.py`, `inkling2_attn_check.py`, `inkling2_f64.py`, and
-+`inkling2_dspark_ref.py`) import Transformers' Inkling-2 modules, masks, cache and tokenizer at run
-+time. Where they recompute part of the math themselves (the attention in `inkling2_f64.py`, `Inkling2NormedEmbedding`
-+in `inkling2_dspark_ref.py`), they copy no Transformers code. Transformers itself is not included.
++The other oracle tools (`inkling2_ref_check.py`, `inkling2_attn_check.py`, `inkling2_f64.py`,
++`inkling2_margins.py`, and `inkling2_dspark_ref.py`) import Transformers' Inkling-2 modules, masks, cache and
++tokenizer at run time. Where they recompute part of the math themselves (the attention in `inkling2_f64.py` and
++`inkling2_margins.py`, `Inkling2NormedEmbedding` in `inkling2_dspark_ref.py`), they copy no Transformers code. Transformers itself is not included.
 +
 +**TokenSpeed** ([lightseekorg/tokenspeed](https://github.com/lightseekorg/tokenspeed)), Copyright (c) 2026 LightSeek
 +Foundation, MIT License (see [the license text](LICENSES/TokenSpeed-MIT.txt)). TokenSpeed ships no NOTICE file.
@@ -2506,6 +2512,27 @@ index c894ea02bd1ae14e1b4f7b6b093c3ba6141bb4cc..6fc1c26b0978f9fd822e52102bd9b7a1
 +  Inkling-2 draft (`python/tokenspeed/runtime/models/inkling2_mtp.py`, `execution/drafter/inkling2.py` and
 +  `execution/drafter/dflash.py`, including `Inkling2MTPHead.refresh_fold` and the bf16 `RotaryEmbedding` cache),
 +  under the same copyright and license.
++
++**kortexa-ai's TensorFold fork** ([kortexa-ai/TensorFold](https://github.com/kortexa-ai/TensorFold), by francip, commit
++`e2614fe`), Apache License 2.0 (see [the license text](LICENSES/Apache-2.0.txt)); its `NOTICE` is TensorFold's own,
++reproduced in `NOTICE`. The Inkling-2 attention core is adapted from its `tf_ik_attention` kernel. Each file below keeps
++the Apache-2.0 header, names that source and commit, and says that it was modified:
++
++- `zig/kernels/cuda/inkling2_kx_common.cuh` is `zig/kernels/cuda/inkling2_common.cuh` at `e2614fe`, with that header
++  added and nothing else changed.
++- `zig/kernels/cuda/inkling2_kx_attention.cuh` is `zig/kernels/cuda/inkling2_attention.cuh` at `e2614fe`, with its
++  include renamed to `inkling2_kx_common.cuh` and the kernel renamed `tf_ik_attention_e2614fe`. The engine never runs
++  it; `tf-inkling2-attn` runs it as a control.
++- `zig/kernels/cuda/inkling2_kx_fp32.cuh`, the attention the engine runs, keeps the per-row arithmetic of
++  `inkling2_attention.cuh` and `inkling2_attention_decode.cuh` (Q·K on `mma.sync` with fp32 accumulation, fp32 scores
++  and online softmax over 64-key tiles, P·V as three bf16 parts of fp32 P, the multiplier form of the attention sink,
++  one bf16 rounding at the output) and the relative-bias arithmetic of `inkling2_heads.cuh`. Modified: one tile body
++  for every form, with ring and paged keys, the position read on the device for CUDA graphs and scalar kernel
++  arguments; keys outside a block's range loaded as zero; subnormal q, K, V elements and P parts flushed per element;
++  a row with a non-finite input recomputed alone (never its whole block); NaN outputs stored as one canonical value;
++  exception counters; column splits; fixed S-key splits on the global layers and on the sliding-window layers with an
++  ordered fp32 merge, and a walk over the splits for long prompt chunks; the query heads that share a key/value head
++  packed into one tile; the relative-bias table in one launch.
 +
 +### Numerics and behaviour followed
 +
@@ -2531,6 +2558,11 @@ index c894ea02bd1ae14e1b4f7b6b093c3ba6141bb4cc..6fc1c26b0978f9fd822e52102bd9b7a1
 +  vision tensor names in `roles.zig` follow TokenSpeed's `inkling2_mtp.py` and `inkling2_vision.py`.
 +  `tools/zig/inkling2_ref_check.py --tokenspeed TS_DIR` runs TokenSpeed's own `block_scaled.py` from a checkout the
 +  user supplies, unmodified (its unused imports stubbed); it is not copied or shipped.
++- **kortexa-ai's TensorFold fork** (the copyright and license above). The fp32 attention reference and checks follow
++  the arithmetic of `tf_ik_attention` at `e2614fe` and copy none of its code: `tools/zig/inkling2_ref.py`,
++  `inkling2_op_ref.py` and `inkling2_margins.py` (`--attn fp32`, in PyTorch); `zig/src/core/relbias_attention_ref.zig`
++  (float64 ranges of its fast path and its per-row path, and of the split form); the argument layout of the control
++  launch in `zig/src/families/inkling2/cuda_attn.zig` (`InklingAttention`).
 +- **Four Over Six** ([mit-han-lab/fouroversix](https://github.com/mit-han-lab/fouroversix); J. Cook, J. Guo, G. Xiao,
 +  Y. Lin, S. Han, "Four Over Six: More Accurate NVFP4 Quantization with Adaptive Block Scaling",
 +  [arXiv:2512.02010](https://arxiv.org/abs/2512.02010)). The checkpoint's `scale_selection_rule: fouroversix_mae`
@@ -2632,7 +2664,10 @@ index c894ea02bd1ae14e1b4f7b6b093c3ba6141bb4cc..6fc1c26b0978f9fd822e52102bd9b7a1
 +  only: `/health`'s KV capacity and admission report (`server/status_routes.zig` `kv`), and the measuring process
 +  behind `recipe/inkling2-tp4/bench.sh` and `tools/inkling2_bench.py` (a one-command speed sweep with JSON out and a
 +  check command, a fixed realistic prompt set measured on the server's clock and at temperature 0.7 too, a speed
-+  ledger against a bandwidth floor, concurrent needle sessions). No code was copied; the prompts
++  ledger against a bandwidth floor, concurrent needle sessions); and FP8 weight-only projections for the DSpark
++  drafter, whose MLP projections run from an FP8 copy of the checkpoint's bf16 drafter weights (theirs: e4m3 with a
++  scale per row; ours: MXFP8, e4m3 with a power-of-two scale per 32 values, quantized at start-up by the quantizer in
++  `zig/src/cuda/mxfp8.zig` and loaded in `zig/src/families/inkling2/cuda_dspark.zig`). No code was copied; the prompts
 +  (`tools/inkling2_prompts.json`) and the needle text are our own.
 +- **BertholomusAI's four-Spark TensorFold recipes**
 +  ([deepseek-v4.1-tensorfold-tp4-4xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10),
