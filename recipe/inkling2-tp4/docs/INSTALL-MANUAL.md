@@ -28,8 +28,9 @@ What `setup.sh` does step by step, its options, the container install, and the s
    check, DSpark, the RoCE mesh wire, `--context 131072`, `--parallel auto` capped by `MAX_STREAMS=4` (four streams),
    an 8 GiB memory reserve and an explicit `--prompt-cache-gib`. The hosts file only needs to name what differs.
 7. **start**, **status** and **smoke:** rank 0, then ranks 1-3. `setup.sh` waits until all four have loaded, prints
-   each rank's state, then runs the smoke checks on rank 0's host. When the release ships the oracle files, it also
-   checks the greedy replies against the oracle's.
+   each rank's state, then runs the smoke checks on rank 0's host. When the release ships the reference files, it
+   also runs greedy replies against the reference's and reports where they depart (information; the token gate is
+   `smoke.py yardstick`, step 6 below).
 
 Every step skips what is already done, so a second run checks and starts. Single steps:
 
@@ -100,7 +101,7 @@ it, and unpack it on the control machine:
 ```
 sha256sum -c tensorfold-inkling2-tp4-VERSION-aarch64-sm121.tar.gz.sha256
 tar xzf tensorfold-inkling2-tp4-VERSION-aarch64-sm121.tar.gz
-cd tensorfold-inkling2-tp4-VERSION && sha256sum -c SHA256SUMS
+cd tensorfold-inkling2-tp4-VERSION-aarch64-sm121 && sha256sum -c SHA256SUMS
 ```
 
 It holds:
@@ -112,7 +113,8 @@ It holds:
 - `recipe/inkling2-tp4/`: this folder
 - `tools/`: the weight copy tool and the benchmarks
 - `plan/`: the rank ranges and the digest manifest
-- `data/`: the decode check's prompt and the oracle's greedy ids
+- `data/`: the decode check's prompt, the fp32 reference's replies with their top-two margins, the extended prompt
+  set (`ext/`) and the structured-output cases (`so-cases/`)
 - the licence files
 
 **Or build** the engine from source: upstream TensorFold at `ENGINE_COMMIT` with this repository's `patches/` applied
@@ -212,17 +214,27 @@ curl -s http://127.0.0.1:8890/v1/chat/completions -H 'Content-Type: application/
 ./check.sh my-sparks.conf ../../data/long_4000.safetensors 3040 80    # prints PASS: ... bit-equal 80/80 ...
 ```
 
-**Greedy against the oracle**, **smoke** and the benchmarks run where the endpoint is reachable (rank 0's host when
-HTTP is on loopback), from the unpacked release folder:
+**The token gate**, **smoke** and the benchmarks run where the endpoint is reachable (rank 0's host when HTTP is on
+loopback), from the unpacked release folder:
 
 ```
+python3 recipe/inkling2-tp4/smoke.py http://127.0.0.1:8890 yardstick data/decode.json \
+  chat_short=data/chat_short.ids.json tool_call=data/tool_call.ids.json --ext data/ext
+                                      # v0.2 prints YARDSTICK: top-1 434/445 (< 438), in the oracle's top-2 443/445 (>= 443): FAIL
+                                      # (top-1 below its bar: CORRECTNESS.md#agreement-with-the-fp32-reference)
 python3 recipe/inkling2-tp4/smoke.py http://127.0.0.1:8890 oracle data/decode.json \
-  chat_short=data/chat_short.ids.json tool_call=data/tool_call.ids.json       # token for token
+  chat_short=data/chat_short.ids.json tool_call=data/tool_call.ids.json --ext data/ext
+                                      # free-running replies: EQUAL, or DEPARTS at j (information)
 python3 recipe/inkling2-tp4/smoke.py http://127.0.0.1:8890 smoke --long-tokens 8000
 ```
 
-The oracle files come from `tools/zig/inkling2_ref.py` (in the engine source: upstream TensorFold at `ENGINE_COMMIT` with `patches/` applied, as `scripts/build-engine.sh` makes it): the checkpoint run through Transformers' own Inkling-2
-modules in PyTorch, with the experts quantized as the checkpoint specifies (TokenSpeed's reference).
+The yardstick sends 445 one-token requests, one after another. The reference files come from
+`tools/zig/inkling2_ref.py --attn fp32` (in the engine source: upstream TensorFold at `ENGINE_COMMIT` with `patches/`
+applied, as `scripts/build-engine.sh` makes it): the checkpoint run through Transformers' own Inkling-2 modules in
+PyTorch, with attention in fp32 as the kernels compute it ([CORRECTNESS.md](CORRECTNESS.md#the-attention-arithmetic)),
+with TF32 off: `decode.json` and `ext/` in the tool's default mode (the stored expert weights decoded to bf16),
+`so-cases/` in its checkpoint mode (activations quantized as the checkpoint's quantization config requires,
+TokenSpeed's reference). Each token carries the reference's top-two margin at its position.
 
 ## Step 7. Benchmarks
 
@@ -231,8 +243,8 @@ standard library only) and writes JSON to `./bench-results/`:
 
 ```
 ./bench.sh my-sparks.conf check        # GPU-free install check on every host
-./bench.sh my-sparks.conf sweep        # decode at 1/2/4 streams, the one-stream workloads, cold prompts (~6 minutes)
-./bench.sh my-sparks.conf prompts      # the 16-row prompt set at temperature 0 and 0.7 (~25 minutes)
+./bench.sh my-sparks.conf sweep        # decode at 1/2/4 streams, the one-stream workloads, cold prompts
+./bench.sh my-sparks.conf prompts      # the 16-row prompt set at temperature 0 and 0.7
 ./bench.sh my-sparks.conf needle       # concurrent needle sessions (8 at once need MAX_STREAMS=8, CONTEXT=32768)
 ./bench.sh my-sparks.conf ledger bench-results/sweep-*.json
 ```

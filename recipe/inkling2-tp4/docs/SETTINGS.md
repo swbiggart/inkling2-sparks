@@ -42,7 +42,12 @@ and ranks that differ refuse to start). Set one in your config only to differ fr
   file, byte for byte the same as `tools/zig/inkling2_dspark_ref.py fold` (a PyTorch tool in the engine source, `patches/`). `DSPARK=0` turns drafting off.
 - **DSpark by depth** (no setting): drafting costs more as a stream's context grows, since every draft and verify
   reads the whole context. Up to 32,768 positions a stream's rounds are priced from the short-context cost table, at
-  least one draft a round. Past it a round of d drafts is priced at the stream's own depth (a table measured at 3,040,
+  least one draft a round. There a lone greedy stream (no structured output) also cuts a draft short
+  before the model checks it when the drafter's own probabilities say the next guess will probably be rejected.
+  With 2 to 4 streams a shared round gives its draft rows to the likeliest drafts across the streams;
+  `TF_INK2_SHARED_CUT=0` (every rank; exactly `0`: any other value leaves it on) turns this off, the same replies
+  either way.
+  Past 32,768 a round of d drafts is priced at the stream's own depth (a table measured at 3,040,
   32,768, 131,072, 262,144 and 524,000 positions, interpolated, plus what such rounds took beyond their price on this
   server), and a plain round competes: drafts must beat it by 5 %, with a probe after a run of plain rounds. A deep
   stream runs plain until a plain round past 32,768 has been timed, starts at one draft a round and reaches at most
