@@ -36,5 +36,15 @@ and the C++ sources of xgrammar v0.2.8 (Copyright (c) 2024 by XGrammar Contribut
 headers of dlpack (Apache License 2.0) and picojson (BSD 2-Clause License, Copyright 2009-2010 Cybozu Labs, Inc. and
 2011-2014 Kazuho Oku). Their licenses are in LICENSES/ and lib/; xgrammar's notice is LICENSES/xgrammar-NOTICE.txt.
 
-Inkling-2-Small is Thinking Machines' model (Apache License 2.0). This project is not affiliated with or endorsed by
+Image input's decoders in lib/ are built unmodified from their projects' signed release tarballs:
+lib/libturbojpeg.so.0 from libjpeg-turbo 3.1.4.1 and lib/libwebpdecoder.so.3 from libwebp
+1.6.0. This software is based in part on the work of the Independent JPEG Group. libjpeg-turbo is
+Copyright (C) 2009-2026 D. R. Commander and Copyright (C) 2015 Viktor Szathmáry, with the IJG's code Copyright (C)
+1991-2020 Thomas G. Lane, Guido Vollbeding (IJG License, Modified (3-clause) BSD License and zlib License;
+LICENSES/libjpeg-turbo-LICENSE.md, LICENSES/libjpeg-turbo-README.ijg). libwebp is Copyright (c) 2010, Google Inc.
+(BSD 3-Clause License with an additional patent grant; LICENSES/libwebp-COPYING.txt, LICENSES/libwebp-PATENTS.txt).
+The same texts are shipped in lib/.
+
+Inkling-2-Small is Thinking Machines' model (Apache License 2.0); inkling2-vision.safetensors, which the recipe writes
+from the checkpoint, holds its vision tower's tensors unchanged. This project is not affiliated with or endorsed by
 Thinking Machines.

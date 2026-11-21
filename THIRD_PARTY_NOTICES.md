@@ -50,6 +50,8 @@ These parts are adapted from it, modified for TensorFold, and carry that copyrig
 - `tools/zig/inkling2_op_ref.py`: `tau_of` and `dyn_conv` split the attention's log scaling and
   `Inkling2DynamicShortConvolution.forward` into ops.
 - `tools/zig/inkling2_moe_check.py`: `exact_sums` is `Inkling2Experts.forward` with fp64 GEMMs.
+- `tools/zig/inkling2_vision_ref.py` (the image oracle) writes out the `model.visual.` weight renames of
+  `conversion_mapping.py` (`VISUAL_RENAMES`).
 - `zig/src/core/template/template.zig` (`aliasReasoning`) is `_alias_reasoning_fields` from Transformers'
   `utils/chat_template_utils.py` (Copyright 2024 The HuggingFace Team, Apache License 2.0), rewritten in Zig. As
   `apply_chat_template` does, it copies a message's first non-null `reasoning_content`, `thinking` or `reasoning` into
@@ -58,8 +60,10 @@ These parts are adapted from it, modified for TensorFold, and carry that copyrig
 
 The other oracle tools (`inkling2_ref_check.py`, `inkling2_attn_check.py`, `inkling2_f64.py`, and
 `inkling2_dspark_ref.py`) import Transformers' Inkling-2 modules, masks, cache and tokenizer at run
-time. Where they recompute part of the math themselves (the attention in `inkling2_f64.py`, `Inkling2NormedEmbedding`
-in `inkling2_dspark_ref.py`), they copy no Transformers code. Transformers itself is not included.
+time; the image oracle tools (`inkling2_vision_ref.py`, `inkling2_vision_check.py` and `inkling2_image_fixtures.py`)
+import its Inkling-2 vision modules and image processor. Where they recompute part of the math themselves (the
+attention in `inkling2_f64.py`, `Inkling2NormedEmbedding` in `inkling2_dspark_ref.py`, the tower's ops in float64 in
+`inkling2_vision_check.py`), they copy no Transformers code. Transformers itself is not included.
 
 **TokenSpeed** ([lightseekorg/tokenspeed](https://github.com/lightseekorg/tokenspeed)), Copyright (c) 2026 LightSeek
 Foundation, MIT License (see [the license text](LICENSES/TokenSpeed-MIT.txt)). TokenSpeed ships no NOTICE file.
@@ -108,6 +112,11 @@ included.
   (the configuration defaults), `roles.zig`, `plan.zig`, `cuda_attn.zig`, `cuda_conv.zig`, `cuda_forward.zig`,
   `cuda_head.zig`, `cuda_moe.zig`, `cuda_ops.zig`, `cuda_res.zig` and `cuda_weights.zig`. The gate/up row interleave
   of the split experts (`plan.zig`) reads the rows as the `Interleave` converter in `conversion_mapping.py` does.
+  The vision tower (`zig/kernels/cuda/inkling2_vision.cu`, `inkling2_vision_attn.cuh` and
+  `zig/src/families/inkling2/cuda_vision.zig`) computes `Inkling2VisionModel` with torch's rounding points, its
+  position taps as `vision_utils` gives them. The image processor (`zig/src/families/inkling2/image.zig`) gives the
+  pixel values of `Inkling2ImageProcessor` (`models/inkling2/` at `109a7d19`) bit for bit: no resize, one token for each
+  40 x 40 block, padded, and alpha laid over the processor's grey checkerboard.
 - **TokenSpeed** (the copyright and license above). The checkpoint-mode kernels compute the numerics of its Torch
   reference, one rounding per Torch op: `zig/kernels/cuda/inkling2_ck.cu`, `zig/src/families/inkling2/cuda_moe.zig`
   (checkpoint mode) and `quant.zig`. The slot order of the fold (`tokenspeed_slot_order` in
@@ -123,7 +132,10 @@ included.
   the arithmetic of `tf_ik_attention` at `e2614fe` and copy none of its code: `tools/zig/inkling2_ref.py`,
   `inkling2_op_ref.py` and `inkling2_margins.py` (`--attn fp32`, in PyTorch); `zig/src/core/relbias_attention_ref.zig`
   (float64 ranges of its fast path and its per-row path, and of the split form); the argument layout of the control
-  launch in `zig/src/families/inkling2/cuda_attn.zig` (`InklingAttention`).
+  launch in `zig/src/families/inkling2/cuda_attn.zig` (`InklingAttention`). The vision tower's attention core
+  (`zig/kernels/cuda/inkling2_vision_attn.cuh`) is written for its 64-wide heads after the tile arithmetic of
+  `inkling2_kx_fp32.cuh` (Q·K on `mma.sync` with fp32 accumulation, 64-key tiles, P·V as three bf16 parts of fp32 P);
+  it copies no file of `e2614fe`.
 - **Four Over Six** ([mit-han-lab/fouroversix](https://github.com/mit-han-lab/fouroversix); J. Cook, J. Guo, G. Xiao,
   Y. Lin, S. Han, "Four Over Six: More Accurate NVFP4 Quantization with Adaptive Block Scaling",
   [arXiv:2512.02010](https://arxiv.org/abs/2512.02010)). The checkpoint's `scale_selection_rule: fouroversix_mae`
@@ -170,6 +182,13 @@ shipped `tools/bench_openai.py` and `tools/bench_concurrent.py`, keeps its MIT n
   `zig/src/fabric/tp/`, the GLM family's CUDA rank, shard and boundary code, the MiniMax-M3 family's CUDA skeleton and
   DSpark drafter, and `tf-tp-test`. `zig/src/families/inkling2/cuda_wire.zig` borrows
   `glm/cuda_roce_multi.zig`.
+- The image processor (`image.zig`) decodes with upstream's `zig/src/core/picture/`: PNG from the PNG specification,
+  JPEG and WebP through libjpeg-turbo 3.1.4.1 and libwebp 1.6.0 (bundled in `lib/`,
+  below) called with Pillow's decoder settings, to the RGB pixels Pillow loads (Pillow's MIT-CMU License, Copyright ©
+  1997-2011 by Secret Labs AB, Copyright © 1995-2011 by Fredrik Lundh and contributors, Copyright © 2010 by Jeffrey
+  'Alex' Clark and contributors; [the license text](LICENSES/Pillow-MIT-CMU.txt)). Upstream credits these in the
+  "Pictures in the native engine" section of its `THIRD_PARTY_NOTICES.md`, with the resizes that repeat Pillow's
+  `Image.resize` arithmetic for other families; Inkling-2's processor does not resize. No Pillow code is included.
 - The recipe's NCCL `NCCL_CUMEM_ENABLE=1` and `NCCL_RUNTIME_CONNECT=1` settings follow
   `docs/recipes/glm-5.3-flash-cuda.md`.
 - The recipe's RoCE gathers (`TF_INK2_ROCE_MULTI=1`, on by default, through `cuda_wire.zig` with the shipped
@@ -250,7 +269,7 @@ conditions on TensorFold; they are credited by name.
   configuration export. It contains no MikroTik code. MikroTik and RouterOS are trademarks of SIA Mikrotīkls;
   TensorFold is not affiliated with or endorsed by MikroTik.
 
-### Release binaries: toolchain and NVIDIA components
+### Release binaries: toolchain, NVIDIA components and bundled libraries
 
 - **Zig.** The executables in `bin/` of the release archives (`tensorfold-native`, `tf-inkling2-decode`,
   `tf-inkling2-plan`, `tf-inkling2-fold`, `tf-tp-test`) are built with [Zig](https://ziglang.org) 0.17.0 and include compiled code from
@@ -285,6 +304,21 @@ conditions on TensorFold; they are credited by name.
   [LICENSES/xgrammar-NOTICE.txt](LICENSES/xgrammar-NOTICE.txt), [LICENSES/dlpack-Apache-2.0.txt](LICENSES/dlpack-Apache-2.0.txt)
   and [LICENSES/picojson-BSD-2-Clause.txt](LICENSES/picojson-BSD-2-Clause.txt), also shipped in `lib/` beside the library.
   `scripts/build-engine.sh` clones xgrammar at that commit to build it.
+- **libjpeg-turbo** (`lib/libturbojpeg.so.0`, the TurboJPEG library of libjpeg-turbo 3.1.4.1, aarch64)
+  is built unmodified from the project's signed release tarball by `scripts/release/build-codecs.sh` and loaded by
+  image input (`VISION=1`, rank 0) to decode JPEG pictures. This software is based in part on the work of the
+  Independent JPEG Group. libjpeg-turbo is Copyright (C) 2009-2026 D. R. Commander and Copyright (C) 2015 Viktor
+  Szathmáry (the TurboJPEG API), with the IJG's code Copyright (C) 1991-2020 Thomas G. Lane, Guido Vollbeding, under
+  the IJG License, the Modified (3-clause) BSD License and the zlib License; their texts are
+  [LICENSES/libjpeg-turbo-LICENSE.md](LICENSES/libjpeg-turbo-LICENSE.md) (with the Modified BSD License's text) and
+  [LICENSES/libjpeg-turbo-README.ijg](LICENSES/libjpeg-turbo-README.ijg), also shipped as `lib/LICENSE-libjpeg-turbo.md`
+  and `lib/README-ijg.txt`.
+- **libwebp** (`lib/libwebpdecoder.so.3`, the decoder library of libwebp 1.6.0, aarch64) is built
+  unmodified from the project's signed release tarball by the same script and loaded by image input to decode WebP
+  pictures. Copyright (c) 2010, Google Inc., under the BSD 3-Clause License with an additional patent grant; the texts
+  are [LICENSES/libwebp-COPYING.txt](LICENSES/libwebp-COPYING.txt) and
+  [LICENSES/libwebp-PATENTS.txt](LICENSES/libwebp-PATENTS.txt), also shipped as `lib/LICENSE-libwebp.txt` and
+  `lib/PATENTS-libwebp.txt`.
 
 ### Model data
 
@@ -304,6 +338,13 @@ are computed by TensorFold's tools and are not files from the original repositor
   TensorFold's own prompts, rendered with the checkpoint's chat template and tokenizer.
 - `data/decode.json` and the other tensors in `data/long_4000.safetensors` (hidden states, routes, logits): outputs of
   the model at that revision, computed by `tools/zig/inkling2_ref.py`.
+
+The vision tower file `inkling2-vision.safetensors` is the checkpoint's own: the 422 `model.visual.*`
+tensors of that revision's last shard (`model-00024-of-00024.safetensors`), their bytes copied unchanged into a
+safetensors file of their own (Thinking Machines, Apache License 2.0). It is not in this repository or the release
+tarball: with `VISION=1`, `weights.sh` (`weights/copy-rank.sh --vision`, `tools/zig/inkling2_vision_copy.py`) writes
+it in rank 0's folder from the pinned Hugging Face revision by range requests (or from a full checkpoint) and checks
+its sha256.
 
 The model weights are not included in TensorFold or its release assets. The DSpark fold file
 (`inkling2-dspark-fold.safetensors`, computed from the unembed and the drafter's `hidden_out`) is derived weights;
