@@ -2,31 +2,33 @@
 
 The release binaries are TensorFold's native engine with the Inkling-2 family: upstream
 [TensorFold](https://github.com/ashhart/TensorFold) at the commit in [`ENGINE_COMMIT`](../ENGINE_COMMIT)
-(`223da7659b2f1ec7a6fe666cb064d839382d6fce`) with the patches in [`patches/`](../patches/) applied in order.
+(`223da7659b2f1ec7a6fe666cb064d839382d6fce`) with the patches in [`patches/`](../patches/) (0001-0008) applied in
+order.
 
 ## The patches
 
 | Patch | What it adds or changes |
 | --- | --- |
-| `0001` family | the Inkling-2 family (`zig/src/families/inkling2/`: config, plan and weights, the tensor-parallel CUDA runner with the KV page pool, the decode tool), its server text layer, structured output and chat-template additions, `/health`'s `kv`, and the native engine's family hooks |
-| `0002` kernels | the CUDA kernels (`zig/kernels/cuda/inkling2_*.cu`: attention, MoE, convolution, head, residual, fused, checkpoint mode) and their launch wrappers; the fp32 attention core (`inkling2_kx*`, after kortexa-ai's `tf_ik_attention`), its checks (`tf-inkling2-attn`: the kernel forms, CUDA graphs, rare inputs) and its float64 reference (`zig/src/core/relbias_attention_ref.zig`); the decode steps' merged launches (projections, the bf16 router, convolution state commits); the MXFP8 quantizer for the drafter's MLP projections (`zig/src/cuda/mxfp8.zig`) |
+| `0001` family | the Inkling-2 family (`zig/src/families/inkling2/`: config, plan and weights, the tensor-parallel CUDA runner with the KV page pool, the decode tool), its server text layer, structured output and chat-template additions, `/health`'s `kv`, and the native engine's family hooks; the prompt overlap (`cuda_xover.zig`), image input (`image.zig`, `image_offer.zig`, the vision tower's runner `cuda_vision*.zig`, the server's image parts and the picture decoders' hooks in `zig/src/core/picture/`) and the NVMe prompt-cache tier (`cuda_nvme.zig`) |
+| `0002` kernels | the CUDA kernels (`zig/kernels/cuda/inkling2_*.cu`: attention, MoE, convolution, head, residual, fused, checkpoint mode) and their launch wrappers; the fp32 attention core (`inkling2_kx*`, after kortexa-ai's `tf_ik_attention`), its checks (`tf-inkling2-attn`: the kernel forms, CUDA graphs, rare inputs) and its float64 reference (`zig/src/core/relbias_attention_ref.zig`); the decode steps' merged launches (projections, the bf16 router, convolution state commits); the MXFP8 quantizer for the drafter's MLP projections (`zig/src/cuda/mxfp8.zig`); the vision tower's kernels (`inkling2_vision.cu`, `inkling2_vision_attn.cuh`) |
 | `0003` batching | the lanes core for several streams a decode step and interleaved prefill; the lone stream's draft cut (`zig/src/core/lanes/windows.zig`, `cuda_lanes.zig`) |
 | `0004` DSpark | the drafter kernel and runner (its global-layer attention packed by key head, its MLP projections loaded as MXFP8), the native fold tool `tf-inkling2-fold`, the draft depth rule |
 | `0005` prompt cache | exact prefix snapshots, the `shared_first` rules, the store budget (upstream core edits) |
-| `0006` tooling | the checkpoint-mode oracle and checks (`tools/zig/inkling2_*.py`, PyTorch; `--attn fp32` for the fp32 reference, `inkling2_margins.py` and `inkling2_tokengate.py` for the token gate), template and tokenizer parity |
+| `0006` tooling | the checkpoint-mode oracle and checks (`tools/zig/inkling2_*.py`, PyTorch; `--attn fp32` for the fp32 reference, `inkling2_margins.py` and `inkling2_tokengate.py` for the token gate; `inkling2_vision_ref.py`, `inkling2_vision_check.py` and `inkling2_image_fixtures.py` for image input), template and tokenizer parity |
 | `0007` build glue | `zig build` steps for the family, its kernels and tools |
 | `0008` notices | the Inkling-2 credits in `NOTICE` and `THIRD_PARTY_NOTICES.md` (in the fork's wording: the recipe and release scripts are in this repository), and the license texts they cite |
 
 Applied with `git am --committer-date-is-author-date` and the committer `scripts/build-engine.sh` sets, the series gives
-commit `c55b38d7931b63f26d3cca5a80bfacca3088e053`, tree `ef76388571d6410e2db157861489da85c14fe082`
+commit `7431a17b155f969798480732ab718ce76170608f`, tree `3cc9020679827f14c9f85ca50814932b162b72de`
 ([`patches/APPLIED_TREE`](../patches/APPLIED_TREE)). That is the engine branch
-[`inkling2-sparks-v0.2`](https://github.com/swbiggart/TensorFold-upstream/tree/inkling2-sparks-v0.2) of our TensorFold
+[`inkling2-sparks-v0.3`](https://github.com/swbiggart/TensorFold-upstream/tree/inkling2-sparks-v0.3) of our TensorFold
 fork, at commit
-[`c55b38d7931b63f26d3cca5a80bfacca3088e053`](https://github.com/swbiggart/TensorFold-upstream/tree/c55b38d7931b63f26d3cca5a80bfacca3088e053),
+[`7431a17b155f969798480732ab718ce76170608f`](https://github.com/swbiggart/TensorFold-upstream/tree/7431a17b155f969798480732ab718ce76170608f),
 and the release branch's tree restricted to the engine's paths, except that `NOTICE` and `THIRD_PARTY_NOTICES.md` say
-where the recipe lives. The branch never moves; a later version gets its own branch (v0.1's engine is
-[`inkling2-sparks-v0.1`](https://github.com/swbiggart/TensorFold-upstream/tree/inkling2-sparks-v0.1), commit
-`dee0906d3`).
+where the recipe lives. The branch never moves; a later version gets its own branch (v0.2's engine is
+[`inkling2-sparks-v0.2`](https://github.com/swbiggart/TensorFold-upstream/tree/inkling2-sparks-v0.2), commit
+`c55b38d79`; v0.1's is [`inkling2-sparks-v0.1`](https://github.com/swbiggart/TensorFold-upstream/tree/inkling2-sparks-v0.1),
+commit `dee0906d3`).
 
 Other ids you may meet: the tarball's `VERSION` names the `source commit` of this repository it was packed from (the
 container image is tagged with it). The tarball's binaries are the gated build, compiled from the same engine source as
@@ -60,6 +62,17 @@ nvcc -fatbin -O3 -std=c++17 -gencode=arch=compute_120,code=sm_120 -gencode=arch=
 
 It copies `tensorfold-native`, `tf-inkling2-decode`, `tf-inkling2-plan`, `tf-inkling2-fold`, `tf-tp-test` and
 `tp_mailbox.fatbin` to `build/dist/bin/`, `libtfgrammar.so` to `build/dist/lib/`, and writes `build/dist/BUILD-INFO` (commits, image, toolchain, sha256s).
+
+## The image decoders
+
+Image input's JPEG and WebP decoders are separate libraries in `lib/`, built outside the toolchain image by
+`scripts/release/build-codecs.sh OUT [--src DIR]` (on macOS or Linux, with zig 0.17.0, cmake and ninja on `PATH`):
+`OUT/libturbojpeg.so.0` from libjpeg-turbo 3.1.4.1 and `OUT/libwebpdecoder.so.3` from libwebp
+1.6.0, the releases Pillow 12.3.0 bundles; the engine refuses any other release. The sources are the
+projects' release tarballs, downloaded (or taken from `--src DIR`) and checked against the sha256s in the script; their
+signatures were checked once against the projects' release keys. They are built unmodified with CMake (Release, the
+projects' default Neon SIMD) and `zig cc -target aarch64-linux-gnu.2.28`, with no debug info, no build paths and a
+fixed libjpeg-turbo build string. Their licence texts are in `LICENSES/` (`libjpeg-turbo-*`, `libwebp-*`).
 
 ## Reproduction check (v0.1)
 
@@ -97,21 +110,21 @@ run one build on all four hosts.
 
 ## Making the release tarball
 
-NVIDIA's NCCL and cuBLAS in `lib/`, `plan/` and `data/` (computed from the checkpoint) do not depend on the build;
-`scripts/release/stage-dist.sh` takes them from the published tarball (keeping the `libtfgrammar.so` the build made). `scripts/release/build-assets.sh` then packs the
-binaries, the recipe and tools at a commit of this repository, and the engine source's `LICENSE`, `NOTICE`,
-`THIRD_PARTY_NOTICES.md` and `LICENSES/` (TensorFold's, with the Inkling-2 section: they cover the code compiled into
-the binaries and the bundled libraries):
+NVIDIA's NCCL and cuBLAS in `lib/`, the image decoders, `plan/` and `data/` (computed from the checkpoint) do not
+depend on the engine build; `scripts/release/stage-dist.sh` takes them from the published tarball (keeping the
+`libtfgrammar.so` the build made). `scripts/release/build-assets.sh` then packs the binaries, the recipe and tools at a
+commit of this repository, and the engine source's `LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md` and `LICENSES/`
+(TensorFold's, with the Inkling-2 section: they cover the code compiled into the binaries and the bundled libraries).
+It refuses a `lib/` without NCCL, cuBLAS, `libtfgrammar.so` and both decoders, and copies their licence texts into
+`lib/` beside them:
 
 ```
-scripts/release/stage-dist.sh tensorfold-inkling2-tp4-v0.2-aarch64-sm121.tar.gz build/dist
-scripts/release/build-assets.sh build/dist --engine-src build/engine-src --version v0.2
+scripts/release/stage-dist.sh tensorfold-inkling2-tp4-v0.3-aarch64-sm121.tar.gz build/dist
+scripts/release/build-assets.sh build/dist --engine-src build/engine-src --version v0.3
 ```
 
-Checked for v0.2: the release asset `tensorfold-inkling2-tp4-v0.2-aarch64-sm121.tar.gz` (sha256
-`4aa5a3f0a5639435320b354b7d16893c824c85987ff2bf28f9b2bc9b801470be`) is this script's output at commit `25bf4f3f123d` of
-this repository with the gated build's `bin/` and `lib/`, the release's `plan/` and `data/`, and the engine source
-above. Against the tarball every release gate ran on (the same binaries, libraries, plan and data), its 131 files are
-the same except `VERSION`, `SHA256SUMS`, the Markdown files (8) and `NOTICE` (the fork's wording). A tarball made from
-rebuilt binaries would differ in `bin/tensorfold-native` and `bin/tf-inkling2-decode` as described above.
+Checked for v0.3: the release asset `tensorfold-inkling2-tp4-v0.3-aarch64-sm121.tar.gz` (sha256 `27fe1df93f4a28e67c7fee44e47ee57f3e121e407eac99adeafefd2fd1bd069d`) is
+this script's output at commit `9f1fd48a19bd` of this repository with the gated build's `bin/` and `lib/`,
+the release's `plan/` and `data/`, and the engine source above. Against the tarball every release gate ran on, its 143 files are byte-equal except VERSION, SHA256SUMS and 8 Markdown documents (repacked with the filled documentation after the gates, as for v0.2's documentation repack). A tarball made from rebuilt
+binaries would differ in `bin/tensorfold-native` and `bin/tf-inkling2-decode` as described above.
 
