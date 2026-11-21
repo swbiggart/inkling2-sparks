@@ -14,7 +14,11 @@
 #               libtfgrammar.so (required: structured output, built by scripts/build-engine.sh from the engine source and
 #               xgrammar v0.2.8; its licences LICENSES/xgrammar-Apache-2.0.txt, xgrammar-NOTICE.txt, dlpack-Apache-2.0.txt
 #               and picojson-BSD-2-Clause.txt are copied into lib/ as LICENSE-xgrammar.txt, NOTICE-xgrammar.txt,
-#               LICENSE-dlpack.txt and LICENSE-picojson.txt)
+#               LICENSE-dlpack.txt and LICENSE-picojson.txt), and libturbojpeg.so.0 and libwebpdecoder.so.3 (required:
+#               image input's JPEG and WebP decoders, libjpeg-turbo 3.1.4.1 and libwebp 1.6.0 from
+#               scripts/release/build-codecs.sh or a published release; their licences LICENSES/libjpeg-turbo-LICENSE.md,
+#               libjpeg-turbo-README.ijg, libwebp-COPYING.txt and libwebp-PATENTS.txt are copied into lib/ as
+#               LICENSE-libjpeg-turbo.md, README-ijg.txt, LICENSE-libwebp.txt and PATENTS-libwebp.txt)
 #   DIST/plan/  ranges-w4-r0.tsv .. ranges-w4-r3.tsv, inkling2-digests-w4.tsv (required). Each ranges file is
 #               tf-inkling2-plan --ranges R with the DSpark drafter's lines added (tools/zig/inkling2_dspark_ranges.py
 #               --plan): every rank's drafter slices and markov_head.hidden_out, which tf-inkling2-fold needs on every
@@ -35,7 +39,7 @@
 # .sha256 file next to it.
 set -euo pipefail
 usage="usage: build-assets.sh DIST --engine-src DIR [--version V] [--out DIR] [--ref REF] | --list"
-repo_files=(recipe/inkling2-tp4 tools/zig/inkling2_rank_copy.py
+repo_files=(recipe/inkling2-tp4 tools/zig/inkling2_rank_copy.py tools/zig/inkling2_vision_copy.py
   tools/inkling2_bench.py tools/inkling2_prompts.json tools/bench_prompts.json tools/inkling2_sheet.json
   tools/bench_openai.py tools/bench_cache.py tools/bench_concurrent.py tools/bench_args.py tools/bench_auth.py
   tools/bench_evidence.py tools/bench_metrics.py tools/bench_stream.py tools/bench_thinking.py tools/bench_timing.py)
@@ -83,9 +87,9 @@ for f in "${dist}/bin/"*; do
     *) echo "${f}: not a release binary (bin/ ships ${need_bin[*]} tp_mailbox.fatbin)" >&2; exit 1;;
   esac
 done
-need_lib=(libnccl.so.2 libcublas.so.13 libcublasLt.so.13 libtfgrammar.so)
+need_lib=(libnccl.so.2 libcublas.so.13 libcublasLt.so.13 libtfgrammar.so libturbojpeg.so.0 libwebpdecoder.so.3)
 for b in "${need_lib[@]}"; do
-  [ -f "${dist}/lib/${b}" ] || { echo "missing ${dist}/lib/${b} (the release bundles NCCL, cuBLAS and libtfgrammar)" >&2; exit 1; }
+  [ -f "${dist}/lib/${b}" ] || { echo "missing ${dist}/lib/${b} (the release bundles NCCL, cuBLAS, libtfgrammar and the image decoders: scripts/release/build-codecs.sh)" >&2; exit 1; }
   if command -v file > /dev/null; then
     file -L -b "${dist}/lib/${b}" | grep -q 'ELF 64-bit.*aarch64' || { echo "${b}: not an aarch64 ELF" >&2; exit 1; }
   fi
@@ -106,7 +110,8 @@ root=${stage}/${name}
 mkdir -p "${root}"
 git -C "${top}" archive --format=tar "${ref}" -- "${repo_files[@]}" | tar -x -C "${root}"
 git -C "${esrc}" archive --format=tar HEAD -- LICENSE NOTICE THIRD_PARTY_NOTICES.md LICENSES | tar -x -C "${root}"
-for l in NCCL-LICENSE.txt NVIDIA-CUDA-EULA.txt xgrammar-Apache-2.0.txt xgrammar-NOTICE.txt dlpack-Apache-2.0.txt picojson-BSD-2-Clause.txt; do
+for l in NCCL-LICENSE.txt NVIDIA-CUDA-EULA.txt xgrammar-Apache-2.0.txt xgrammar-NOTICE.txt dlpack-Apache-2.0.txt picojson-BSD-2-Clause.txt \
+  libjpeg-turbo-LICENSE.md libjpeg-turbo-README.ijg libwebp-COPYING.txt libwebp-PATENTS.txt; do
   [ -s "${root}/LICENSES/${l}" ] || { echo "LICENSES/${l} is not in the engine source: the bundled libraries need it" >&2; exit 1; }
 done
 mkdir -p "${root}/bin" "${root}/lib" "${root}/plan"
@@ -120,6 +125,10 @@ cp -p "${root}/LICENSES/xgrammar-Apache-2.0.txt" "${root}/lib/LICENSE-xgrammar.t
 cp -p "${root}/LICENSES/xgrammar-NOTICE.txt" "${root}/lib/NOTICE-xgrammar.txt"
 cp -p "${root}/LICENSES/dlpack-Apache-2.0.txt" "${root}/lib/LICENSE-dlpack.txt"
 cp -p "${root}/LICENSES/picojson-BSD-2-Clause.txt" "${root}/lib/LICENSE-picojson.txt"
+cp -p "${root}/LICENSES/libjpeg-turbo-LICENSE.md" "${root}/lib/LICENSE-libjpeg-turbo.md"
+cp -p "${root}/LICENSES/libjpeg-turbo-README.ijg" "${root}/lib/README-ijg.txt"
+cp -p "${root}/LICENSES/libwebp-COPYING.txt" "${root}/lib/LICENSE-libwebp.txt"
+cp -p "${root}/LICENSES/libwebp-PATENTS.txt" "${root}/lib/PATENTS-libwebp.txt"
 cp -p "${dist}/plan/"* "${root}/plan/"
 if [ -d "${dist}/data" ]; then mkdir -p "${root}/data" && cp -pR "${dist}/data/." "${root}/data/"; else
   echo "note: no ${dist}/data (the decode check prompt and oracle ids); the tarball ships without data/" >&2; fi
