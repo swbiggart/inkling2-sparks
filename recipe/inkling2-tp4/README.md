@@ -6,7 +6,7 @@ from a clone of the repository or from the unpacked release tarball), `weights.s
 `prompt_ids.py`, `container/` and `fabric/`. Changes by version: [CHANGELOG.md](CHANGELOG.md).
 
 How to install and run it, the requirements, the benchmarks, what is checked, the settings and the API are in the
-[repository README](../../README.md). Each topic in full: [docs/](docs/) (INSTALL-MANUAL, CORRECTNESS, BENCHMARKS,
+[repository README](https://github.com/swbiggart/inkling2-sparks/blob/v0.3/README.md). Each topic in full: [docs/](docs/) (INSTALL-MANUAL, CORRECTNESS, BENCHMARKS,
 SETTINGS).
 
 Quick start, from this folder: `cp hosts.conf.example my-sparks.conf`, set `HOSTS` and `ROOT`, then run the

@@ -4,8 +4,9 @@ Each host holds only its own rank's bytes of `thinkingmachines/Inkling-2-Small`,
 `aac974122acd33ddb0d3e1f54433a9c5dd2249ce`. A rank folder looks like the checkpoint to the server: every shard at
 its full size as a sparse file (the safetensors header, then only this rank's byte ranges at their original offsets,
 holes elsewhere), plus the small files (config, quantization manifest, index, tokenizer, chat template) whole. That
-is about 92 GiB on disk a rank instead of the checkpoint's 366 GiB. The weights are the checkpoint's own bytes: no
-conversion, no re-quantization.
+is about 92 GiB on disk a rank instead of the checkpoint's 366 GiB. With `VISION=1` rank 0's folder also holds the
+vision tower as one new file, `inkling2-vision.safetensors` (0.61 GiB). The weights are the checkpoint's own
+bytes: no conversion, no re-quantization.
 
 ## What you need
 
@@ -15,8 +16,9 @@ conversion, no re-quantization.
   - `inkling2-digests-w4.tsv`: the content-digest manifest. Each rank hashes every byte it loads and checks it
     against its lines (`TF_INK2_DIGESTS`), so a wrong or corrupt byte stops the server at start-up.
 - `tools/zig/inkling2_rank_copy.py` (Python 3.9 or later, standard library only) on the machine that runs
-  `weights.sh`; it is copied to the hosts.
-- About 92 GiB free on each host (plus headroom), and HTTPS to huggingface.co (or a full checkpoint on the fabric, below).
+  `weights.sh`; it is copied to the hosts. With `VISION=1`, `inkling2_vision_copy.py` beside it (copied to rank 0).
+- About 92 GiB free on each host (plus headroom; rank 0 0.61 GiB more with `VISION=1`), and HTTPS to
+  huggingface.co (or a full checkpoint on the fabric, below; rank 0's tower file always comes from Hugging Face).
 
 ## Copy
 
@@ -36,15 +38,21 @@ On each host, `weights/copy-rank.sh` then:
    and every run re-read from disk with the page cache dropped, against its hash from fetch.
 4. **check --http:** every shard header and small file against Hugging Face, plus a 3 GiB pseudo-random sample of
    runs read again from Hugging Face and hashed (`--check-gib all` checks every run, about 92 GiB of downloads).
+5. **vision** (rank 0, `--vision`, added by `weights.sh` while `VISION=1`): the tower's 422 tensors, by
+   range requests for their span of the pinned revision's `model-00024-of-00024.safetensors`, written as one new file
+   beside the shards with `inkling2_vision_copy.py` and published as `inkling2-vision.safetensors` only once its sha256
+   is `VISION_SHA256` in `copy-rank.sh` (`b8e7df24b5bcb0d69f246cd5c703912b81b4f752c2316850b1225959c3d79a71`). No existing file is written. With `--verify-only` the
+   file's sha256 is checked; `--vision-check` checks only that file (a read). The server checks each tower tensor
+   against the digest manifest when it loads.
 
 The log ends in `== done` when every step passed. A step that fails stops the script with its exit code (1 seed,
-2 fetch, 3 verify, 4 check).
+2 fetch, 3 verify, 4 check, 7 vision).
 
-Only `model.llm.*` (the text model) is copied. `--drafter` adds the DSpark drafter's tensors, which only
+Only `model.llm.*` (the text model) is copied into the shards. `--drafter` adds the DSpark drafter's tensors, which only
 `TF_INK2_DSPARK=1` needs, and `--folds BIN` (added by `weights.sh` while `DSPARK=1`) then builds the rank's DSpark
 folds file `inkling2-dspark-fold.safetensors` in the folder with `BIN` (`ROOT/bin/tf-inkling2-fold`) from the
 folder's own unembed rows and `hidden_out` (`weights/fold-rank.sh`: about a second; kept on a rerun when its
-recorded digest matches). The vision tower is not used and not copied.
+recorded digest matches).
 
 ## From a full checkpoint
 
@@ -69,7 +77,8 @@ running `setup.sh`). On the checkpoint's host, in a new temporary folder:
 Each rank then runs `copy-rank.sh R MODEL --server ADDR:PORT`: **fetch --server** (each run hashed by the server as
 it reads the source and again on arrival, recorded only once synced; resumable), the digest manifest, **verify**
 (every run re-read from disk) and **check --server** (a 3 GiB sample against the source's disk). The folder is byte
-for byte the one the download makes, and its stamp is the same. By hand, run `checkpoint.py check` and
+for byte the one the download makes, and its stamp is the same. With `VISION=1` rank 0 still fetches the tower's
+file from Hugging Face (step 5 above). By hand, run `checkpoint.py check` and
 `checkpoint.py serve` on the source yourself and pass `--server ADDR:PORT` to `weights.sh ... start`.
 
 ## Optional: seed from a folder already on the host

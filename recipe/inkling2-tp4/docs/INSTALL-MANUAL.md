@@ -15,18 +15,21 @@ What `setup.sh` does step by step, its options, the container install, and the s
 2. **assets:** the release tarball, checked against its `.sha256` and its `SHA256SUMS`, unpacked into `ROOT` on every
    host and checked again there.
 3. **libs:** `ROOT/lib`: NCCL 2.30.7 and cuBLAS 13.1.1.3, from the release's own `lib/` (bundled, with their licence
-   texts), or with `--libs DIR`, or else from NVIDIA's wheels on PyPI at pinned sha256s.
+   texts), or with `--libs DIR`, or else from NVIDIA's wheels on PyPI at pinned sha256s. The image decoders
+   (`libturbojpeg.so.0`, `libwebpdecoder.so.3`) come from the release's `lib/`.
 4. **weights:** each host fetches its rank's bytes (and the DSpark drafter's) from Hugging Face at the pinned
    revision, then verifies and checks them (step 4 below). This is the long step, about 92 GiB a host. It resumes: run `setup.sh` again after an
    interruption. With `CHECKPOINT` (below) the hosts copy the same bytes from a full checkpoint over the fabric
-   instead.
+   instead. With `VISION=1` rank 0 also fetches the vision tower's 422 tensors from Hugging Face as one new file,
+   `inkling2-vision.safetensors` (0.61 GiB), checked against its sha256; no existing weight file is written.
 5. **folds** (DSpark only): each host builds its rank's DSpark folds file from its own rank folder with the release's
    `tf-inkling2-fold`, in about a second (see DSpark in [SETTINGS.md](SETTINGS.md)).
 6. **manifest** and **config:** the digest manifest on every host, and the server config (`my-sparks.serve.conf`,
    beside `my-sparks.conf`). NCCL bootstraps over the fabric port at rank 0's fabric address, not the LAN. The
    release settings come from `release-defaults.sh`: checkpoint mode, split experts in `model-split/`, the digest
-   check, DSpark, the RoCE mesh wire, `--context 131072`, `--parallel auto` capped by `MAX_STREAMS=4` (four streams),
-   an 8 GiB memory reserve and an explicit `--prompt-cache-gib`. The hosts file only needs to name what differs.
+   check, DSpark, image input (`--vision`), the RoCE mesh wire, `--context 131072`, `--parallel auto` capped by
+   `MAX_STREAMS=4` (four streams), a 6 GiB memory reserve and an explicit `--prompt-cache-gib`. The hosts file only
+   needs to name what differs.
 7. **start**, **status** and **smoke:** rank 0, then ranks 1-3. `setup.sh` waits until all four have loaded, prints
    each rank's state, then runs the smoke checks on rank 0's host. When the release ships the reference files, it
    also runs greedy replies against the reference's and reports where they depart (information; the token gate is
@@ -108,10 +111,11 @@ It holds:
 
 - `bin/`: the aarch64 sm_121 build (`tensorfold-native`, `tf-inkling2-decode`, `tf-inkling2-plan`,
   `tf-inkling2-fold`, `tf-tp-test`, and `tp_mailbox.fatbin`, the RoCE wire's kernel image)
-- `lib/`: NVIDIA's NCCL 2.30.7 and cuBLAS / cuBLASLt 13.1.1.3, unmodified, and `libtfgrammar.so` (structured output,
-  built with xgrammar v0.2.8), with their licence texts
+- `lib/`: NVIDIA's NCCL 2.30.7 and cuBLAS / cuBLASLt 13.1.1.3, unmodified, `libtfgrammar.so` (structured output,
+  built with xgrammar v0.2.8), and the image decoders `libturbojpeg.so.0` (libjpeg-turbo 3.1.4.1)
+  and `libwebpdecoder.so.3` (libwebp 1.6.0), built unmodified, with their licence texts
 - `recipe/inkling2-tp4/`: this folder
-- `tools/`: the weight copy tool and the benchmarks
+- `tools/`: the weight copy tool, the vision tower's copy tool and the benchmarks
 - `plan/`: the rank ranges and the digest manifest
 - `data/`: the decode check's prompt, the fp32 reference's replies with their top-two margins, the extended prompt
   set (`ext/`) and the structured-output cases (`so-cases/`)
@@ -141,7 +145,8 @@ nvcc -fatbin -O3 -std=c++17 -gencode=arch=compute_120,code=sm_120 -gencode=arch=
 
 Copy the binaries (and `tp_mailbox.fatbin`) to `ROOT/bin/` on every host, the same build on all four (the ranks
 compare executable hashes at start-up), and `libtfgrammar.so` to `ROOT/lib/`. Put NCCL and cuBLAS in `ROOT/lib/`: the release's `lib/`, or NVIDIA's NCCL
-2.30.7 for arm64 and CUDA 13 and cuBLAS 13.1.1.3 (what was measured). The
+2.30.7 for arm64 and CUDA 13 and cuBLAS 13.1.1.3 (what was measured). Put the image decoders there too: the release's,
+or `scripts/release/build-codecs.sh` builds them from their projects' signed release tarballs. The
 `data/` and `plan/` files stay on the control machine; `check.sh` and `weights.sh` copy what each host needs.
 
 ## Step 2. Fabric
@@ -169,10 +174,10 @@ Fill in `HOSTS` (ssh names, in rank order), `MASTER` (rank 0's address on its fi
 (that port's interface, so NCCL's bootstrap stays clear of LAN firewalls), and `ROOT` and the paths under it.
 (`setup.sh` writes this file from the hosts file.) Keep the switch `NCCL_ENV` as it is. The release's settings are
 not in this file but in `release-defaults.sh` (the scripts read it before the config): `CONTEXT`, `PARALLEL`,
-`MAX_STREAMS`, `MEMORY_RESERVE_GIB`, `PROMPT_CACHE_GIB`, `DSPARK`, `XROWS`, `ROCE_MULTI`, `MAILBOX_MAX_KB` and the folder name
-`MODEL_DIRNAME` (`model-split`). Set one of them in the config only to differ from the release. `EXTRA_ENV` adds
-more environment. Everything in `release-defaults.sh` and `EXTRA_ENV`, and every serve flag, must be the same on all
-four ranks.
+`MAX_STREAMS`, `MEMORY_RESERVE_GIB`, `PROMPT_CACHE_GIB`, `DSPARK`, `XROWS`, `VISION`, `ROCE_MULTI`, `MAILBOX_MAX_KB`
+and the folder name `MODEL_DIRNAME` (`model-split`). Set one of them in the config only to differ from the release.
+`EXTRA_ENV` adds more environment. Everything in `release-defaults.sh` and `EXTRA_ENV`, and every serve flag, must be
+the same on all four ranks.
 
 ## Step 4. Weights
 
@@ -182,8 +187,9 @@ four ranks.
 ```
 
 Each host fetches its rank's byte ranges from Hugging Face at the pinned revision, then verifies coverage, the
-headers and every byte from disk, and checks a sample against Hugging Face. With DSpark on, it then builds the rank's
-folds file with `ROOT/bin/tf-inkling2-fold` (when the release is unpacked in `ROOT` on the host). The digest manifest goes into the rank
+headers and every byte from disk, and checks a sample against Hugging Face. With `VISION=1` rank 0 then writes the
+vision tower's file (`copy-rank.sh --vision`). With DSpark on, each host then builds the rank's folds file with
+`ROOT/bin/tf-inkling2-fold` (when the release is unpacked in `ROOT` on the host). The digest manifest goes into the rank
 folder, and the server checks every byte it loads against it. `weights/README.md` has the details, how to copy from a
 full checkpoint instead (`weights.sh ... --server`), how to seed from a folder already on a host, and how to make the
 plan files yourself.
@@ -220,7 +226,7 @@ loopback), from the unpacked release folder:
 ```
 python3 recipe/inkling2-tp4/smoke.py http://127.0.0.1:8890 yardstick data/decode.json \
   chat_short=data/chat_short.ids.json tool_call=data/tool_call.ids.json --ext data/ext
-                                      # v0.2 prints YARDSTICK: top-1 434/445 (< 438), in the oracle's top-2 443/445 (>= 443): FAIL
+                                      # v0.3 prints YARDSTICK: top-1 434/445 (< 438), in the oracle's top-2 443/445 (>= 443): FAIL
                                       # (top-1 below its bar: CORRECTNESS.md#agreement-with-the-fp32-reference)
 python3 recipe/inkling2-tp4/smoke.py http://127.0.0.1:8890 oracle data/decode.json \
   chat_short=data/chat_short.ids.json tool_call=data/tool_call.ids.json --ext data/ext

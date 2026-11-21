@@ -2,7 +2,7 @@
 
 Paths in this file are relative to `recipe/inkling2-tp4/` (or the unpacked release folder, for `tools/`, `data/`, `plan/`), unless a link says otherwise.
 
-The full text behind the short table in the [README](../../../README.md#settings-you-may-change).
+The full text behind the short table in the [README](https://github.com/swbiggart/inkling2-sparks/blob/v0.3/README.md#settings-you-may-change).
 
 ## Settings you may change
 
@@ -10,9 +10,9 @@ All of these are in `release-defaults.sh`; they are the same on all four ranks (
 and ranks that differ refuse to start). Set one in your config only to differ from the release.
 
 - **Context** (`CONTEXT`, `--context`; 131072): the largest request the server takes, prompt plus reply, up to the
-  model's 1,048,576 tokens. A longer request is refused with HTTP 400 naming the limit. At `CONTEXT=1048576` the
-  recipe sets `DSPARK=0`: with the release's prompt cache the drafter's caches do not reliably fit beside a 1M stream,
-  and the server could refuse to start. Below it `DSPARK` applies as set.
+  model's 1,048,576 tokens. A longer request is refused with HTTP 400 naming the limit. `DSPARK` applies as set at
+  every context: at `CONTEXT=1048576` the drafter's caches (about 1 GiB a rank) fit beside the stream and the 1.5 GiB
+  prompt-cache arena, taking pool room kept prompts would have had.
 - **Streams** (`MAX_STREAMS`, `TF_INK2_MAX_STREAMS`; 4. `PARALLEL`, `--parallel`; auto): at start-up the server
   counts, on every rank, the memory after its load, the reserve, the prompt cache's arena and the graph cache; the
   rank with the least room decides. With `PARALLEL=auto` it serves as many streams as fit at a whole `CONTEXT` each,
@@ -45,8 +45,9 @@ and ranks that differ refuse to start). Set one in your config only to differ fr
   least one draft a round. There a lone greedy stream (no structured output) also cuts a draft short
   before the model checks it when the drafter's own probabilities say the next guess will probably be rejected.
   With 2 to 4 streams a shared round gives its draft rows to the likeliest drafts across the streams;
-  `TF_INK2_SHARED_CUT=0` (every rank; exactly `0`: any other value leaves it on) turns this off, the same replies
-  either way.
+  `TF_INK2_SHARED_CUT=0` (or `off` or `false` in any case; any other value leaves it on) turns this off, the same
+  replies either way. Set it on every rank: at start the ranks compare the mode it resolves to and refuse to start
+  when that differs.
   Past 32,768 a round of d drafts is priced at the stream's own depth (a table measured at 3,040,
   32,768, 131,072, 262,144 and 524,000 positions, interpolated, plus what such rounds took beyond their price on this
   server), and a plain round competes: drafts must beat it by 5 %, with a probe after a run of plain rounds. A deep
@@ -57,16 +58,28 @@ and ranks that differ refuse to start). Set one in your config only to differ fr
 - **The prompt cache** (`PROMPT_CACHE_GIB`, `--prompt-cache-gib`; 1.5 GiB a rank, on): an exact prefix cache (a
   resumed prompt gives the same bits as a cold one). A kept prompt holds its whole pages of the pool by reference and
   one slot of the 1.5 GiB arena for the rest (the sliding layers' rings, the convolution states, the drafter's local
-  rings and the tail past its last whole page). Streams that resume it adopt its pages (shared pages are never
-  written; a stream writes only past its own position) and copy back only the arena slot. When a stream needs pages,
+  rings and the tail past its last whole page); a prompt with images is kept with its images' digest in the key.
+  Streams that resume it adopt its pages (shared pages are never written; a stream writes only past its own position)
+  and copy back only the arena slot. When a stream needs pages,
   kept prompts give theirs back, least valuable first, never one a waiting request will resume. It is passed
   explicitly; left out, the server sizes the arena itself; 0 turns the cache off.
-- **Memory reserve** (`MEMORY_RESERVE_GIB`, `TENSORFOLD_MEMORY_RESERVE_GIB`; 8): memory each host keeps free. The
+- **Memory reserve** (`MEMORY_RESERVE_GIB`, `TENSORFOLD_MEMORY_RESERVE_GIB`; 6): memory each host keeps free. The
   streams and the page pool take the rest after the load.
 - **Long prompts beside decoding streams** (`DECODE_SHARE`, `--decode-share`; 0.5): while other streams decode, a long
   prompt is cut into 512-row chunks that take this share of the time; the decoders keep about half their rate
   instead of stopping for the whole prompt, and that prompt's time to first token grows. A prompt with nothing else
   decoding runs at full speed. Output is the same either way (prompt chunking is exact).
+- **Image input** (`VISION`, `--vision` on every rank; 1, on): image parts in user and tool messages (OpenAI
+  `image_url` with a data URL, Anthropic `image` with base64 data; image URLs are refused) as PNG, JPEG or WebP. There
+  is no resize: an image is one token for each 40 x 40 pixel block, padded, and its pixels are the ones Transformers'
+  processor gives the model (alpha is laid over the processor's grey checkerboard). A request is refused with HTTP 400
+  naming the numbers when an image is larger than 4,096 pixels a side or over its share of the request's
+  10,816 image tokens (`--vision-image-tokens`; split evenly over the images), when it holds more than
+  4 images (`--vision-max-images`), or when an image is over 10 MiB or its images
+  together over 20 MiB. Rank 0 decodes images one at a time and runs the vision tower whole, from
+  one new file in its rank folder, `inkling2-vision.safetensors` (0.61 GiB; `weights.sh` and `setup.sh`'s
+  weights step add it while `VISION=1`). JPEG and WebP decode in the release's `lib/` (libjpeg-turbo
+  3.1.4.1, libwebp 1.6.0). `VISION=0` serves text only with v0.2's launches.
 - **The RoCE mesh wire** (`ROCE_MULTI=1`, `TF_INK2_ROCE_MULTI`; on). Small decode exchanges (up to `MAILBOX_MAX_KB`,
   640 KiB a rank) go over RoCE writes instead of NCCL; the bytes and their order are the same, so replies are
   bit-identical, and every rank falls back to NCCL together if the probe fails. It needs `bin/tp_mailbox.fatbin` and
@@ -74,7 +87,10 @@ and ranks that differ refuse to start). Set one in your config only to differ fr
   `fabric/ring-experimental/`.
 - **By-rows layer sums** (`XROWS`, `TF_INK2_XROWS`; on): the same bits, less exchange time in prompt chunks. Its
   first use costs a first long prompt a moment, so `start.sh` sends one warm-up prompt once the server is ready
-  (`warmup.sh`; `WARMUP=0` skips it). Needs a switch (every pair of ranks connected).
+  (`warmup.sh`; `WARMUP=0` skips it). Needs a switch (every pair of ranks connected). For prompt chunks of 576 rows or
+  more, with by-rows sums on, `release_env` also sets `TF_INK2_XOVERLAP=1` (each half's by-rows sum crosses the wire
+  under the other half's compute) and `TF_INK2_XCODES=1` (the MoE exchange carries each rank's quantized values in
+  place of bf16 ones): the same bits; `=0` in `OPT_ENV` turns one off.
 
 No setting changes the output's bits.
 
@@ -90,6 +106,20 @@ one shared drafter pass with its masks applied after (the replies are the same e
 To add an opt-in setting on every rank: with `setup.sh`, put it in the hosts file's `OPT_ENV`, for example
 `OPT_ENV=(TF_INK2_GRAPH=0)`; setup writes it into the config's `EXTRA_ENV`. With a hand-written config, add it to
 `EXTRA_ENV` directly. Either way it comes after the release's settings, so it overrides one of the same name.
+
+**The prompt cache on NVMe** (opt-in, off by default):
+`OPT_ENV=(TF_INK2_NVME=/a/dir)` in the hosts file (`EXTRA_ENV` in a manual config), an absolute directory on each
+host's own disk, also writes kept text prompts of 1,024
+tokens or more there while no stream runs, one file a rank, so they survive a restart and the device cache's
+evictions; a prompt whose longest kept prefix is on
+disk is read back into fresh pages, the same bits as a resume from memory. `TF_INK2_NVME_GIB` caps a rank's files
+(64 GiB); `TF_INK2_NVME_FLOOR_GIB` is the free space a write must leave on the disk
+(32 GiB). Files go under `<dir>/ink2-<identity>/`, the identity being the program, the checkpoint,
+the settings, the world and the layout: a new build or setting starts cold, and at start each rank removes only its
+own files of other identities. The tier deletes only files it wrote. What it costs: disk space up to the cap (each kept state of a 128k prompt is about 1.15 GiB a host, and one prompt can keep several states), and disk writes in idle turns only (a request arriving waits at most one write chunk). With `--container`, only the
+container's mounts are seen and kept: use a directory under `RUN` (`ROOT/serve`, mounted read-write), e.g.
+`TF_INK2_NVME=ROOT/serve/nvme` with ROOT spelled out. Set it on every rank (the ranks refuse to start
+when it differs) and use one server a host for each directory. Prompts with images are not written.
 
 ## Health
 
@@ -125,5 +155,5 @@ host or container) prints a warning and rank 0's log has one; the server still s
 
 ## Structured output
 
-Structured output has no setting: a request asks for it (README, [Structured output](../../../README.md#structured-output)).
+Structured output has no setting: a request asks for it (README, [API](https://github.com/swbiggart/inkling2-sparks/blob/v0.3/README.md#api)).
 A greedy constrained pick is the highest-scoring allowed token, ties to the lower id like every greedy pick.

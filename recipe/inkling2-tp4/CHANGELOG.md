@@ -1,5 +1,31 @@
 # Inkling-2-Small TP4: changes
 
+## v0.3
+
+- **Prompt fill:** in prompt chunks of 576 rows or more, each half's by-rows attention sum crosses the wire under the
+  other half's compute (`TF_INK2_XOVERLAP`), and the MoE exchange carries each rank's quantized values in place of bf16
+  ones (`TF_INK2_XCODES`); both on, the same bits, and a rank that differs refuses to start. Cold time to first token
+  -15.3% at 2,048 tokens, -16.1% at 8,192, -14.5% at 32,768 and
+  -10.8% at 126,000.
+- **DSpark at 1M:** `CONTEXT=1048576` drafts by depth instead of decoding plainly, with the 1.5 GiB prompt-cache arena
+  kept and one more price point for the depth rule at 1M: 19.43 tok/s by default on a
+  1,038,466-token book (v0.2: 12.5 plain, on a synthetic 1,048,000-token state); the idle pool at 1M keeps 10 128k prompts (as v0.2's plain 1M).
+- **Image input** (`VISION=1`, the default; `VISION=0` serves text only with v0.2's launches): PNG, JPEG and WebP parts
+  in user and tool messages (data URLs and base64; image URLs refused), at their own size, up to 4,096 pixels
+  a side, 10,816 image tokens and 4 images a request, refused above with HTTP 400 naming
+  the numbers. The checkpoint's vision tower runs on rank 0 from one new file, `inkling2-vision.safetensors`
+  (0.61 GiB, 422 tensors, fetched and checked by `weights.sh` / `copy-rank.sh --vision`); images join the
+  prompt cache's key. Checks in [CORRECTNESS.md](docs/CORRECTNESS.md#images).
+- **Prompt cache on NVMe** (opt-in, `TF_INK2_NVME=<dir>` in `OPT_ENV`): kept text prompts are written to each host's
+  disk in idle time and read back after a restart or eviction (0.394 s against 95.87 s cold for
+  a 128,581-token prompt); cap `TF_INK2_NVME_GIB` (64), free-space floor
+  `TF_INK2_NVME_FLOOR_GIB` (32); a new build or setting starts cold.
+- **Memory reserve 6 GiB** (`MEMORY_RESERVE_GIB`, was 8); the default config's memory gate floor is 6.25 GiB.
+- **Exactness:** text replies are v0.2's tokens; every v0.2 check hash passes, none recorded again
+  ([CORRECTNESS.md](docs/CORRECTNESS.md)).
+- **Fixes:** a setting string a rank cannot parse stops every rank instead of leaving the others waiting;
+  `TF_INK2_SHARED_CUT` takes `off` and `false` in any case.
+
 ## v0.2
 
 - **Attention in fp32:** scores, softmax and probabilities stay in fp32 on the tensor cores and are rounded to bf16
