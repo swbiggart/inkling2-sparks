@@ -1,15 +1,15 @@
-From ec990952b819f5968ef0826f99dbc852046c0983 Mon Sep 17 00:00:00 2001
+From 3640601beed958168bc0f3747cd4585d98f24809 Mon Sep 17 00:00:00 2001
 From: Scott Biggart <297695+swbiggart@users.noreply.github.com>
-Date: Tue, 17 Nov 2026 19:30:00 -0800
+Date: Fri, 20 Nov 2026 19:30:00 -0800
 Subject: [PATCH 2/8] inkling2: CUDA kernels (attention, MoE, convolution,
  head, residual, fused) and their launch wrappers
 
-33 files (30 new, 3 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
-Part of the engine changes behind Inkling-2-Small TP4 v0.2 (github.com/swbiggart/inkling2-sparks).
+35 files (32 new, 3 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
+Part of the engine changes behind Inkling-2-Small TP4 v0.3 (github.com/swbiggart/inkling2-sparks).
 Apply the whole series in order with git am (scripts/build-engine.sh does); only the full series is built and gated.
 ---
  zig/kernels/cuda/inkling2_attn.cu             | 1216 +++++++++++++
- zig/kernels/cuda/inkling2_ck.cu               | 1396 +++++++++++++++
+ zig/kernels/cuda/inkling2_ck.cu               | 1506 ++++++++++++++++
  zig/kernels/cuda/inkling2_conv.cu             |  342 ++++
  zig/kernels/cuda/inkling2_fuse.cu             |  897 ++++++++++
  zig/kernels/cuda/inkling2_head.cu             |  245 +++
@@ -19,12 +19,14 @@ Apply the whole series in order with git am (scripts/build-engine.sh does); only
  zig/kernels/cuda/inkling2_kx_fp32.cuh         |  793 +++++++++
  zig/kernels/cuda/inkling2_moe.cu              |  572 ++++++
  zig/kernels/cuda/inkling2_res.cu              |  258 +++
+ zig/kernels/cuda/inkling2_vision.cu           |  275 +++
+ zig/kernels/cuda/inkling2_vision_attn.cuh     |  274 +++
  zig/src/core/relbias_attention_ref.zig        |  670 +++++++
  zig/src/cuda/context.zig                      |    6 +
- zig/src/cuda/kernels.zig                      |    9 +
+ zig/src/cuda/kernels.zig                      |   10 +
  zig/src/cuda/mxfp8.zig                        |  198 +++
  .../families/inkling2/cuda_argmax_check.zig   |  228 +++
- zig/src/families/inkling2/cuda_attn.zig       | 1357 ++++++++++++++
+ zig/src/families/inkling2/cuda_attn.zig       | 1367 +++++++++++++++
  zig/src/families/inkling2/cuda_attn_check.zig | 1402 +++++++++++++++
  .../families/inkling2/cuda_attn_kx_check.zig  | 1561 +++++++++++++++++
  zig/src/families/inkling2/cuda_attn_main.zig  |  323 ++++
@@ -37,11 +39,11 @@ Apply the whole series in order with git am (scripts/build-engine.sh does); only
  zig/src/families/inkling2/cuda_fuse_main.zig  |  671 +++++++
  zig/src/families/inkling2/cuda_head.zig       |  238 +++
  zig/src/families/inkling2/cuda_kernels.zig    |   72 +
- zig/src/families/inkling2/cuda_moe.zig        | 1089 ++++++++++++
- zig/src/families/inkling2/cuda_moe_main.zig   |  563 ++++++
+ zig/src/families/inkling2/cuda_moe.zig        | 1173 +++++++++++++
+ zig/src/families/inkling2/cuda_moe_main.zig   |  609 +++++++
  zig/src/families/inkling2/cuda_ops.zig        |  308 ++++
  zig/src/families/inkling2/cuda_res.zig        |  158 ++
- 33 files changed, 17523 insertions(+)
+ 35 files changed, 18323 insertions(+)
  create mode 100644 zig/kernels/cuda/inkling2_attn.cu
  create mode 100644 zig/kernels/cuda/inkling2_ck.cu
  create mode 100644 zig/kernels/cuda/inkling2_conv.cu
@@ -53,6 +55,8 @@ Apply the whole series in order with git am (scripts/build-engine.sh does); only
  create mode 100644 zig/kernels/cuda/inkling2_kx_fp32.cuh
  create mode 100644 zig/kernels/cuda/inkling2_moe.cu
  create mode 100644 zig/kernels/cuda/inkling2_res.cu
+ create mode 100644 zig/kernels/cuda/inkling2_vision.cu
+ create mode 100644 zig/kernels/cuda/inkling2_vision_attn.cuh
  create mode 100644 zig/src/core/relbias_attention_ref.zig
  create mode 100644 zig/src/families/inkling2/cuda_argmax_check.zig
  create mode 100644 zig/src/families/inkling2/cuda_attn.zig
@@ -1297,10 +1301,10 @@ index 0000000000000000000000000000000000000000..082e9ba5ad96bd303589b405b8ee399d
 +}
 diff --git a/zig/kernels/cuda/inkling2_ck.cu b/zig/kernels/cuda/inkling2_ck.cu
 new file mode 100644
-index 0000000000000000000000000000000000000000..36d3e437285d18a65fcec90a103bd80360939972
+index 0000000000000000000000000000000000000000..222c01ebc1bfe3bea51ac3f91773cff74cf912ad
 --- /dev/null
 +++ b/zig/kernels/cuda/inkling2_ck.cu
-@@ -0,0 +1,1396 @@
+@@ -0,0 +1,1506 @@
 +// Inkling-2's experts in `checkpoint` mode (cuda_moe.zig, Mode.checkpoint): activations quantized the way the
 +// checkpoint was trained and is served, on the block-scaled tensor cores (sm_120a / sm_121a).
 +//   NVFP4 layers (0-39): rows to NVFP4 per token (outer scale amax / 1536, an e4m3 scale a 16 chosen between the
@@ -2691,6 +2695,116 @@ index 0000000000000000000000000000000000000000..36d3e437285d18a65fcec90a103bd803
 +    const int w = c / half, j = c - w * half;
 +    dst[c] = __ldg(src + ((size_t)w * R + row) * half + j);
 +  }
++}
++
++// ------------------------------------------------------------------------------------------------- MoE-A as codes
++// Split experts, prompt chunks (cuda_moe.zig splitAmax / splitQuant / splitDownCodes; TF_INK2_XCODES): each rank
++// quantizes its own I/W columns of every route's act row before MoE-A and the ranks gather the codes and scales in
++// place of the bf16 columns. The down pass then reads the same codes, scales and amax the whole-row quantizer above
++// leaves. MXFP8 is block-local (32 values, none straddles ranks: I/W = 576). NVFP4's only cross-block input is the
++// row's amax, a max (exact in any order): each rank gathers every rank's segment amax first, and each 16-value block
++// then takes the same steps as tf_ink2_ck_quant_nvfp4's second loop with that amax.
++
++namespace {
++// tf_ink2_ck_quant_nvfp4's second loop for one row: x the row's K values (dense), the row's amax.
++__device__ __forceinline__ void quant_nvfp4_row(const __nv_bfloat16* x, int K, float amax, uint8_t* codes,
++                                                uint8_t* scales) {
++  const int nb = K / 16;
++  const float encoder = clamp_max(__fdiv_rn(1536.0f, amax), FMAX);
++  const float decoder = __fdiv_rn(1.0f, encoder);
++  const float outer = __fmul_rn(amax, INV_1536);
++  const float enc6 = __fmul_rn(encoder, INV_6), enc4 = __fmul_rn(encoder, 0.25f);
++  for (int b = threadIdx.x; b < nb; b += blockDim.x) {
++    float f[16];
++    unpack16(x + 16 * b, f);
++    float maxima = 0.0f;
++#pragma unroll
++    for (int i = 0; i < 16; ++i) maxima = max_nan(maxima, fabsf(f[i]));
++    uint32_t code[2][16];
++    uint32_t s8[2];
++    float err[2];
++#pragma unroll
++    for (int c = 0; c < 2; ++c) {
++      const float sv = clamp_max(__fmul_rn(maxima, c == 0 ? enc6 : enc4), 448.0f);
++      s8[c] = f2e4m3(sv);
++      const float sf = e4m3f(s8[c]);
++      const float inv = clamp_max(__fdiv_rn(1.0f, __fmul_rn(sf, decoder)), FMAX);
++      float e[16];
++#pragma unroll
++      for (int i = 0; i < 16; ++i) {
++        float r;
++        code[c][i] = fp4_round(__fmul_rn(f[i], inv), r);
++        e[i] = fabsf(__fsub_rn(f[i], __fmul_rn(__fmul_rn(r, sf), outer)));
++      }
++#pragma unroll
++      for (int w = 8; w >= 1; w >>= 1)
++#pragma unroll
++        for (int i = 0; i < w; ++i) e[i] = __fadd_rn(e[2 * i], e[2 * i + 1]);
++      err[c] = e[0];
++    }
++    const int pick = err[1] < err[0] ? 1 : 0;
++    uint32_t w0 = 0u, w1 = 0u;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) w0 |= code[pick][i] << (4 * i), w1 |= code[pick][8 + i] << (4 * i);
++    *reinterpret_cast<uint2*>(codes + 8 * b) = make_uint2(w0, w1);
++    scales[b] = static_cast<uint8_t>(s8[pick]);
++  }
++}
++
++// The row amax over the ranks' segment amaxes [W][rows] (as block_max's: max_nan from 0, any order).
++__device__ __forceinline__ float parts_amax(const float* amaxes, int W, int rows, int row) {
++  float m = 0.0f;
++  for (int w = 0; w < W; ++w) m = max_nan(m, __ldg(amaxes + (size_t)w * rows + row));
++  return m;
++}
++}  // namespace
++
++// A block a row: max_nan(0, |x|) over the row's K values (x dense [rows, K]) into amax[row].
++extern "C" __global__ void __launch_bounds__(512)
++    tf_ink2_ck_seg_amax(const __nv_bfloat16* __restrict__ x, int K, float* __restrict__ amax) {
++  __shared__ float red[16];
++  const int row = blockIdx.x;
++  float m = 0.0f;
++  for (int b = threadIdx.x; b < K / 16; b += blockDim.x) {
++    float f[16];
++    unpack16(x + (size_t)row * K + 16 * b, f);
++#pragma unroll
++    for (int i = 0; i < 16; ++i) m = max_nan(m, fabsf(f[i]));
++  }
++  const float a = block_max(m, red);
++  if (threadIdx.x == 0) amax[row] = a;
++}
++
++// A block a row: the rank's K values of the row (x dense [rows, K]) as NVFP4 with the row's amax over every rank's
++// segment amax (amaxes [W][rows]): codes u8 [rows, K/2], scales e4m3 [rows, K/16].
++extern "C" __global__ void __launch_bounds__(512)
++    tf_ink2_ck_quant_nvfp4_parts(const __nv_bfloat16* __restrict__ x, int K, const float* __restrict__ amaxes, int W,
++                                 int rows, uint8_t* __restrict__ codes, uint8_t* __restrict__ scales) {
++  const int row = blockIdx.x;
++  quant_nvfp4_row(x + (size_t)row * K, K, parts_amax(amaxes, W, rows, row), codes + (size_t)row * (K / 2),
++                  scales + (size_t)row * (K / 16));
++}
++
++// A block a row: every rank's gathered slot (slot w at parts + w * slot bytes: codes [rows][cb] then scales
++// [rows][sb]) laid out as the whole row's codes aq [rows][W * cb] and scales asc [rows][W * sb], rank order; with
++// amaxes (NVFP4), the row's amax into aa[row]. A plain copy (and a max).
++extern "C" __global__ void __launch_bounds__(256)
++    tf_ink2_ck_codes_rows(const uint8_t* __restrict__ parts, long long slot, int W, int rows, int cb, int sb,
++                          const float* __restrict__ amaxes, uint8_t* __restrict__ aq, uint8_t* __restrict__ asc,
++                          float* __restrict__ aa) {
++  const int row = blockIdx.x;
++  const int cw = cb / 4;
++  uint32_t* dq = reinterpret_cast<uint32_t*>(aq + (size_t)row * W * cb);
++  for (int c = threadIdx.x; c < W * cw; c += blockDim.x) {
++    const int w = c / cw, j = c - w * cw;
++    dq[c] = __ldg(reinterpret_cast<const uint32_t*>(parts + (size_t)w * slot + (size_t)row * cb) + j);
++  }
++  uint8_t* ds = asc + (size_t)row * W * sb;
++  for (int c = threadIdx.x; c < W * sb; c += blockDim.x) {
++    const int w = c / sb, j = c - w * sb;
++    ds[c] = __ldg(parts + (size_t)w * slot + (size_t)rows * cb + (size_t)row * sb + j);
++  }
++  if (amaxes != nullptr && threadIdx.x == 0) aa[row] = parts_amax(amaxes, W, rows, row);
 +}
 +
 +// The module's presence check.
@@ -6084,6 +6198,567 @@ index 0000000000000000000000000000000000000000..24cb60daea147d476eb61c6a5f3ae1fc
 +    }
 +    store8(out + at, x);
 +}
+diff --git a/zig/kernels/cuda/inkling2_vision.cu b/zig/kernels/cuda/inkling2_vision.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae3ef083a804c9fd8628b58320b1b567d516e297
+--- /dev/null
++++ b/zig/kernels/cuda/inkling2_vision.cu
+@@ -0,0 +1,275 @@
++// Inkling-2's vision tower (families/inkling2/cuda_vision.zig): every op of FABLE-IMAGE-INPUT-DESIGN 1.3 but the
++// projections (the lane matmul, cuda/qmmf.zig) and the tensor-core attention core (inkling2_vision_attn.cuh).
++// Built with the glue flags: no contraction, IEEE division and square root, so each op keeps torch's rounding
++// points with plain __f*_rn arithmetic. Rows are the image's tower rows: row 0 the class token, then its P = 4T
++// patches in block order (tokens in raster order, inside a token (0,0), (0,1), (1,0), (1,1)).
++
++#include <cuda_bf16.h>
++#include <math.h>
++#include <stdint.h>
++
++#include "common/glue_math.cuh"
++#include "vit_norm.cuh"
++
++#include "inkling2_vision_attn.cuh"  // tf_iv_attn, the tensor-core core (--core tc, the default)
++
++using tf_glue::bf;
++using tf_glue::rbf;
++
++namespace {
++
++constexpr int NT = 256;
++constexpr int W = 1024;     // hidden width
++constexpr int HEADS = 16;
++constexpr int HD = 64;      // head dim
++constexpr int BLOCK = 40;   // pixels a token side
++constexpr int PATCH = 20;   // pixels a patch side
++constexpr int FEAT = 1200;  // a patch's features (py, px, c)
++constexpr int FEAT_PAD = 1216;
++
++// A patch's (row, col) on the 2*rows x 2*cols patch grid from its block-order index.
++__device__ __forceinline__ void patch_at(int p, int cols, int& row, int& col) {
++    const int t = p >> 2, in = p & 3;
++    row = 2 * (t / cols) + (in >> 1);
++    col = 2 * (t % cols) + (in & 1);
++}
++
++// erff as torch 2.14.1+cu130's GELU kernel runs it (CUDA 13.0's erff, read from its sm_120 SASS: it differs from
++// CUDA 13.3's in 7 of the 65,536 bf16 GELU outputs). |a| >= 0x3f8060fe: 1 - 2^(-|a| p(|a|) - |a|) with a's sign;
++// else a p(a^2) + a. p is a degree-6 polynomial by fma, its coefficients per branch; 2^x is MUFU.EX2 (ex2.approx.ftz).
++__device__ __forceinline__ float torch_erff(float a) {
++    const float t = fabsf(a);
++    const bool big = t >= __int_as_float(0x3f8060fe);
++    const float s = big ? t : __fmul_rn(a, a);
++    const unsigned c[2][7] = {{0x38b1e96au, 0xba574d20u, 0x3baad5eau, 0xbcdc1be7u, 0x3de718afu, 0xbec093acu, 0x3e0375d3u},
++                              {0x38eb4c3au, 0xbaae005bu, 0x3c09919fu, 0xbd24d99au, 0x3e235519u, 0x3f69b4f9u, 0x3f210a14u}};
++    const unsigned* k = c[big ? 1 : 0];
++    float p = __fmaf_rn(s, __uint_as_float(k[0]), __uint_as_float(k[1]));
++#pragma unroll
++    for (int i = 2; i < 7; ++i) p = __fmaf_rn(s, p, __uint_as_float(k[i]));
++    const float m = big ? -t : a;
++    const float r = __fmaf_rn(p, m, m);
++    if (!big) return r;
++    float e;
++    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(r));
++    return copysignf(__fsub_rn(1.0f, e), a);
++}
++
++// torch's F.gelu (approximate='none') on CUDA in fp32: x * 0.5 * (1 + erf(x * M_SQRT1_2)).
++__device__ __forceinline__ float gelu_erf(float x) {
++    constexpr float alpha = M_SQRT1_2;
++    return __fmul_rn(__fmul_rn(x, 0.5f), __fadd_rn(1.0f, torch_erff(__fmul_rn(x, alpha))));
++}
++
++// x = bf16(x + bf16(ls * y)), y already bf16: the layer scale's product and the residual add, two roundings.
++__device__ __forceinline__ __nv_bfloat16 ls_res(float y, __nv_bfloat16 ls, __nv_bfloat16 x) {
++    const float t = rbf(__fmul_rn(bf(ls), y));
++    return __float2bfloat16_rn(__fadd_rn(bf(x), t));
++}
++
++}  // namespace
++
++// E1. Block a patch row of [n][1216]: patch p0 + blockIdx.x's 1200 features (py, px, c) = bf16(table[byte]) or
++// bf16(table[256]) past the image (padding right and bottom), then 16 zeros. rgb [H][W][3].
++extern "C" __global__ void __launch_bounds__(NT) tf_iv_patchify(const uint8_t* __restrict__ rgb, const float* __restrict__ table,
++                                                                int H, int Wd, int cols, int p0, __nv_bfloat16* __restrict__ out) {
++    const int p = p0 + blockIdx.x;
++    int prow, pcol;
++    patch_at(p, cols, prow, pcol);
++    const int y0 = prow * PATCH, x0 = pcol * PATCH;
++    __nv_bfloat16* o = out + static_cast<int64_t>(blockIdx.x) * FEAT_PAD;
++    for (int f = threadIdx.x; f < FEAT_PAD; f += NT) {
++        float v = 0.0f;
++        if (f < FEAT) {
++            const int py = f / (3 * PATCH), px = (f / 3) % PATCH, c = f % 3;
++            const int y = y0 + py, x = x0 + px;
++            v = (y < H && x < Wd) ? table[rgb[(static_cast<int64_t>(y) * Wd + x) * 3 + c]] : table[256];
++        }
++        o[f] = __float2bfloat16_rn(v);
++    }
++}
++
++// E3 + E4. Block a patch p0 + blockIdx.x: pos = bf16((((0 + t0) + t1) + t2) + t3), t_i = float(table[idx_i]) * w_i in
++// fp32; x[1 + p] = bf16(float(e2[p - p0]) + float(pos)). idx [P][4], w [P][4] from the host (vision_utils' order).
++extern "C" __global__ void __launch_bounds__(NT) tf_iv_embed(const __nv_bfloat16* __restrict__ e2, const __nv_bfloat16* __restrict__ table,
++                                                             const int* __restrict__ idx, const float* __restrict__ wts, int p0,
++                                                             __nv_bfloat16* __restrict__ x) {
++    const int p = p0 + blockIdx.x;
++    const int* id = idx + static_cast<int64_t>(p) * 4;
++    const float* w = wts + static_cast<int64_t>(p) * 4;
++    const __nv_bfloat16* e = e2 + static_cast<int64_t>(blockIdx.x) * W;
++    __nv_bfloat16* o = x + static_cast<int64_t>(1 + p) * W;
++    for (int c = threadIdx.x; c < W; c += NT) {
++        float s = 0.0f;
++#pragma unroll
++        for (int i = 0; i < 4; ++i) s = __fadd_rn(s, __fmul_rn(bf(table[static_cast<int64_t>(id[i]) * W + c]), w[i]));
++        o[c] = __float2bfloat16_rn(__fadd_rn(bf(e[c]), rbf(s)));
++    }
++}
++
++// E4's class row: x[0] = bf16(class_embedding + cls_position_embedding).
++extern "C" __global__ void __launch_bounds__(NT) tf_iv_class(const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b,
++                                                             __nv_bfloat16* __restrict__ x) {
++    for (int c = threadIdx.x; c < W; c += NT) x[c] = __float2bfloat16_rn(__fadd_rn(bf(a[c]), bf(b[c])));
++}
++
++// E5, L1, L7: LayerNorm(1024) rows (vit_norm.cuh, fixed fp32 order), block a row. X and Y must not overlap.
++extern "C" __global__ void __launch_bounds__(NT) tf_iv_layer_norm(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ Wt,
++                                                                  const __nv_bfloat16* __restrict__ B, __nv_bfloat16* __restrict__ Y, float eps) {
++    tf_vit_norm::layer_norm<W / NT>(X, Wt, B, Y, W, eps, tf_vit_norm::ALL);
++}
++
++// R: the rotary tables of rows r0 + blockIdx.x: pair j < 16 turns by the column angle at frequency j, j >= 16 by the
++// row angle at frequency j - 16; angle = float(pos) * inv[j % 16]; cos, sin [S][32] fp32. Position (row + 1, col + 1)
++// for a patch, (0, 0) for the class row.
++extern "C" __global__ void __launch_bounds__(32) tf_iv_rope_table(const float* __restrict__ inv, int cols, int r0,
++                                                                  float* __restrict__ cs, float* __restrict__ sn) {
++    const int r = r0 + blockIdx.x, j = threadIdx.x;
++    int prow = -1, pcol = -1;
++    if (r > 0) patch_at(r - 1, cols, prow, pcol);
++    const float pos = static_cast<float>(j < 16 ? pcol + 1 : prow + 1);
++    const float a = __fmul_rn(pos, inv[j & 15]);
++    cs[static_cast<int64_t>(r) * 32 + j] = cosf(a);
++    sn[static_cast<int64_t>(r) * 32 + j] = sinf(a);
++}
++
++// L3: q and k of rows r0 + blockIdx.x in place (row r at qkv + r * ld, q at +0, k at +1024): per head, pair (a, b) at
++// (2i, 2i + 1) -> (bf16(a cos - b sin), bf16(b cos + a sin)), each product and the sum rounded in fp32 (torch's
++// q * cos + rotate_pairwise(q) * sin, rotate (a, b) = (-b, a)).
++extern "C" __global__ void __launch_bounds__(NT) tf_iv_rotary(__nv_bfloat16* qkv, int ld, const float* __restrict__ cs,
++                                                              const float* __restrict__ sn, int r0) {
++    const int r = r0 + blockIdx.x;
++    __nv_bfloat16* row = qkv + static_cast<int64_t>(r) * ld;
++    for (int e = threadIdx.x; e < 2 * HEADS * 32; e += NT) {
++        const int part = e / (HEADS * 32), h = (e / 32) % HEADS, i = e % 32;
++        __nv_bfloat16* at = row + part * W + h * HD + 2 * i;
++        const float c = cs[static_cast<int64_t>(r) * 32 + i], s = sn[static_cast<int64_t>(r) * 32 + i];
++        const float a = bf(at[0]), b = bf(at[1]);
++        at[0] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(a, c), __fmul_rn(-b, s)));
++        at[1] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s)));
++    }
++}
++
++// Block (row, column block): O[row * ldo + c] = bf16(ACC[row * N + c] + bias[c]) (a Linear's bias, torch's one rounding).
++extern "C" __global__ void __launch_bounds__(NT) tf_iv_bias(const float* __restrict__ ACC, const __nv_bfloat16* __restrict__ BIAS,
++                                                            __nv_bfloat16* __restrict__ O, int N, int ldo) {
++    const int c = blockIdx.y * NT + threadIdx.x;
++    if (c >= N) return;
++    const int64_t at = static_cast<int64_t>(blockIdx.x) * N + c;
++    O[static_cast<int64_t>(blockIdx.x) * ldo + c] = __float2bfloat16_rn(__fadd_rn(ACC[at], bf(BIAS[c])));
++}
++
++// L8 fc1's end: O = bf16(gelu(bf16(ACC + bias))), [rows][N].
++extern "C" __global__ void __launch_bounds__(NT) tf_iv_bias_gelu(const float* __restrict__ ACC, const __nv_bfloat16* __restrict__ BIAS,
++                                                                 __nv_bfloat16* __restrict__ O, int N) {
++    const int c = blockIdx.y * NT + threadIdx.x;
++    if (c >= N) return;
++    const int64_t at = static_cast<int64_t>(blockIdx.x) * N + c;
++    O[at] = __float2bfloat16_rn(gelu_erf(rbf(__fadd_rn(ACC[at], bf(BIAS[c])))));
++}
++
++// L5 + L6, L8 fc2 + L9: y = bf16(ACC + bias); X = bf16(X + bf16(ls * y)) in place, [rows][1024].
++extern "C" __global__ void __launch_bounds__(NT) tf_iv_bias_ls_res(const float* __restrict__ ACC, const __nv_bfloat16* __restrict__ BIAS,
++                                                                   const __nv_bfloat16* __restrict__ LS, __nv_bfloat16* __restrict__ X) {
++    const int c = blockIdx.y * NT + threadIdx.x;
++    const int64_t at = static_cast<int64_t>(blockIdx.x) * W + c;
++    X[at] = ls_res(rbf(__fadd_rn(ACC[at], bf(BIAS[c]))), LS[c], X[at]);
++}
++
++// The same residual end from a bf16 y (the op check: torch's projection output as y).
++extern "C" __global__ void __launch_bounds__(NT) tf_iv_ls_res(const __nv_bfloat16* __restrict__ Y, const __nv_bfloat16* __restrict__ LS,
++                                                              __nv_bfloat16* __restrict__ X) {
++    const int c = blockIdx.y * NT + threadIdx.x;
++    const int64_t at = static_cast<int64_t>(blockIdx.x) * W + c;
++    X[at] = ls_res(bf(Y[at]), LS[c], X[at]);
++}
++
++// M2's GELU (and the op check's GELU table): O = bf16(gelu(float(X))), count elements; X may be O.
++extern "C" __global__ void __launch_bounds__(NT) tf_iv_gelu(const __nv_bfloat16* X, __nv_bfloat16* O, int64_t count) {
++    const int64_t at = static_cast<int64_t>(blockIdx.x) * NT + threadIdx.x;
++    if (at < count) O[at] = __float2bfloat16_rn(gelu_erf(bf(X[at])));
++}
++
++// Block a listed row: out[i] = x[rows[i]] (1024 wide): the sampled layer rows.
++extern "C" __global__ void __launch_bounds__(NT) tf_iv_gather(const __nv_bfloat16* __restrict__ x, const int* __restrict__ rows,
++                                                              __nv_bfloat16* __restrict__ out) {
++    const __nv_bfloat16* src = x + static_cast<int64_t>(rows[blockIdx.x]) * W;
++    for (int c = threadIdx.x; c < W; c += NT) out[static_cast<int64_t>(blockIdx.x) * W + c] = src[c];
++}
++
++// L4, the reference core: one thread a (query row, head); grid (ceil(qn / 128), 16), 128 threads. Scores
++// s = fp32 dot(q, k) (fma chain over d = 0 .. 63) * 0.125, keys 0 .. S - 1 in order; two passes: m = max s, then
++// p = expf(s - m), Z = sum p, O = sum p v (fma, keys in order); out = bf16(O / Z). q, k, v (row r, head h, d) at
++// base + r * ld + h * 64 + d; out row r at out + (r - q0) * 1024 + h * 64 + d (tf_iv_attn's arguments).
++namespace {
++constexpr int REF_ROWS = 128;
++constexpr int REF_KEYS = 32;
++}  // namespace
++
++extern "C" __global__ void __launch_bounds__(REF_ROWS) tf_iv_attn_ref(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
++                                                                      const __nv_bfloat16* __restrict__ v, int ld, __nv_bfloat16* __restrict__ out,
++                                                                      int S, int q0, int qn) {
++    __shared__ float4 ks[REF_KEYS][HD / 4];
++    __shared__ float4 vs[REF_KEYS][HD / 4];
++    const int h = blockIdx.y;
++    const int i = blockIdx.x * REF_ROWS + threadIdx.x;
++    const bool live = i < qn;
++    const int r = q0 + (live ? i : 0);
++    float qr[HD];
++#pragma unroll
++    for (int d = 0; d < HD; ++d) qr[d] = bf(q[static_cast<int64_t>(r) * ld + h * HD + d]);
++    auto load = [&](const __nv_bfloat16* src, float4 (*dst)[HD / 4], int k0) {
++        for (int e = threadIdx.x; e < REF_KEYS * HD; e += REF_ROWS) {
++            const int kk = e / HD, d = e % HD;
++            const int key = k0 + kk;
++            reinterpret_cast<float*>(dst[kk])[d] = key < S ? bf(src[static_cast<int64_t>(key) * ld + h * HD + d]) : 0.0f;
++        }
++    };
++    auto score = [&](int kk) {
++        float s = 0.0f;
++#pragma unroll
++        for (int d4 = 0; d4 < HD / 4; ++d4) {
++            const float4 kv = ks[kk][d4];
++            s = __fmaf_rn(qr[4 * d4 + 0], kv.x, s);
++            s = __fmaf_rn(qr[4 * d4 + 1], kv.y, s);
++            s = __fmaf_rn(qr[4 * d4 + 2], kv.z, s);
++            s = __fmaf_rn(qr[4 * d4 + 3], kv.w, s);
++        }
++        return __fmul_rn(s, 0.125f);
++    };
++    float m = -INFINITY;
++    for (int k0 = 0; k0 < S; k0 += REF_KEYS) {
++        __syncthreads();
++        load(k, ks, k0);
++        __syncthreads();
++        const int nk = min(REF_KEYS, S - k0);
++        for (int kk = 0; kk < nk; ++kk) m = fmaxf(m, score(kk));
++    }
++    float acc[HD];
++#pragma unroll
++    for (int d = 0; d < HD; ++d) acc[d] = 0.0f;
++    float z = 0.0f;
++    for (int k0 = 0; k0 < S; k0 += REF_KEYS) {
++        __syncthreads();
++        load(k, ks, k0);
++        load(v, vs, k0);
++        __syncthreads();
++        const int nk = min(REF_KEYS, S - k0);
++        for (int kk = 0; kk < nk; ++kk) {
++            const float p = expf(__fsub_rn(score(kk), m));
++            z = __fadd_rn(z, p);
++#pragma unroll
++            for (int d4 = 0; d4 < HD / 4; ++d4) {
++                const float4 vv = vs[kk][d4];
++                acc[4 * d4 + 0] = __fmaf_rn(p, vv.x, acc[4 * d4 + 0]);
++                acc[4 * d4 + 1] = __fmaf_rn(p, vv.y, acc[4 * d4 + 1]);
++                acc[4 * d4 + 2] = __fmaf_rn(p, vv.z, acc[4 * d4 + 2]);
++                acc[4 * d4 + 3] = __fmaf_rn(p, vv.w, acc[4 * d4 + 3]);
++            }
++        }
++    }
++    if (!live) return;
++    __nv_bfloat16* o = out + static_cast<int64_t>(i) * W + h * HD;
++#pragma unroll
++    for (int d = 0; d < HD; ++d) o[d] = __float2bfloat16_rn(__fdiv_rn(acc[d], z));
++}
+diff --git a/zig/kernels/cuda/inkling2_vision_attn.cuh b/zig/kernels/cuda/inkling2_vision_attn.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..87ac68694cd6df4b27f8d6c61f3ff985b99ef1c4
+--- /dev/null
++++ b/zig/kernels/cuda/inkling2_vision_attn.cuh
+@@ -0,0 +1,274 @@
++// Inkling-2's vision tower attention core (L4 of the tower; FABLE-IMAGE-INPUT-DESIGN 1.3): one image, 16 heads of
++// 64, no mask, no bias, sink, gate or window; keys = all S rows of the image. Adapted from inkling2_kx_fp32.cuh's tile
++// arithmetic (mma.sync m16n8k16 bf16 -> fp32, P in bf16 limbs) for D = 64, with the scores kept in registers.
++//
++// The arithmetic of a (row, head), the same for every launch:
++//   scores s = fp32(q . k) on mma.sync m16n8k16 (bf16 products exact, fp32 accumulate, dims 0-15, 16-31, 32-47,
++//   48-63 in that order) times 0.125 (exact); 64-key tiles at absolute keys 64t .. 64t + 63, t = 0 .. ceil(S / 64) - 1
++//   in that order for every row (keys >= S: score -inf, value +0); per tile: m' = max(m, the tile's max) (a thread's
++//   16 columns in order, then xor 1, 2 over the quad), a = m == m' ? 1 : expf(m - m'), p = expf(s - m') in fp32,
++//   Z = Z * a + (the thread's 16 p in order, then xor 1, 2), O = O * a + T (product, then sum, each rounded) where T
++//   is the tile's P.V accumulated from +0 on the same mma (keys 0-15, 16-31, 32-47, 48-63 of the tile, limbs 0, 1, 2
++//   within each) with P as LIMBS bf16 limbs of p (limb i = bf16_rn(p - limbs 0 .. i-1)); out = bf16_rn(O / Z),
++//   rounded once. (T per tile, not one mma accumulator over all keys: the tensor cores' fp32 accumulation drifts over
++//   long key ranges; per tile the output equals bf16(fp64) to 1e-6 relative even at S = 42,437, for ~1% time.)
++// A row's bits depend on its own q and on k, v only: never on q0, qn, the grid, the CTA's other rows or the slot it
++// takes in an MMA. Deterministic: no atomics, no data-dependent order. Non-finite inputs are not screened (the tower's
++// q, k, v come from LayerNorm, a projection and the rotation); a NaN or inf reaches the row's output. Subnormal
++// inputs are used as the tensor cores treat them (the same bits every run).
++//
++// Build with the glue flags (-O3 --fmad=false --ftz=false --prec-div=true --prec-sqrt=true -std=c++20
++// --expt-relaxed-constexpr); needs sm_80 or later (mma.sync bf16, ldmatrix, cp.async).
++//
++// Launch (host side; the constants below are host-callable):
++//   tf_iv_attn<<<dim3(iv::blocks(qn), iv::kHeads, 1), iv::kThreads, 0 /* static shared, iv::kSmemBytes */>>>(
++//       q, k, v, ld, out, S, q0, qn);
++//   q, k, v: element (row r, head h, dim d) at base + r * ld + h * 64 + d (ld = 3072 and bases +0 / +1024 / +2048 for
++//   one fused [S][3072] qkv buffer); ld % 8 == 0 and 16-byte aligned bases. out: row r at out + (r - q0) * 1024 +
++//   h * 64 + d (dense [qn][1024]). 0 <= q0, 1 <= qn, q0 + qn <= S. No dynamic shared memory, no scratch.
++// Include this header in one .cu only (it defines the extern "C" kernel). iv::attn<2> is the 2-limb variant (same
++// accuracy on every measured case, ~16% faster at S = 42,437, ~0.1% of output bits differ); not instantiated here.
++#pragma once
++#include <cuda_bf16.h>
++#include <stdint.h>
++
++namespace iv {
++
++constexpr int kHeads = 16;      // heads (query and key/value)
++constexpr int kDim = 64;        // head dim
++constexpr int kKeys = 64;       // keys a tile (absolute positions 64t .. 64t + 63)
++constexpr int kWarps = 4;       // warps a CTA, 16 query rows each
++constexpr int kRows = 16 * kWarps;     // query rows a CTA
++constexpr int kThreads = 32 * kWarps;  // threads a CTA
++constexpr int kPad = kDim + 8;         // shared row (144 bytes: ldmatrix rows on distinct banks)
++constexpr int kStages = 2;             // key/value tiles in flight
++constexpr int kSmemBytes = kStages * 2 * kKeys * kPad * 2;  // static shared memory a CTA (36,864 bytes; sm_12x
++                                                             // reports 37,888 with the system's 1 KiB)
++constexpr float kScale = 0.125f;       // 64^-0.5, exact
++constexpr int kLimbs = 3;              // P's bf16 limbs in tf_iv_attn
++
++// Grid x for qn query rows (grid y = kHeads, z = 1).
++__host__ __device__ constexpr unsigned blocks(int qn) { return (unsigned)((qn + kRows - 1) / kRows); }
++
++__device__ __forceinline__ void mma(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const __nv_bfloat16* p) {
++    const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(p));
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(at) : "memory");
++}
++__device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], const __nv_bfloat16* p) {
++    const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(p));
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(at) : "memory");
++}
++// 16 bytes global -> shared; bytes = 0 fills +0 (a key past S).
++__device__ __forceinline__ void cp16(void* dst, const void* src, int bytes) {
++    const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(dst));
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(at), "l"(src), "r"(bytes) : "memory");
++}
++__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
++template <int N>
++__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
++
++// Two fp32 as bf16 (round to nearest even): the low half holds a.
++__device__ __forceinline__ uint32_t pack(float a, float c) {
++    const __nv_bfloat162 p = __floats2bfloat162_rn(a, c);
++    return *reinterpret_cast<const uint32_t*>(&p);
++}
++__device__ __forceinline__ float lo(uint32_t x) { return __uint_as_float(x << 16); }
++__device__ __forceinline__ float hi(uint32_t x) { return __uint_as_float(x & 0xffff0000u); }
++
++struct Tile {
++    __align__(16) __nv_bfloat16 k[kKeys][kPad];
++    __align__(16) __nv_bfloat16 v[kKeys][kPad];
++};
++
++// Keys base .. base + 63 of head h into t (cp.async; keys >= S as +0).
++__device__ __forceinline__ void load_tile(Tile& t, const __nv_bfloat16* k, const __nv_bfloat16* v, int ld, int h,
++                                          int S, int base) {
++    // 64 keys x 8 chunks of 16 bytes, for k and for v
++#pragma unroll
++    for (int i = threadIdx.x; i < kKeys * 8; i += kThreads) {
++        const int j = i >> 3, c = (i & 7) * 8, key = base + j;
++        const bool live = key < S;
++        const size_t at = (size_t)(live ? key : 0) * ld + h * kDim + c;
++        cp16(&t.k[j][c], k + at, live ? 16 : 0);
++        cp16(&t.v[j][c], v + at, live ? 16 : 0);
++    }
++}
++
++// One CTA: query rows q0 + 64 * blockIdx.x + 16 * warp + 0 .. 15 of head blockIdx.y against keys 0 .. S - 1.
++template <int LIMBS>
++__device__ __forceinline__ void attn(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
++                                     const __nv_bfloat16* __restrict__ v, int ld, __nv_bfloat16* __restrict__ out,
++                                     int S, int q0, int qn) {
++    static_assert(LIMBS >= 1 && LIMBS <= 3, "P limbs");
++    __shared__ Tile tiles[kStages];
++    const int t = threadIdx.x, w = t >> 5, lane = t & 31, g = lane >> 2, sub = lane & 3;
++    const int h = blockIdx.y;
++    const int r0 = blockIdx.x * kRows + w * 16;  // this warp's first row, from q0
++    const int ntiles = (S + kKeys - 1) / kKeys;
++    load_tile(tiles[0], k, v, ld, h, S, 0);
++    cp_commit();
++
++    // q's A fragments: rows g and g + 8 of the warp (a row past the block repeats the block's last row; not stored)
++    uint32_t qa[4][4];
++    {
++        const int ra = q0 + min(r0 + g, qn - 1), rb = q0 + min(r0 + g + 8, qn - 1);
++        const __nv_bfloat16* pa = q + (size_t)ra * ld + h * kDim + 2 * sub;
++        const __nv_bfloat16* pb = q + (size_t)rb * ld + h * kDim + 2 * sub;
++#pragma unroll
++        for (int s = 0; s < 4; ++s) {
++            qa[s][0] = *reinterpret_cast<const uint32_t*>(pa + s * 16);
++            qa[s][1] = *reinterpret_cast<const uint32_t*>(pb + s * 16);
++            qa[s][2] = *reinterpret_cast<const uint32_t*>(pa + s * 16 + 8);
++            qa[s][3] = *reinterpret_cast<const uint32_t*>(pb + s * 16 + 8);
++        }
++    }
++    float o[8][4];
++#pragma unroll
++    for (int n = 0; n < 8; ++n)
++#pragma unroll
++        for (int e = 0; e < 4; ++e) o[n][e] = 0.f;
++    float m[2] = {-INFINITY, -INFINITY}, z[2] = {0.f, 0.f};  // rows g, g + 8
++    float ot[8][4];  // this tile's P.V
++
++    for (int ti = 0; ti < ntiles; ++ti) {
++        if (ti + 1 < ntiles) {
++            load_tile(tiles[(ti + 1) & 1], k, v, ld, h, S, (ti + 1) * kKeys);
++            cp_commit();
++            cp_wait<1>();
++        } else {
++            cp_wait<0>();
++        }
++        __syncthreads();
++        const Tile& tl = tiles[ti & 1];
++        const int base = ti * kKeys;
++
++        // scores: keys 8n .. 8n + 7 of the tile (thread: columns 2 sub, 2 sub + 1), dims in steps of 16 ascending
++        float sc[8][4];
++#pragma unroll
++        for (int n = 0; n < 8; ++n) {
++#pragma unroll
++            for (int e = 0; e < 4; ++e) sc[n][e] = 0.f;
++            uint32_t kb[2][4];
++            ldsm_x4(kb[0], &tl.k[n * 8 + (lane & 7)][(lane >> 3) * 8]);
++            ldsm_x4(kb[1], &tl.k[n * 8 + (lane & 7)][32 + (lane >> 3) * 8]);
++            mma(sc[n], qa[0], kb[0][0], kb[0][1]);
++            mma(sc[n], qa[1], kb[0][2], kb[0][3]);
++            mma(sc[n], qa[2], kb[1][0], kb[1][1]);
++            mma(sc[n], qa[3], kb[1][2], kb[1][3]);
++        }
++        const bool tail = base + kKeys > S;
++#pragma unroll
++        for (int n = 0; n < 8; ++n)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) {
++                float s = sc[n][e] * kScale;
++                if (tail && base + n * 8 + 2 * sub + (e & 1) >= S) s = -INFINITY;
++                sc[n][e] = s;
++            }
++        // the tile's max and the rescale (row g: e = 0, 1; row g + 8: e = 2, 3)
++        float alpha[2];
++#pragma unroll
++        for (int r = 0; r < 2; ++r) {
++            float mx = m[r];
++#pragma unroll
++            for (int n = 0; n < 8; ++n) {
++                mx = fmaxf(mx, sc[n][2 * r]);
++                mx = fmaxf(mx, sc[n][2 * r + 1]);
++            }
++            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
++            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
++            alpha[r] = m[r] == mx ? 1.f : expf(m[r] - mx);
++            m[r] = mx;
++        }
++        // the weights and their sums
++        float zt[2] = {0.f, 0.f};
++#pragma unroll
++        for (int n = 0; n < 8; ++n)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) {
++                const float p = expf(sc[n][e] - m[e >> 1]);
++                sc[n][e] = p;
++            }
++#pragma unroll
++        for (int r = 0; r < 2; ++r) {
++#pragma unroll
++            for (int n = 0; n < 8; ++n) {
++                zt[r] = __fadd_rn(zt[r], sc[n][2 * r]);
++                zt[r] = __fadd_rn(zt[r], sc[n][2 * r + 1]);
++            }
++            zt[r] = __fadd_rn(zt[r], __shfl_xor_sync(0xffffffffu, zt[r], 1));
++            zt[r] = __fadd_rn(zt[r], __shfl_xor_sync(0xffffffffu, zt[r], 2));
++            z[r] = __fadd_rn(__fmul_rn(z[r], alpha[r]), zt[r]);
++        }
++#pragma unroll
++        for (int n = 0; n < 8; ++n)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) ot[n][e] = 0.f;
++
++        // P.V: keys 16s .. 16s + 15 ascending, limbs 0 .. LIMBS - 1 within each
++#pragma unroll
++        for (int s = 0; s < 4; ++s) {
++            // P's A fragment (rows g, g + 8; keys 16s + 2 sub, +1 and 16s + 8 + 2 sub, +1) as limbs
++            float pr[4][2] = {{sc[2 * s][0], sc[2 * s][1]},
++                              {sc[2 * s][2], sc[2 * s][3]},
++                              {sc[2 * s + 1][0], sc[2 * s + 1][1]},
++                              {sc[2 * s + 1][2], sc[2 * s + 1][3]}};
++            uint32_t pa[LIMBS][4];
++#pragma unroll
++            for (int l = 0; l < LIMBS; ++l)
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    const uint32_t x = pack(pr[i][0], pr[i][1]);
++                    pa[l][i] = x;
++                    if (l + 1 < LIMBS) {
++                        pr[i][0] = __fsub_rn(pr[i][0], lo(x));
++                        pr[i][1] = __fsub_rn(pr[i][1], hi(x));
++                    }
++                }
++            // V's B fragments: dims 16j .. 16j + 15 (two n-tiles) by ldmatrix .trans of the key-major tile
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                uint32_t vb[4];
++                ldsm_x4_t(vb, &tl.v[s * 16 + (lane & 15)][j * 16 + (lane >> 4) * 8]);
++#pragma unroll
++                for (int l = 0; l < LIMBS; ++l) {
++                    mma(ot[2 * j], pa[l], vb[0], vb[1]);
++                    mma(ot[2 * j + 1], pa[l], vb[2], vb[3]);
++                }
++            }
++        }
++        // O = O * a + T
++#pragma unroll
++        for (int n = 0; n < 8; ++n)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) o[n][e] = __fadd_rn(__fmul_rn(o[n][e], alpha[e >> 1]), ot[n][e]);
++        __syncthreads();  // the next iteration's load overwrites this tile's stage
++    }
++
++    // out = bf16(O / Z), rows g and g + 8, columns 8n + 2 sub, +1
++#pragma unroll
++    for (int r = 0; r < 2; ++r) {
++        const int row = r0 + g + 8 * r;
++        if (row >= qn) continue;
++        __nv_bfloat16* po = out + (size_t)row * (kHeads * kDim) + h * kDim + 2 * sub;
++#pragma unroll
++        for (int n = 0; n < 8; ++n)
++            *reinterpret_cast<uint32_t*>(po + n * 8) = pack(__fdiv_rn(o[n][2 * r], z[r]), __fdiv_rn(o[n][2 * r + 1], z[r]));
++    }
++}
++
++}  // namespace iv
++
++// The tower's core: 3-limb P (iv::kLimbs). Grid (iv::blocks(qn), iv::kHeads, 1), iv::kThreads threads, static shared.
++extern "C" __global__ void __launch_bounds__(iv::kThreads) tf_iv_attn(const __nv_bfloat16* q, const __nv_bfloat16* k,
++                                                                      const __nv_bfloat16* v, int ld, __nv_bfloat16* out,
++                                                                      int S, int q0, int qn) {
++    iv::attn<iv::kLimbs>(q, k, v, ld, out, S, q0, qn);
++}
 diff --git a/zig/src/core/relbias_attention_ref.zig b/zig/src/core/relbias_attention_ref.zig
 new file mode 100644
 index 0000000000000000000000000000000000000000..1898c67e99fd5a3ad9b0ee96d298613d1f76322e
@@ -6778,10 +7453,10 @@ index 1287ca27ae21cb023a7fb5afd3162310f7e46f4b..e02286b3b361ecba81eb37bad3d16d1f
      pub fn setSchedule(d: *const Driver, ordinal: c_int, s: Schedule) Error!void {
          var dev: abi.Device = 0;
 diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
-index 1ff9f6a4489ffc32991770b799e197eadcedec52..e0989b9bbe12c868e79e62c8c6cd361000ff0241 100644
+index 1ff9f6a4489ffc32991770b799e197eadcedec52..8481da44554e9ff6aba5b209b3f3ba694f8e840e 100644
 --- a/zig/src/cuda/kernels.zig
 +++ b/zig/src/cuda/kernels.zig
-@@ -80,6 +80,15 @@ pub const glm_ops: []const u8 = if (available) &Blob("fatbin_glm_ops").bytes els
+@@ -80,6 +80,16 @@ pub const glm_ops: []const u8 = if (available) &Blob("fatbin_glm_ops").bytes els
  pub const glm_index: []const u8 = if (available) &Blob("fatbin_glm_index").bytes else &.{};
  pub const minimax_m3: []const u8 = if (available) &Blob("fatbin_minimax_m3").bytes else &.{};
  pub const minimax_m3_attn: []const u8 = if (available) &Blob("fatbin_minimax_m3_attn").bytes else &.{};
@@ -6794,6 +7469,7 @@ index 1ff9f6a4489ffc32991770b799e197eadcedec52..e0989b9bbe12c868e79e62c8c6cd3610
 +pub const inkling2_fuse: []const u8 = if (available) &Blob("fatbin_inkling2_fuse").bytes else &.{};
 +pub const inkling2_ck: []const u8 = if (available) &Blob("fatbin_inkling2_ck").bytes else &.{};
 +pub const inkling2_kx: []const u8 = if (available) &Blob("fatbin_inkling2_kx").bytes else &.{};
++pub const inkling2_vision: []const u8 = if (available) &Blob("fatbin_inkling2_vision").bytes else &.{};
  pub const glm_quant: []const u8 = if (available) &Blob("fatbin_glm_quant").bytes else &.{};
  pub const glm_vision: []const u8 = if (available) &Blob("fatbin_glm_vision").bytes else &.{};
  pub const glm_mm: []const u8 = if (available) &Blob("fatbin_glm_mm").bytes else &.{};
@@ -7239,10 +7915,10 @@ index 0000000000000000000000000000000000000000..0bc0979219cc6f1c6df96e80c5d0054e
 +}
 diff --git a/zig/src/families/inkling2/cuda_attn.zig b/zig/src/families/inkling2/cuda_attn.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..694a4eb31923008be39d0ee2765888144b4bf745
+index 0000000000000000000000000000000000000000..b698cefed73e288a774078f579984577f2e0b68a
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_attn.zig
-@@ -0,0 +1,1357 @@
+@@ -0,0 +1,1367 @@
 +//! G-attn: sliding-window (1024) and global attention with a relative-position bias, a sink logit, L2-clipped
 +//! Q / K / relative states, RMS-normed V without gain, log-scaled Q in global layers and a sigmoid output gate.
 +//! Kernel image: inkling2_attn.cu. Math: Transformers modeling_inkling2.py (Apache-2.0), Inkling2SlidingAttention /
@@ -7425,13 +8101,23 @@ index 0000000000000000000000000000000000000000..694a4eb31923008be39d0ee276588814
 +    return f;
 +}
 +
-+/// The settings fingerprint's attention part (cuda_engine.zig): the resolved form (unset and `kx` agree; an unknown
-+/// value as given, refused later at Kernels.load) and v0.1's two switches.
-+pub fn fingerprintText(buf: []u8) []const u8 {
-+    const v = env("TF_INK2_ATTN");
-+    const form = if (parseForm(v)) |f| @tagName(f) else v;
-+    return std.fmt.bufPrint(buf, "attn {s} TF_INK2_ATTN_ROWS={s} TF_INK2_ATTN_AB={s}", .{ form, env("TF_INK2_ATTN_ROWS"), env("TF_INK2_ATTN_AB") }) catch "attn ?";
-+}
++/// The settings fingerprint's attention part (cuda_engine.zig, "{f}"): the resolved form (unset and `kx` agree; an
++/// unknown value as given, refused later at Kernels.load) and v0.1's two switches, written whole however long they are
++/// (no buffer: two ranks' long values never shorten to one text).
++pub const fingerprint: Fingerprint = .{};
++
++pub const Fingerprint = struct {
++    pub fn format(_: Fingerprint, w: *std.Io.Writer) std.Io.Writer.Error!void {
++        const r = rawFields();
++        try w.print("attn {s} TF_INK2_ATTN_ROWS={s} TF_INK2_ATTN_AB={s}", .{ r[0], r[1], r[2] });
++    }
++
++    /// The part's three values as written: the form, TF_INK2_ATTN_ROWS and TF_INK2_ATTN_AB.
++    pub fn rawFields() [3][]const u8 {
++        const v = env("TF_INK2_ATTN");
++        return .{ if (parseForm(v)) |f| @tagName(f) else v, env("TF_INK2_ATTN_ROWS"), env("TF_INK2_ATTN_AB") };
++    }
++};
 +
 +/// inkling2_attn.cu's functions and the lane matmul.
 +pub const Kernels = struct {
@@ -13056,7 +13742,7 @@ index 0000000000000000000000000000000000000000..8704dbf87ec6216e7dfe24dacb4eac24
 +}
 diff --git a/zig/src/families/inkling2/cuda_attn_oracle_real.zig b/zig/src/families/inkling2/cuda_attn_oracle_real.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..f9d8f0985d49548148ee463a2bec489a44a40dfc
+index 0000000000000000000000000000000000000000..3952a1ebc584d6e4d7c98afd46d5fd092f0d7277
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_attn_oracle_real.zig
 @@ -0,0 +1,619 @@
@@ -13597,8 +14283,8 @@ index 0000000000000000000000000000000000000000..f9d8f0985d49548148ee463a2bec489a
 +    var arena: std.heap.ArenaAllocator = .init(gpa);
 +    defer arena.deinit();
 +    const aa = arena.allocator();
-+    defer for (st.runs.items) |r| if (r.impl != null or r.forced != null) gpa.free(r.out);
 +    defer st.runs.deinit(gpa);
++    defer for (st.runs.items) |r| if (r.impl != null or r.forced != null) gpa.free(r.out);
 +    // e2614fe's path reading (planted runs) does not apply to v0.2's kx: no forced runs
 +    const obs: ?usize = null;
 +    for (impls) |impl| if (st.want(impl)) for ([_]bool{ false, true }) |split| for (o.chunks) |N| {
@@ -15666,10 +16352,10 @@ index 0000000000000000000000000000000000000000..5c9f69e4e3393ea91e0ceb04d6beeaf6
 +}
 diff --git a/zig/src/families/inkling2/cuda_moe.zig b/zig/src/families/inkling2/cuda_moe.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..fd6bc85d9a21775263684ef98a34ca4ff7efcd21
+index 0000000000000000000000000000000000000000..8073f126029266eaada2df3626be8a242927236d
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_moe.zig
-@@ -0,0 +1,1089 @@
+@@ -0,0 +1,1173 @@
 +//! G-moe: the router (sigmoid scores, selection by score + bias, weights normalised and scaled by 8) and the
 +//! grouped experts in `full` mode: stored weights decoded in the kernel, bf16 activations (W4A16 for the NVFP4
 +//! layers 0-39, W8A16 for the MXFP8 layers 40-47), softcapped SwiGLU, the weighted fp32 sum in expert-id order.
@@ -15838,6 +16524,11 @@ index 0000000000000000000000000000000000000000..fd6bc85d9a21775263684ef98a34ca4f
 +    ck_k1: Rows,
 +    /// the unit shapes of calls of 9 .. 64 rows by band (wide_bands), null: ckShape's (TF_INK2_CK_SHAPEW)
 +    ck_wide: Wide = @splat(@splat(@splat(null))),
++    /// split experts, MoE-A as codes (splitAmax, splitQuant, splitDownCodes): a row's amax, NVFP4 with the ranks'
++    /// amaxes, the gathered codes laid out as rows
++    ck_seg_amax: cuda.Function,
++    ck_quant_parts: cuda.Function,
++    ck_codes_rows: cuda.Function,
 +    /// the unit shape of calls of 1 .. 8 rows in place of ckShape's (null: ckShape's): TF_INK2_CK_SHAPE1, else the
 +    /// GB10 table on an integrated GPU (windowShapes); [nvfp4, mxfp8][up, down][rows - 1]
 +    ck_rows: Rows,
@@ -15869,6 +16560,9 @@ index 0000000000000000000000000000000000000000..fd6bc85d9a21775263684ef98a34ca4f
 +            .ck_k1 = try k1Shapes(),
 +            .ck_wide = try wideShapes(),
 +            .block_cap = try blockCap(),
++            .ck_seg_amax = try ck.function("tf_ink2_ck_seg_amax"),
++            .ck_quant_parts = try ck.function("tf_ink2_ck_quant_nvfp4_parts"),
++            .ck_codes_rows = try ck.function("tf_ink2_ck_codes_rows"),
 +            .mod = mod,
 +            .probe = try mod.function("tf_ink2_moe_probe"),
 +            .logits = try mod.function("tf_ink2_moe_logits"),
@@ -16400,6 +17094,65 @@ index 0000000000000000000000000000000000000000..fd6bc85d9a21775263684ef98a34ca4f
 +/// order), `plan` as `splitUp` left it; `y` bf16 [R, H/W], this rank's columns of the layer's output (its slot of the
 +/// MoE-B gather).
 +pub fn splitDown(c: *const Ctx, l: *const Layer, R: usize, h_all: u64, plan: u64, y: u64, force_shape: ?u32, form: Form) !void {
++    return splitDownFrom(c, l, R, h_all, null, plan, y, force_shape, form);
++}
++
++/// MoE-A as codes (TF_INK2_XCODES; inkling2_ck.cu "MoE-A as codes"): the gathered slots (rank w's at `parts` + w *
++/// codesSlot) in place of h_all.
++pub const Codes = struct {
++    parts: u64,
++    world: usize,
++    /// NVFP4: every rank's segment amax [W][R * 8] fp32
++    amaxes: u64,
++};
++
++/// Bytes of one rank's slot of the codes gather for `routes` routes: its I/W columns' codes, then their scales.
++pub fn codesSlot(nv: bool, world: usize, routes: usize) usize {
++    const n = intermediate / world;
++    return routes * (if (nv) n / 2 + n / 16 else n + n / 32);
++}
++
++/// MoE-A as codes, NVFP4 layers: each route's amax over this rank's columns of h (`h` bf16 [R * 8, I/W], as splitUp
++/// left it) into `amax` fp32 [R * 8]. MXFP8 layers need none (nothing to do).
++pub fn splitAmax(c: *const Ctx, l: *const Layer, R: usize, world: usize, h: u64, amax: u64) !void {
++    if (R == 0 or l.experts.format != .nvfp4) return;
++    const n = intermediate / world;
++    var a: cuda.launch.Args = .{};
++    a.add(h);
++    a.add(@as(i32, @intCast(n)));
++    a.add(amax);
++    try launch(c, c.k.moe.ck_seg_amax, .{ @intCast(R * topk), 1 }, quantThreads(n, true), &a);
++}
++
++/// MoE-A as codes: this rank's columns of h quantized as the whole row's quantizer would (NVFP4 with the row amax
++/// over every rank's `amaxes` [W][R * 8]) into its slot `out` (codesSlot bytes: codes, then scales).
++pub fn splitQuant(c: *const Ctx, l: *const Layer, R: usize, world: usize, h: u64, amaxes: u64, out: u64) !void {
++    if (R == 0) return;
++    const E = &l.experts;
++    try splitCheck(c, E);
++    const routes = R * topk;
++    const n = intermediate / world;
++    const nv = E.format == .nvfp4;
++    const codes_bytes = routes * (if (nv) n / 2 else n);
++    if (!nv) return ckQuant(c, c.k.moe.ck_quant[1], false, h, routes, n, n, 0, 0, 0, 0, out, out + codes_bytes, 0);
++    var a: cuda.launch.Args = .{};
++    a.add(h);
++    a.add(@as(i32, @intCast(n)));
++    a.add(amaxes);
++    a.add(@as(i32, @intCast(world)));
++    a.add(@as(i32, @intCast(routes)));
++    a.add(out);
++    a.add(out + codes_bytes);
++    try launch(c, c.k.moe.ck_quant_parts, .{ @intCast(routes), 1 }, quantThreads(n, true), &a);
++}
++
++/// splitDown with MoE-A as codes: the whole rows' codes, scales and amax laid out from the gathered slots, then the
++/// same down pass and fold.
++pub fn splitDownCodes(c: *const Ctx, l: *const Layer, R: usize, codes: Codes, plan: u64, y: u64, force_shape: ?u32, form: Form) !void {
++    return splitDownFrom(c, l, R, 0, codes, plan, y, force_shape, form);
++}
++
++fn splitDownFrom(c: *const Ctx, l: *const Layer, R: usize, h_all: u64, codes: ?Codes, plan: u64, y: u64, force_shape: ?u32, form: Form) !void {
 +    if (R == 0) return;
 +    const E = &l.experts;
 +    try splitCheck(c, E);
@@ -16419,8 +17172,25 @@ index 0000000000000000000000000000000000000000..fd6bc85d9a21775263684ef98a34ca4f
 +    var prof = try Prof.init(c);
 +    defer prof.deinit();
 +    try prof.mark(c);
-+    // every route's act row from its W segments, quantized over the whole row
-+    try ckQuant(c, k.ck_quant[f], nv, h_all, routes, intermediate, seg, routes * seg, 0, 0, 0, aq, asc, aa);
++    if (codes) |cd| {
++        // the ranks' quantized segments, gathered, laid out as whole rows
++        if (cd.world != E.split) return error.BadMoeShape;
++        var a: cuda.launch.Args = .{};
++        a.add(cd.parts);
++        a.add(@as(i64, @intCast(codesSlot(nv, cd.world, routes))));
++        a.add(@as(i32, @intCast(cd.world)));
++        a.add(@as(i32, @intCast(routes)));
++        a.add(@as(i32, @intCast(if (nv) seg / 2 else seg)));
++        a.add(@as(i32, @intCast(if (nv) seg / 16 else seg / 32)));
++        a.add(if (nv) cd.amaxes else @as(u64, 0));
++        a.add(aq);
++        a.add(asc);
++        a.add(aa);
++        try launch(c, k.ck_codes_rows, .{ @intCast(routes), 1 }, 256, &a);
++    } else {
++        // every route's act row from its W segments, quantized over the whole row
++        try ckQuant(c, k.ck_quant[f], nv, h_all, routes, intermediate, seg, routes * seg, 0, 0, 0, aq, asc, aa);
++    }
 +    try prof.mark(c);
 +    const rcp2: f32 = if (nv) 1.0 / (1536.0 * E.den2) else 1;
 +    if (fold_in) |fd| {
@@ -16761,10 +17531,10 @@ index 0000000000000000000000000000000000000000..fd6bc85d9a21775263684ef98a34ca4f
 +}
 diff --git a/zig/src/families/inkling2/cuda_moe_main.zig b/zig/src/families/inkling2/cuda_moe_main.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..17a1eab1607e5c51eb8136ada9e35494753f39a9
+index 0000000000000000000000000000000000000000..6135749828d41b2a64980f3350e5d44e1b73d8bc
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_moe_main.zig
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,609 @@
 +//! tf-inkling2-moe: G-moe's two ops (moe.route, moe.experts; cuda_moe.zig) alone on one layer's real weights and
 +//! any number of input rows, at several forward sizes. It checks that a row's bits do not depend on how many rows
 +//! a call holds (a decode row, 8- and 16-row windows, a whole 2,048-row prompt chunk) or on the kernels' row
@@ -16818,6 +17588,8 @@ index 0000000000000000000000000000000000000000..17a1eab1607e5c51eb8136ada9e35494
 +    \\                    each in turn, alternating within every repeat
 +    \\  --split W         split experts over W virtual ranks (checkpoint mode; every rank's slice loaded)
 +    \\  --only R          with --split: only rank R's slice, run as every virtual rank (its time; y not the layer's)
++    \\  --codes 1         with --split (every rank): MoE-A as codes (cuda_moe.zig splitAmax, splitQuant, splitDownCodes;
++    \\                    TF_INK2_XCODES): y must be bit-equal to the bf16 gather's (--against its run)
 +    \\  --rows N          the input's first N rows (default all)
 +    \\  --fed 0           ignore the input's torch routes (no y_fed pass)
 +    \\  --against FILE    compare y (and y_fed) row by row with FILE's (another run's output), bit for bit
@@ -16849,6 +17621,8 @@ index 0000000000000000000000000000000000000000..17a1eab1607e5c51eb8136ada9e35494
 +    only: ?u32 = null,
 +    /// --k1 1: the split experts' K1 forms; 2 (both): each configuration also in K1's forms
 +    k1: u8 = 0,
++    /// --split: MoE-A as codes
++    codes: bool = false,
 +    /// the input's first rows (null: all)
 +    rows: ?usize = null,
 +    /// run the input's torch routes too when it has them
@@ -16898,6 +17672,8 @@ index 0000000000000000000000000000000000000000..17a1eab1607e5c51eb8136ada9e35494
 +            o.k1 = if (std.mem.eql(u8, v, "both")) 2 else if (std.mem.eql(u8, v, "1")) 1 else if (std.mem.eql(u8, v, "0")) 0 else return error.BadK1;
 +        } else if (std.mem.eql(u8, k, "--only")) {
 +            o.only = try std.fmt.parseInt(u32, v, 10);
++        } else if (std.mem.eql(u8, k, "--codes")) {
++            o.codes = std.mem.eql(u8, v, "1");
 +        } else if (std.mem.eql(u8, k, "--fed")) {
 +            o.fed = !std.mem.eql(u8, v, "0");
 +        } else if (std.mem.eql(u8, k, "--rows")) {
@@ -16910,7 +17686,7 @@ index 0000000000000000000000000000000000000000..17a1eab1607e5c51eb8136ada9e35494
 +            o.reps = @max(1, try std.fmt.parseInt(usize, v, 10));
 +        } else return null;
 +    }
-+    if (i != args.len or o.layer == null or o.rank >= o.world or (o.only != null and (o.split < 2 or o.only.? >= o.split or o.slowest or o.against != null)) or o.split == 1 or (o.split > 1 and o.world != 1) or (o.slowest and o.split == 0 and (o.world == 1 or o.rank != 0))) return null;
++    if (i != args.len or o.layer == null or o.rank >= o.world or (o.only != null and (o.split < 2 or o.only.? >= o.split or o.slowest or o.against != null)) or o.split == 1 or (o.split > 1 and o.world != 1) or (o.codes and (o.split < 2 or o.only != null)) or (o.slowest and o.split == 0 and (o.world == 1 or o.rank != 0))) return null;
 +    return o;
 +}
 +
@@ -17093,6 +17869,11 @@ index 0000000000000000000000000000000000000000..17a1eab1607e5c51eb8136ada9e35494
 +            x.* = own.items[own.items.len - 1].ptr;
 +        }
 +        sp = .{ .world = nranks, .split = o.split > 1, .layers = split_layers[0..nranks], .h = sb[0], .y = sb[1], .plan = sb[2], .plan_bytes = if (o.split > 1) moe.splitPlanBytes(N) else 0, .y_rerun = sb[3], .one = one_rank };
++        if (o.codes) {
++            try own.ensureUnusedCapacity(a, 1); // the list's slot first: a failed append cannot lose the buffer
++            own.appendAssumeCapacity(try cuda.DeviceBuffer.alloc(&driver, nranks * (moe.codesSlot(false, nranks, N * K8) + N * K8 * 4)));
++            sp.?.codes = own.items[own.items.len - 1].ptr;
++        }
 +    }
 +    var ev2 = try cuda.Event.init(&driver, true);
 +    defer ev2.deinit();
@@ -17236,6 +18017,8 @@ index 0000000000000000000000000000000000000000..17a1eab1607e5c51eb8136ada9e35494
 +    plan_bytes: usize = 0,
 +    /// the timing pass's columns (its result is not the one compared)
 +    y_rerun: u64 = 0,
++    /// --codes: MoE-A as codes: the gather's slots [W][codesSlot] (shared, as h), then every rank's amax [W][R * 8]
++    codes: u64 = 0,
 +    /// --only: one rank's slice as every rank; only virtual rank 0 runs, once, between the events (its weights cold,
 +    /// as in a decode step); the call's h ([W][R * 8][I/W]) and y ([W][R][H/W]) are zeroed first, so y (not the
 +    /// layer's) still has a row's bits fixed
@@ -17299,7 +18082,9 @@ index 0000000000000000000000000000000000000000..17a1eab1607e5c51eb8136ada9e35494
 +        c.scratch.reset();
 +        try moe.splitUp(c, lr, m, ids, w, s.h + r * R * K8 * seg * 2, s.plan + r * s.plan_bytes, force, form);
 +    }
-+    for (s.layers, 0..) |lr, r| {
++    if (s.codes != 0) {
++        try codesPass(c, s, R, force, form);
++    } else for (s.layers, 0..) |lr, r| {
 +        c.scratch.reset();
 +        try moe.splitDown(c, lr, R, s.h, s.plan + r * s.plan_bytes, s.y + r * R * (H / s.world) * 2, force, form);
 +    }
@@ -17311,7 +18096,7 @@ index 0000000000000000000000000000000000000000..17a1eab1607e5c51eb8136ada9e35494
 +        try ev[0].record(c.stream);
 +        try moe.splitUp(c, lr, m, ids, w, s.h + r * R * K8 * seg * 2, s.plan + r * s.plan_bytes, force, form);
 +        c.scratch.reset();
-+        try moe.splitDown(c, lr, R, s.h, s.plan + r * s.plan_bytes, s.y + r * R * (H / s.world) * 2, force, form);
++        if (s.codes != 0) try codesRank(c, s, R, r, force, form) else try moe.splitDown(c, lr, R, s.h, s.plan + r * s.plan_bytes, s.y + r * R * (H / s.world) * 2, force, form);
 +        try moe.splitColumns(c, s.y, s.world, Mat.of(s.y_rerun, R, H, .bf16));
 +        try ev[1].record(c.stream);
 +        const t = try since(ev);
@@ -17319,6 +18104,37 @@ index 0000000000000000000000000000000000000000..17a1eab1607e5c51eb8136ada9e35494
 +        out[1] = @max(out[1], t);
 +    }
 +    return out;
++}
++
++/// --codes: after every rank's splitUp, MoE-A as codes over the virtual ranks (the shared buffers stand for the
++/// gathers): each rank's segment amax, its quantized slot, then each rank's down pass from the codes.
++fn codesPass(c: *const ic.ops.Ctx, s: Virt, R: usize, force: ?u32, form: moe.Form) !void {
++    const W = s.world;
++    const seg = moe.intermediate / W;
++    const routes = R * K8;
++    const amaxes = s.codes + W * moe.codesSlot(false, W, routes);
++    for (s.layers, 0..) |lr, r| try moe.splitAmax(c, lr, R, W, s.h + r * routes * seg * 2, amaxes + r * routes * 4);
++    for (s.layers, 0..) |lr, r| {
++        const nv = lr.experts.format == .nvfp4;
++        try moe.splitQuant(c, lr, R, W, s.h + r * routes * seg * 2, amaxes, s.codes + r * moe.codesSlot(nv, W, routes));
++    }
++    for (s.layers, 0..) |lr, r| {
++        c.scratch.reset();
++        try moe.splitDownCodes(c, lr, R, .{ .parts = s.codes, .world = W, .amaxes = amaxes }, s.plan + r * s.plan_bytes, s.y + r * R * (H / W) * 2, force, form);
++    }
++}
++
++/// --codes, one rank's own work after codesPass (the other ranks' slots and amaxes still in the shared buffers).
++fn codesRank(c: *const ic.ops.Ctx, s: Virt, R: usize, r: usize, force: ?u32, form: moe.Form) !void {
++    const W = s.world;
++    const routes = R * K8;
++    const lr = s.layers[r];
++    const nv = lr.experts.format == .nvfp4;
++    const amaxes = s.codes + W * moe.codesSlot(false, W, routes);
++    const h = s.h + r * routes * (moe.intermediate / W) * 2;
++    try moe.splitAmax(c, lr, R, W, h, amaxes + r * routes * 4);
++    try moe.splitQuant(c, lr, R, W, h, amaxes, s.codes + r * moe.codesSlot(nv, W, routes));
++    try moe.splitDownCodes(c, lr, R, .{ .parts = s.codes, .world = W, .amaxes = amaxes }, s.plan + r * s.plan_bytes, s.y + r * R * (H / W) * 2, force, form);
 +}
 +
 +fn secs(ns: i96) f64 {

@@ -1,36 +1,36 @@
-From a13309fc4346d68516c3164627c9bc62f38dcf99 Mon Sep 17 00:00:00 2001
+From dede78b048f25ab65c75b0e909aa090807f513b9 Mon Sep 17 00:00:00 2001
 From: Scott Biggart <297695+swbiggart@users.noreply.github.com>
-Date: Tue, 17 Nov 2026 19:30:00 -0800
+Date: Fri, 20 Nov 2026 19:30:00 -0800
 Subject: [PATCH 3/8] inkling2: batching: lanes core for several streams a
  decode step and interleaved prefill
 
 22 files (5 new, 17 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
-Part of the engine changes behind Inkling-2-Small TP4 v0.2 (github.com/swbiggart/inkling2-sparks).
+Part of the engine changes behind Inkling-2-Small TP4 v0.3 (github.com/swbiggart/inkling2-sparks).
 Apply the whole series in order with git am (scripts/build-engine.sh does); only the full series is built and gated.
 ---
  zig/src/core/engine_stats.zig                 |    8 +
- zig/src/core/lane_host.zig                    |    9 +-
+ zig/src/core/lane_host.zig                    |   23 +-
  zig/src/core/lanes/allocate.zig               |   55 +-
- zig/src/core/lanes/backend.zig                |   11 +
+ zig/src/core/lanes/backend.zig                |   15 +
  zig/src/core/lanes/config.zig                 |   24 +
- zig/src/core/lanes/depth_shared_test.zig      |  257 +++
- zig/src/core/lanes/engine.zig                 |   76 +-
+ zig/src/core/lanes/depth_shared_test.zig      |  257 ++
+ zig/src/core/lanes/engine.zig                 |   78 +-
  zig/src/core/lanes/engine_test.zig            |   48 +-
- zig/src/core/lanes/fake.zig                   |   24 +-
+ zig/src/core/lanes/fake.zig                   |   32 +-
  zig/src/core/lanes/grammar.zig                |   11 +
  zig/src/core/lanes/grammar_parallel.zig       |    7 +-
  zig/src/core/lanes/grammar_window.zig         |   10 +
  zig/src/core/lanes/lanes.zig                  |    2 +
- zig/src/core/lanes/lone_cut_test.zig          |  292 +++
+ zig/src/core/lanes/lone_cut_test.zig          |  292 ++
  zig/src/core/lanes/open.zig                   |    2 +
  zig/src/core/lanes/open_first.zig             |    2 +
  zig/src/core/lanes/pieces.zig                 |    4 +
- zig/src/core/lanes/shared_cut_test.zig        |  415 ++++
- zig/src/core/lanes/stream.zig                 |   14 +
- zig/src/core/lanes/windows.zig                |   57 +-
- .../families/inkling2/cuda_batch_check.zig    |  808 +++++++
- zig/src/families/inkling2/cuda_lanes.zig      | 1878 +++++++++++++++++
- 22 files changed, 3991 insertions(+), 23 deletions(-)
+ zig/src/core/lanes/shared_cut_test.zig        |  609 ++++
+ zig/src/core/lanes/stream.zig                 |   20 +
+ zig/src/core/lanes/windows.zig                |   58 +-
+ .../families/inkling2/cuda_batch_check.zig    |  808 +++++
+ zig/src/families/inkling2/cuda_lanes.zig      | 2712 +++++++++++++++++
+ 22 files changed, 5054 insertions(+), 23 deletions(-)
  create mode 100644 zig/src/core/lanes/depth_shared_test.zig
  create mode 100644 zig/src/core/lanes/lone_cut_test.zig
  create mode 100644 zig/src/core/lanes/shared_cut_test.zig
@@ -57,7 +57,7 @@ index 5bc253e0a5322b9e6f6dfd1f4a500c3dcc114492..a683b798f71b61297def897de2294a63
      telemetry_json: []const u8 = "",
  };
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index d883f1d8acbb0231ead6bd09ed36bfb3ab2875b3..1e449bc86f5edd434e1d2911e1bd4267c5d0b0f5 100644
+index d883f1d8acbb0231ead6bd09ed36bfb3ab2875b3..934379f8d0f278ddca75af0d6ccfd98b171a7812 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
 @@ -68,6 +68,7 @@ pub const LaneHost = struct {
@@ -90,6 +90,34 @@ index d883f1d8acbb0231ead6bd09ed36bfb3ab2875b3..1e449bc86f5edd434e1d2911e1bd4267
      pub fn lock(h: *LaneHost) void {
          h.mutex.lockUncancelable(h.io);
      }
+@@ -504,6 +511,19 @@ pub const LaneHost = struct {
+         };
+     }
+ 
++    /// The engine loop's idle turn for the backend's own idle work (under the lock): when it has some and nothing
++    /// waits, the lock let go and one unit done; true if so (the loop looks again before the next).
++    fn backendIdle(h: *LaneHost) bool {
++        const vt = h.core.backend.vtable;
++        const has = vt.idle_pending orelse return false;
++        const work = vt.idle orelse return false;
++        if (h.queued.items.len > 0 or h.admitted.items.len > 0 or h.cancels.items.len > 0 or h.closing) return false;
++        if (!has(h.core.backend.ptr)) return false;
++        h.unlock();
++        work(h.core.backend.ptr);
++        return true;
++    }
++
+     fn run(h: *LaneHost) void {
+         defer scoring.close(h);
+         if (!@import("lane_thread.zig").start(h)) return;
+@@ -549,6 +569,7 @@ pub const LaneHost = struct {
+                 }
+                 activity.end();
+                 if (rows_host.idle(h)) continue;
++                if (backendIdle(h)) continue;
+                 if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes or admit.holds(h)))
+                     h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
+                 h.unlock();
 diff --git a/zig/src/core/lanes/allocate.zig b/zig/src/core/lanes/allocate.zig
 index 99426b5a0f1d3355f7e8ace24a06b475f0e08bbe..3968b8498b23a5e599e1c559961dffab240c46d1 100644
 --- a/zig/src/core/lanes/allocate.zig
@@ -189,7 +217,7 @@ index 99426b5a0f1d3355f7e8ace24a06b475f0e08bbe..3968b8498b23a5e599e1c559961dffab
      const gpa = std.testing.allocator;
      const empty: Table = .{};
 diff --git a/zig/src/core/lanes/backend.zig b/zig/src/core/lanes/backend.zig
-index 48e2c8ffa23ead69a9f04dc0792771fc6d038120..3d878079211bf9e4906617d5a6e5eb8c74bcc0b6 100644
+index 48e2c8ffa23ead69a9f04dc0792771fc6d038120..493191e55e80fb5ad641556d3875bd7039664ed6 100644
 --- a/zig/src/core/lanes/backend.zig
 +++ b/zig/src/core/lanes/backend.zig
 @@ -18,6 +18,7 @@ pub const Window = struct {
@@ -224,6 +252,17 @@ index 48e2c8ffa23ead69a9f04dc0792771fc6d038120..3d878079211bf9e4906617d5a6e5eb8c
          /// A tree head's held drafts as host tokens and parents (gpa-owned), read where Python reads them.
          tree: ?*const fn (ptr: *anyopaque, s: *Stream, gpa: std.mem.Allocator) anyerror!?Held = null,
          /// The head's best tokens and probabilities at each level it drafted for the stream (waits for the drafts).
+@@ -145,6 +156,10 @@ pub const Backend = struct {
+         reports_fill: bool = false,
+         /// The stream left the rounds: free its caches and held drafts.
+         release: *const fn (ptr: *anyopaque, s: *Stream) void,
++        /// Idle work the backend does in units while no stream is live and nothing waits (a family's write-behind):
++        /// `idle_pending` says whether any is left (cheap, under the host's lock), `idle` does one unit (unlocked).
++        idle_pending: ?*const fn (ptr: *anyopaque) bool = null,
++        idle: ?*const fn (ptr: *anyopaque) void = null,
+         /// A prompt in pieces between rounds (`Rounds`) instead of `prefill`: begin, pieces, finish; null: whole only.
+         begin: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!Begun = null,
+         piece: ?*const fn (ptr: *anyopaque, s: *Stream, start: u64, end: u64, save: bool) anyerror!void = null,
 diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
 index 3d4470c510f263c030dd36b9b0d4a0dc9f9cc22e..6690a58e933e1faf0e799e3ecc8b1e87c53e3d05 100644
 --- a/zig/src/core/lanes/config.zig
@@ -567,7 +606,7 @@ index 0000000000000000000000000000000000000000..535464face95481267380b700e26fc54
 +    for (0..7) |_| try std.testing.expectEqual(@as(i64, 0), try r.depth(w));
 +}
 diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
-index 018ae4a72ebcde583ef11ce9d3f5625a4a96bb5e..9b405fe90996a5f737cdd5ec0e1aca3c6dcec58d 100644
+index 018ae4a72ebcde583ef11ce9d3f5625a4a96bb5e..4476be575be209d7bcfce4fe3c15b4f89de7e698 100644
 --- a/zig/src/core/lanes/engine.zig
 +++ b/zig/src/core/lanes/engine.zig
 @@ -47,6 +47,8 @@ pub const Engine = struct {
@@ -684,7 +723,7 @@ index 018ae4a72ebcde583ef11ce9d3f5625a4a96bb5e..9b405fe90996a5f737cdd5ec0e1aca3c
          }
          if (e.cfg.root_copies) for (heads.items, budgets) |i, *d| {
              if (plans[i].stream.next) |held| if (held.count == 0) {
-@@ -319,11 +344,28 @@ pub const Engine = struct {
+@@ -319,11 +344,30 @@ pub const Engine = struct {
              for (budgets) |d| steps = if (e.cfg.draft_streams and depth.pricedBatched()) @max(steps, d - 1) else steps + @max(0, d - 1);
              const ms = e.clock.elapsedMs(.overhead) - e.cfg.draft_step_ms * @as(f64, @floatFromInt(steps));
              try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(plans.len)), f("rows", int(total)), f("ms", ev.bits(ms)) });
@@ -705,8 +744,10 @@ index 018ae4a72ebcde583ef11ce9d3f5625a4a96bb5e..9b405fe90996a5f737cdd5ec0e1aca3c
  
 +    /// shared_cut `deepen`: a drafting greedy stream of a shared round at or below depth_from drafts its whole block (as
 +    /// deep as its room lets), and the next round's allocation verifies the prefix its chances pay for; else the budget.
++    /// A stream whose chances the backend never reads (`Stream.no_chances`) keeps its budget: nothing could price the
++    /// deeper drafts (the same streams `windows.sharedChances` asks).
 +    fn deepened(e: *const Engine, s: *const Stream, d: i64) i64 {
-+        if (e.cfg.shared_cut != .deepen or !e.shared_open or d <= 0 or s.sampling != null or s.grammar != null) return d;
++        if (e.cfg.shared_cut != .deepen or !e.shared_open or d <= 0 or s.sampling != null or s.grammar != null or s.no_chances) return d;
 +        if (e.cfg.context_costs.len > 0 and s.cache_len > e.cfg.depth_from) return d; // past it the depth rule's ramp holds
 +        return @max(d, @min(@as(i64, e.cfg.most_drafts), s.draftRoom() - 1));
 +    }
@@ -714,7 +755,7 @@ index 018ae4a72ebcde583ef11ce9d3f5625a4a96bb5e..9b405fe90996a5f737cdd5ec0e1aca3c
      /// Commit the target-sampled path (after the thinking budget's cut), each token with its path row's logprob row.
      fn conclude(e: *Engine, s: *Stream, p: Plan, sampled: []const u32, rows_lp: []const LogRow, tokens: []const u32, parents: []const i32, positions: []const u64) !Outcome {
          const a = e.arena.allocator();
-@@ -363,7 +405,15 @@ pub const Engine = struct {
+@@ -363,7 +407,15 @@ pub const Engine = struct {
                      const chain = if (p.branch_from > 0) ds[0..p.branch_from] else ds[0..own_end];
                      var chain_kept: usize = 0;
                      for (path[1..]) |r| chain_kept += @intFromBool((p.branch_from == 0 or r < p.branch_from) and r < own_end);
@@ -731,7 +772,7 @@ index 018ae4a72ebcde583ef11ce9d3f5625a4a96bb5e..9b405fe90996a5f737cdd5ec0e1aca3c
                  }
                  var kept_branch: u64 = 0; // the context's graft rows kept, then Recall's
                  var kept_recall: u64 = 0;
-@@ -395,6 +445,14 @@ pub const Engine = struct {
+@@ -395,6 +447,14 @@ pub const Engine = struct {
                  }
              }
              if (s.recall) |r| if (p.kind != .copy) r.noteHead(path.len); // its own rounds: the bar a copy must beat
@@ -746,7 +787,7 @@ index 018ae4a72ebcde583ef11ce9d3f5625a4a96bb5e..9b405fe90996a5f737cdd5ec0e1aca3c
          }
          if (e.trim) |t| if (p.kind != .forced) {
              const chain = parents.len == 0 or accept.isChain(parents);
-@@ -443,6 +501,10 @@ pub const Engine = struct {
+@@ -443,6 +503,10 @@ pub const Engine = struct {
      fn draftLate(e: *Engine, s: *Stream, start: u64, follow: []const u32, path: []const u32, budget: ?i64) !void {
          var w = win.who(s);
          const d: u32 = @intCast(try e.rule.headDepth(&w, budget, win.probe(e)));
@@ -829,10 +870,21 @@ index 6c731c519eb277e51ef37329352cf1b86daa1fc6..b6628518aedcad703676041985c496dd
      for ([_]bool{ true, false }) |lone_copies| {
          var cfg = try Config.init(gpa, .{ .exact_width = 16, .mtp = true, .speculate = true, .drafts = 4, .lone_copies = lone_copies }, 16, 15);
 diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
-index 4f68632ce7032b3db5883b9b309363de0b425881..90a310bc65c19c1ae2536d85e5134e68166b8624 100644
+index 4f68632ce7032b3db5883b9b309363de0b425881..34cc8d4d34d3c3cb86f219a878f3a33d967dad46 100644
 --- a/zig/src/core/lanes/fake.zig
 +++ b/zig/src/core/lanes/fake.zig
-@@ -92,6 +92,9 @@ pub const Fake = struct {
+@@ -69,6 +69,10 @@ pub const Fake = struct {
+     many_streams: usize = 0, // streams those calls prefilled
+     prefill_hook: ?*const fn (ctx: *anyopaque, s: *Stream, chunk: usize) void = null,
+     prefill_hook_ctx: ?*anyopaque = null,
++    // a stepped prompt call that runs other work than its rows first (an image's tower unit): its ns when it does, and
++    // the call returns with no rows filled
++    side_hook: ?*const fn (ctx: *anyopaque, s: *Stream, max_rows: u32) ?u64 = null,
++    side_hook_ctx: ?*anyopaque = null,
+     release_hook: ?*const fn (ctx: *anyopaque, s: *Stream) void = null, // after a stream's release, as a backend ending another
+     release_hook_ctx: ?*anyopaque = null,
+     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
+@@ -92,6 +96,9 @@ pub const Fake = struct {
      image_rows: usize = 0, // image rows fed (`image_words`): the rows a tower had to make
      gpu_charge: ?f64 = null, // each verify and step charges its streams this many GPU seconds, as a timed backend does
      head_accepts: ?usize = null, // head drafts a round right before one wrong (null: one in five wrong)
@@ -842,7 +894,7 @@ index 4f68632ce7032b3db5883b9b309363de0b425881..90a310bc65c19c1ae2536d85e5134e68
  
      pub fn deinit(x: *Fake) void {
          var it = x.lanes.valueIterator();
-@@ -108,7 +111,7 @@ pub const Fake = struct {
+@@ -108,7 +115,7 @@ pub const Fake = struct {
      }
  
      pub fn backend(x: *Fake) be.Backend {
@@ -851,7 +903,18 @@ index 4f68632ce7032b3db5883b9b309363de0b425881..90a310bc65c19c1ae2536d85e5134e68
      }
  
      /// The same target taking several prompts in one pass (`prefill_many`).
-@@ -456,6 +459,19 @@ pub const Fake = struct {
+@@ -307,6 +314,10 @@ pub const Fake = struct {
+         x.prefill_count += 1;
+         if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, l.filled);
+         if (s.isCancelled()) return error.Cancelled;
++        if (x.side_hook) |hook| if (hook(x.side_hook_ctx.?, s, max_rows)) |ns| {
++            s.side_ns = ns;
++            return false;
++        };
+         l.filled += 1;
+         const chunks: usize = @intCast(chunksFor(s.prompt_len, x.prefill_chunks, max_rows));
+         const at = @min(@as(u64, @intCast(s.prompt_len)), s.prompt_len * l.filled / @as(u64, @intCast(chunks)));
+@@ -456,6 +467,19 @@ pub const Fake = struct {
              @memcpy(o.drafts, l.rows.items[1..]);
              const parents = if (w.parents) |ps| try x.gpa.dupe(i32, ps) else try accept.rowParents(x.gpa, l.rows.items.len, null);
              defer x.gpa.free(parents);
@@ -871,7 +934,7 @@ index 4f68632ce7032b3db5883b9b309363de0b425881..90a310bc65c19c1ae2536d85e5134e68
              for (0..l.rows.items.len) |r| {
                  // each row reads the cache and its own path from the pending row
                  l.history.shrinkRetainingCapacity(l.base);
-@@ -466,9 +482,9 @@ pub const Fake = struct {
+@@ -466,9 +490,9 @@ pub const Fake = struct {
                  try l.history.appendSlice(x.gpa, path.items);
                  if (w.positions[r] != l.history.items.len) return error.PositionMismatch;
                  o.sampled[r] = x.targetNext(l.history.items, w.stream.sampling, w.positions[r]);
@@ -1326,10 +1389,10 @@ index 72210cc19f421179f73bbd92b3138be8ec7d4d47..ef721a604c494b414ea610c62cd0fee8
      try e.live.append(e.gpa, s);
 diff --git a/zig/src/core/lanes/shared_cut_test.zig b/zig/src/core/lanes/shared_cut_test.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..92b665f5aa5443be82303d731824298d81d45d4e
+index 0000000000000000000000000000000000000000..6007e672241be02133b15edfcd6fba60fce5bd3d
 --- /dev/null
 +++ b/zig/src/core/lanes/shared_cut_test.zig
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,609 @@
 +//! shared_cut (windows.zig sharedChances, Engine.deepened): a shared round's greedy streams' held drafts priced by this
 +//! round's chances (Backend.probabilities) in place of the learned rates; `deepen` drafts each drafting greedy stream's
 +//! whole block. Off: no chances asked; lone, sampled and grammar streams never ask; every stream's tokens are the same.
@@ -1341,17 +1404,28 @@ index 0000000000000000000000000000000000000000..92b665f5aa5443be82303d731824298d
 +const t = std.testing;
 +const a = t.allocator;
 +
-+var hook: struct { chance: f64 = 0.5, calls: usize = 0, sampled_calls: usize = 0, lone_calls: usize = 0, wide_calls: usize = 0, deny_after: ?usize = null, engine: ?*lanes.Engine = null } = .{};
++var hook: struct { chance: f64 = 0.5, calls: usize = 0, sampled_calls: usize = 0, lone_calls: usize = 0, wide_calls: usize = 0, no_chance_calls: usize = 0, grammar_calls: usize = 0, deny_after: ?usize = null, engine: ?*lanes.Engine = null, streams: ?[]const lanes.Stream = null, per: ?[6]f64 = null } = .{};
++
++/// The run's stream index of `s` (null: not one of the run's streams).
++fn indexOf(s: *const lanes.Stream) ?usize {
++    const all = hook.streams orelse return null;
++    for (all, 0..) |*x, i| if (x == s) return i;
++    return null;
++}
 +
 +fn chances(_: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
 +    hook.calls += 1;
 +    if (s.sampling != null) hook.sampled_calls += 1;
++    if (s.no_chances) hook.no_chance_calls += 1;
++    if (s.grammar != null) hook.grammar_calls += 1;
 +    if (hook.engine) |e| hook.lone_calls += @intFromBool(e.alone);
 +    if (hook.engine) |e| hook.wide_calls += @intFromBool(e.activeCount() > 4);
 +    if (hook.deny_after) |n| if (hook.calls > n) return false; // the chances lost (as a prefill's flush drops them)
++    // each stream its own chance when the run gives them (`per`), else one for all
++    const chance = if (hook.per) |per| per[indexOf(s).?] else hook.chance;
 +    var product: f64 = 1;
 +    for (out) |*o| {
-+        product *= hook.chance;
++        product *= chance;
 +        o.* = product;
 +    }
 +    return true;
@@ -1366,14 +1440,89 @@ index 0000000000000000000000000000000000000000..92b665f5aa5443be82303d731824298d
 +var timed_for_test = false;
 +/// Windows of rounds that do not price by chances (lone, or 5 or more live streams) and how many verified more held
 +/// drafts than the stream's budget (`Stream.asked`): what v0.2 would not have verified there.
-+var watch: struct { orig: ?*const fn (ptr: *anyopaque, windows: []const lanes.backend.Window, out: []lanes.backend.Verified) anyerror!void = null, checked: usize = 0, past_budget: usize = 0, checked_unpriced: usize = 0, past_budget_unpriced: usize = 0 } = .{};
++var watch: struct { orig: ?*const fn (ptr: *anyopaque, windows: []const lanes.backend.Window, out: []lanes.backend.Verified) anyerror!void = null, checked: usize = 0, past_budget: usize = 0, checked_unpriced: usize = 0, past_budget_unpriced: usize = 0, no_chance_windows: usize = 0, no_chance_deepened: usize = 0, grammar_deepened: usize = 0, grammar_windows: usize = 0, open: [5][6]Grants = @splat(@splat(.{})) } = .{};
++/// A stream's windows in chance-priced rounds of one live count: how many, how many verified more held drafts than its
++/// budget, and the held drafts verified in all.
++const Grants = struct { windows: usize = 0, past_budget: usize = 0, held: usize = 0 };
 +/// From this many chance reads on, every read gives none (null: never).
 +var deny_for_test: ?usize = null;
++/// The stream whose chances the backend never reads (Stream.no_chances: TF_INK2_DRAFT_CUT=ab's whole arm; null: none).
++var no_chances_for_test: ?usize = null;
++/// The stream with a grammar (null: none): it allows `spell_want` in order, then 96, its stop token.
++var grammar_for_test: ?usize = null;
++/// Each stream's chance of its drafts landing (null: the run's one chance for all).
++var per_for_test: ?[6]f64 = null;
++/// The stream that ends early (`short_for_test`'s reply length; 1 unless set).
++var short_at_for_test: usize = 1;
++
++const spell_want = [_]u32{ 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60 };
++
++/// A test grammar: `spell_want` in order, then 96; its own drafts are what is left of it.
++const Spell = struct {
++    at: usize = 0,
++    done: bool = false,
++
++    fn rules(sp: *Spell) lanes.grammar.Rules {
++        return .{ .ptr = sp, .vtable = &.{ .accept = accept, .rollback = rollback, .terminated = terminated, .fill = fill, .drafts = drafts, .free = freeRules } };
++    }
++    fn cast(ptr: *anyopaque) *Spell {
++        return @ptrCast(@alignCast(ptr));
++    }
++    fn allows(sp: *const Spell, x: u32) bool {
++        if (sp.done) return false;
++        return if (sp.at == spell_want.len) x == 96 else x == spell_want[sp.at];
++    }
++    fn accept(ptr: *anyopaque, x: u32) anyerror!bool {
++        const sp = cast(ptr);
++        if (!sp.allows(x)) return false;
++        if (sp.at == spell_want.len) sp.done = true else sp.at += 1;
++        return true;
++    }
++    fn rollback(ptr: *anyopaque, n: usize) anyerror!void {
++        const sp = cast(ptr);
++        for (0..n) |_| {
++            if (sp.done) sp.done = false else sp.at -= 1;
++        }
++    }
++    fn terminated(ptr: *anyopaque) bool {
++        return cast(ptr).done;
++    }
++    fn fill(ptr: *anyopaque, words: []u32) anyerror!void {
++        const sp = cast(ptr);
++        @memset(words, 0);
++        for (0..fake.vocab) |x| if (sp.allows(@intCast(x))) {
++            words[x / 32] |= @as(u32, 1) << @intCast(x % 32);
++        };
++    }
++    fn drafts(ptr: *anyopaque, out: []u32) anyerror!usize {
++        const sp = cast(ptr);
++        if (sp.done) return 0;
++        const n = @min(out.len, spell_want.len - sp.at);
++        @memcpy(out[0..n], spell_want[sp.at..][0..n]);
++        return n;
++    }
++    fn freeRules(_: *anyopaque) void {}
++};
 +
 +fn verifyWatched(ptr: *anyopaque, windows: []const lanes.backend.Window, out: []lanes.backend.Verified) anyerror!void {
 +    if (hook.engine) |e| {
 +        const denied = hook.deny_after != null and hook.calls > hook.deny_after.?;
 +        for (windows) |w| {
++            if (w.stream.no_chances and w.held > 0) {
++                // a stream without chances: its block drafted to its budget only, and verified within it
++                watch.no_chance_windows += 1;
++                watch.no_chance_deepened += @intFromBool(w.stream.deepened or w.held > w.stream.asked);
++            }
++            if (w.stream.grammar != null) {
++                watch.grammar_windows += 1;
++                watch.grammar_deepened += @intFromBool(w.stream.deepened);
++            }
++            if (e.shared_open and e.live_streams < watch.open.len) if (indexOf(w.stream)) |i| {
++                const g = &watch.open[e.live_streams][i];
++                g.windows += 1;
++                g.past_budget += @intFromBool(w.held > w.stream.asked);
++                g.held += w.held;
++            };
 +            if (w.stream.asked == 0 or w.held == 0) continue;
 +            if (!e.shared_open) {
 +                watch.checked += 1;
@@ -1405,7 +1554,7 @@ index 0000000000000000000000000000000000000000..92b665f5aa5443be82303d731824298d
 +var turns_for_test: ?u32 = null;
 +
 +const prompts = [_][]const u32{ &.{ 3, 1, 4 }, &.{ 1, 5, 9 }, &.{ 2, 6, 5 }, &.{ 3, 5, 8 }, &.{ 9, 7, 9 }, &.{ 3, 2, 3 } };
-+const Run = struct { tokens: [6][]u32, record: [32]u8 = undefined, drafted: u64, rounds: u64, calls: usize, sampled_calls: usize, lone_calls: usize, wide_calls: usize = 0, rate: f64 = -1, prior: f64 = 0, plain_overheads: usize = 0 };
++const Run = struct { tokens: [6][]u32, record: [32]u8 = undefined, drafted: u64, rounds: u64, calls: usize, sampled_calls: usize, lone_calls: usize, wide_calls: usize = 0, no_chance_calls: usize = 0, grammar_calls: usize = 0, rate: f64 = -1, prior: f64 = 0, plain_overheads: usize = 0 };
 +
 +/// `count` streams together (stream `sampled_at` sampled), stepped until done, the fact `cut`, the hook's `chance`.
 +fn run(count: usize, cut: SharedCut, chance: f64, sampled_at: ?usize) !Run {
@@ -1443,9 +1592,12 @@ index 0000000000000000000000000000000000000000..92b665f5aa5443be82303d731824298d
 +    var clock: fake.FixedClock = .{};
 +    var e = lanes.Engine.init(a, &cfg, b, clock.clock());
 +    defer e.deinit();
-+    hook = .{ .chance = chance, .engine = &e, .deny_after = deny_for_test };
-+    defer hook.engine = null;
 +    var streams: [6]lanes.Stream = undefined;
++    hook = .{ .chance = chance, .engine = &e, .deny_after = deny_for_test, .streams = streams[0..count], .per = per_for_test };
++    defer hook.engine = null;
++    defer hook.streams = null;
++    var spell: Spell = .{};
++    var constraint: lanes.grammar.Constraint = .init(spell.rules(), (fake.vocab + 31) / 32, null);
 +    var log = lanes.events.Log.init(a);
 +    defer log.deinit();
 +    e.log = &log;
@@ -1453,9 +1605,11 @@ index 0000000000000000000000000000000000000000..92b665f5aa5443be82303d731824298d
 +    defer for (streams[0..made]) |*s| s.deinit(a);
 +    const joined = join_for_test != null;
 +    for (streams[0..count], prompts[0..count], 0..) |*s, p, i| {
-+        const max_new: u32 = if (i == 1 and short_for_test != null) short_for_test.? else 48;
-+        s.* = try lanes.Stream.init(a, .{ .id = "s", .prompt = p, .max_new = max_new, .sampling = if (sampled_at == i) .{ .seed = 11 } else null });
++        const max_new: u32 = if (i == short_at_for_test and short_for_test != null) short_for_test.? else 48;
++        const walked = grammar_for_test == i;
++        s.* = try lanes.Stream.init(a, .{ .id = "s", .prompt = p, .max_new = max_new, .sampling = if (sampled_at == i) .{ .seed = 11 } else null, .eos = if (walked) &.{96} else &.{}, .grammar = if (walked) &constraint else null });
 +        made += 1;
++        s.no_chances = no_chances_for_test == i;
 +        if (!(joined and i == count - 1)) try e.addStream(s);
 +    }
 +    var rate: f64 = -1; // stream 0's first-draft rate, last seen while it decodes
@@ -1466,7 +1620,7 @@ index 0000000000000000000000000000000000000000..92b665f5aa5443be82303d731824298d
 +        if (joined and steps == join_for_test.?) try e.addStream(&streams[count - 1]);
 +        if (streams[0].depth) |st| rate = st.p[0];
 +    }
-+    var out: Run = .{ .tokens = undefined, .drafted = e.drafted, .rounds = e.shared_rounds, .calls = hook.calls, .sampled_calls = hook.sampled_calls, .lone_calls = hook.lone_calls, .wide_calls = hook.wide_calls, .rate = rate, .prior = cfg.depth_prior[0], .plain_overheads = e.rule.plain_overhead.items.len };
++    var out: Run = .{ .tokens = undefined, .drafted = e.drafted, .rounds = e.shared_rounds, .calls = hook.calls, .sampled_calls = hook.sampled_calls, .lone_calls = hook.lone_calls, .wide_calls = hook.wide_calls, .no_chance_calls = hook.no_chance_calls, .grammar_calls = hook.grammar_calls, .rate = rate, .prior = cfg.depth_prior[0], .plain_overheads = e.rule.plain_overhead.items.len };
 +    for (&out.tokens, 0..) |*x, i| x.* = try a.dupe(u32, if (i < count) streams[i].emitted() else &.{});
 +    var hash = std.crypto.hash.sha2.Sha256.init(.{});
 +    for (0..log.events.items.len) |i| {
@@ -1503,11 +1657,14 @@ index 0000000000000000000000000000000000000000..92b665f5aa5443be82303d731824298d
 +    const low = try run(4, .cut, 0.02, null);
 +    defer free(low);
 +    try t.expect(low.drafted < off.drafted);
++    // short budgets (one or two drafts) and confident chances: deepening must verify more drafts than the cut alone
++    low_prior_for_test = true;
++    defer low_prior_for_test = false;
 +    const high = try run(4, .deepen, 0.999, null);
 +    defer free(high);
 +    const high_cut = try run(4, .cut, 0.999, null);
 +    defer free(high_cut);
-+    try t.expect(high.drafted >= high_cut.drafted);
++    try t.expect(high.drafted > high_cut.drafted);
 +}
 +
 +test "shared cut: rates learn only from chains that verified the rule's depth (cut chains feed nothing)" {
@@ -1745,8 +1902,108 @@ index 0000000000000000000000000000000000000000..92b665f5aa5443be82303d731824298d
 +    try t.expect(told.open > 0 and told.closed > 0); // shared rounds of 2 open, lone rounds after the peer ended closed
 +    try t.expectEqual(@as(usize, 0), told.lone_open);
 +}
++
++test "shared cut: a stream whose chances are never read (an A/B arm without them) is neither deepened nor chance-priced" {
++    // TF_INK2_DRAFT_CUT=ab's whole arm: the backend reads no chances for the stream (cuda_lanes.zig probabilitiesFn), so
++    // drafting it past its budget (deepen) would only make drafts nothing can price; its rounds are v0.2's, the other
++    // streams' still chance-priced and deepened. Short budgets and confident chances: deepening would show.
++    low_prior_for_test = true;
++    defer low_prior_for_test = false;
++    no_chances_for_test = 1;
++    defer no_chances_for_test = null;
++    const off = try run(3, .off, 0.999, null);
++    defer free(off);
++    const on = try run(3, .deepen, 0.999, null);
++    defer free(on);
++    try t.expect(on.calls > 0); // the other two streams were priced by their chances
++    try t.expect(watch.no_chance_windows > 0); // the stream drafted and verified in the shared rounds
++    try t.expectEqual(@as(usize, 0), on.no_chance_calls);
++    try t.expectEqual(@as(usize, 0), watch.no_chance_deepened);
++    for (off.tokens, on.tokens) |x, y| try t.expectEqualSlices(u32, x, y);
++    // the same run with every stream's chances read: the confident stream is deepened (the check above can fail)
++    no_chances_for_test = null;
++    const all = try run(3, .deepen, 0.999, null);
++    defer free(all);
++    try t.expect(all.drafted > on.drafted);
++}
++
++/// The grants of stream `i` in chance-priced rounds of `live` live streams (the last run's).
++fn grants(live: usize, i: usize) Grants {
++    return watch.open[live][i];
++}
++
++test "shared cut: each stream's grant follows its own chances, before and after an admission and a departure" {
++    // short budgets (low prior) so a grant past the budget is deepening's; stream 0's drafts land (0.999), the last
++    // stream's seldom (0.02): stream 0 verifies past its budget in chance-priced rounds, the unlikely one never does
++    // and verifies fewer drafts a window
++    low_prior_for_test = true;
++    defer low_prior_for_test = false;
++    defer per_for_test = null;
++    const Expect = struct {
++        fn split(live: usize, sure: usize, unlikely: usize) !void {
++            const s0 = grants(live, sure);
++            const s1 = grants(live, unlikely);
++            try t.expect(s0.windows > 0 and s1.windows > 0);
++            try t.expect(s0.past_budget > 0);
++            try t.expectEqual(@as(usize, 0), s1.past_budget);
++            try t.expect(s1.held * s0.windows < s0.held * s1.windows); // fewer held drafts a window
++        }
++    };
++    // two streams together
++    per_for_test = .{ 0.999, 0.02, 0.5, 0.5, 0.5, 0.5 };
++    {
++        const off = try run(2, .off, 0.5, null);
++        defer free(off);
++        const on = try run(2, .deepen, 0.5, null);
++        defer free(on);
++        try Expect.split(2, 0, 1);
++        for (off.tokens, on.tokens) |x, y| try t.expectEqualSlices(u32, x, y);
++    }
++    // an admission: a third stream (chances 0.5) joins after 6 steps; the split holds at 2 live and at 3
++    join_for_test = 6;
++    {
++        defer join_for_test = null;
++        const off = try run(3, .off, 0.5, null);
++        defer free(off);
++        const on = try run(3, .deepen, 0.5, null);
++        defer free(on);
++        try Expect.split(2, 0, 1);
++        try Expect.split(3, 0, 1);
++        for (off.tokens, on.tokens) |x, y| try t.expectEqualSlices(u32, x, y);
++    }
++    // a departure: of three streams the middle one (0.5) ends after 6 tokens; the split holds at 3 live and at 2
++    per_for_test = .{ 0.999, 0.5, 0.02, 0.5, 0.5, 0.5 };
++    short_for_test = 6;
++    defer short_for_test = null;
++    {
++        const off = try run(3, .off, 0.5, null);
++        defer free(off);
++        const on = try run(3, .deepen, 0.5, null);
++        defer free(on);
++        try Expect.split(3, 0, 2);
++        try Expect.split(2, 0, 2);
++        for (off.tokens, on.tokens) |x, y| try t.expectEqualSlices(u32, x, y);
++    }
++}
++
++test "shared cut: a grammar stream among greedy ones asks no chances and is never deepened, every stream's tokens as off" {
++    grammar_for_test = 2;
++    defer grammar_for_test = null;
++    low_prior_for_test = true;
++    defer low_prior_for_test = false;
++    const off = try run(4, .off, 0.999, null);
++    defer free(off);
++    const on = try run(4, .deepen, 0.999, null);
++    defer free(on);
++    try t.expect(watch.grammar_windows > 0); // it verified windows in the shared rounds
++    try t.expectEqual(@as(usize, 0), on.grammar_calls);
++    try t.expectEqual(@as(usize, 0), watch.grammar_deepened);
++    try t.expect(on.calls > 0 and grants(4, 0).past_budget > 0); // the greedy streams were priced and deepened
++    try t.expectEqualSlices(u32, &spell_want ++ [_]u32{96}, on.tokens[2]); // the grammar's text, then its stop token
++    for (off.tokens, on.tokens) |x, y| try t.expectEqualSlices(u32, x, y);
++}
 diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
-index baff3bd3100bbf287db9cb071c4d84da32ec0888..829b99afc699fab95abcbf382194d140d0081c4c 100644
+index baff3bd3100bbf287db9cb071c4d84da32ec0888..a51d975daba1462d0aa7d1d50e113128f535f057 100644
 --- a/zig/src/core/lanes/stream.zig
 +++ b/zig/src/core/lanes/stream.zig
 @@ -1,5 +1,7 @@
@@ -1757,7 +2014,26 @@ index baff3bd3100bbf287db9cb071c4d84da32ec0888..829b99afc699fab95abcbf382194d140
  const grammar = @import("grammar.zig");
  const shape = @import("shape.zig");
  const plan_lanes = @import("plan_lanes.zig");
-@@ -234,14 +236,24 @@ pub const Stream = struct {
+@@ -111,6 +113,8 @@ pub const Image = struct {
+     /// Visible pixel height and width before padding, for towers with content-normalized positions.
+     content_size: ?[2]u32 = null,
+     hash: u64 = 0, // core/picture/identity.zig's: the bytes and the grid, as the prompt cache's key names the image
++    /// The family's full identity of the image (SHA-256 of its decoded pixels); zeros: none, `hash` alone names it.
++    digest: [32]u8 = @splat(0),
+ };
+ 
+ pub const Spec = struct {
+@@ -209,6 +213,9 @@ pub const Stream = struct {
+     cost_probe_trial: ?@import("lone_costs.zig").Trial = null, // priced selection, consumed only by its completed width
+     shared_round: bool = false, // a round beside another stream: its times are not this stream's alone
+     settle_step: bool = false, // the lane host bills this prompt step's time to decoders: end it on the device
++    side_ns: u64 = 0, // the backend's last prompt call ran other work than its rows (an image's tower unit), ended on the device: its ns
++    side_held: bool = false, // the lane host holds side work this call (decode time is owed): a capped tower unit waits; rows and stored images do not
++    side_wait: bool = false, // the backend's last prompt call ran nothing: its side work waited on side_held
+     prices_seeded: bool = false, // its own prices started from the engine's kept calibration
+     copy_landed: [2]f64 = .{ -1, -1 }, // a lone context copy's rows that landed, decayed, by short and long match (-1: unprimed)
+     copy_broke: [2]f64 = .{ 0, 0 }, // and its chains that broke before their end: their ratio is a copied row's landing rate
+@@ -234,14 +241,25 @@ pub const Stream = struct {
      grammar_time: @import("grammar_time.zig").Sum = .{},
      grammar_round: @import("grammar_time.zig").Round = .{},
      gpu_seconds: ?f64 = null, // a timed backend's passes this stream ran in (TF_Q27_PROFILE); null: untimed
@@ -1778,11 +2054,12 @@ index baff3bd3100bbf287db9cb071c4d84da32ec0888..829b99afc699fab95abcbf382194d140
      granted: ?u32 = null,
 +    asked: u32 = 0, // shared_cut: the drafts the rule's budget asked of the last shared draft, before `deepen`
 +    deepened: bool = false, // shared_cut `deepen`: the held block was drafted past `asked`; only a chance-priced round verifies past it
++    no_chances: bool = false, // shared_cut: the backend reads no chances for this stream's drafts (an A/B arm without them), so it is neither deepened nor chance-priced
 +
      grant_short: bool = false, // the last grant verified fewer drafts than the stream held
      grant_gain: ?f64 = null, // the drafts its last grant expected to keep (the chances it was priced by)
      draft_chances: std.ArrayList(f64) = .empty, // last full head prices, retained through zero-row rounds
-@@ -317,6 +329,8 @@ pub const Stream = struct {
+@@ -317,6 +335,8 @@ pub const Stream = struct {
          s.granted = null;
          s.grant_short = false;
          s.grant_gain = null;
@@ -1792,7 +2069,7 @@ index baff3bd3100bbf287db9cb071c4d84da32ec0888..829b99afc699fab95abcbf382194d140
          s.draft_chances = .empty;
          s.copy_width = null;
 diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
-index b3758b7c38498d8d1f82881b7c0f0291e3a4e471..f2f487991cafc7c935c3a8b286181e9cff2afa13 100644
+index b3758b7c38498d8d1f82881b7c0f0291e3a4e471..eb69d6862eab05ec8514f9c1f7ba1068fc285a9a 100644
 --- a/zig/src/core/lanes/windows.zig
 +++ b/zig/src/core/lanes/windows.zig
 @@ -35,9 +35,11 @@ pub const Plan = struct {
@@ -1854,7 +2131,7 @@ index b3758b7c38498d8d1f82881b7c0f0291e3a4e471..f2f487991cafc7c935c3a8b286181e9c
              const controls = @import("mtp_policy.zig").Controls{ .cap = e.cfg.most_drafts, .floor = e.cfg.draft_confidence };
              pr.* = if (p.kind == .head and e.cfg.draft_confidence != null) chances[0..controls.prefix(chances)] else chances;
          }
-@@ -503,6 +518,40 @@ pub fn nodeChances(e: *Engine, s: *Stream, n: usize) ![]const f64 {
+@@ -503,6 +518,41 @@ pub fn nodeChances(e: *Engine, s: *Stream, n: usize) ![]const f64 {
      return alloc.chainProbabilities(a, try e.rule.rates(who(s)), n);
  }
  
@@ -1863,11 +2140,12 @@ index b3758b7c38498d8d1f82881b7c0f0291e3a4e471..f2f487991cafc7c935c3a8b286181e9c
 +/// the deferred drafts first), so the allocation gives the rows to the drafts likeliest to land; null (the learned
 +/// rates) when the round is not open to it (Engine.shared_open: 2 .. the pass's fair_above streams), when it is not
 +/// such a stream, it is past depth_from (with context prices: its drafts' map and its rounds' prices
-+/// there are the depth rule's), or the backend has none.
++/// there are the depth rule's), or the backend has none (or never reads them for it: Stream.no_chances, which
++/// Engine.deepened keeps to its budget too).
 +fn sharedChances(e: *Engine, streams: usize, p: Plan) !?[]const f64 {
 +    if (e.cfg.shared_cut == .off or !e.shared_open or streams < 2 or p.kind != .head or p.held == 0 or p.tokens.len > 0 or p.parents != null) return null;
 +    const s = p.stream;
-+    if (s.sampling != null or s.grammar != null) return null;
++    if (s.sampling != null or s.grammar != null or s.no_chances) return null;
 +    if (e.cfg.context_costs.len > 0 and s.cache_len > e.cfg.depth_from) return null; // the chances' map: shallow drafts
 +    const hook = e.backend.vtable.probabilities orelse return null;
 +    const out = try e.arena.allocator().alloc(f64, p.held);
@@ -1895,7 +2173,7 @@ index b3758b7c38498d8d1f82881b7c0f0291e3a4e471..f2f487991cafc7c935c3a8b286181e9c
  /// The grammar walk stays shared by serial windows and parallel per-stream jobs.
  pub const constrain = @import("grammar_window.zig").constrain;
  
-@@ -514,7 +563,7 @@ pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
+@@ -514,7 +564,7 @@ pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
      const ds = try accept.depths(a, parents);
      const positions = try a.alloc(u64, rows);
      for (positions, ds) |*x, d| x.* = p.position + 1 + d;
@@ -2720,10 +2998,10 @@ index 0000000000000000000000000000000000000000..6e3d9611dbfbcf151419a5e66e34c891
 +}
 diff --git a/zig/src/families/inkling2/cuda_lanes.zig b/zig/src/families/inkling2/cuda_lanes.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03cacd0fe68
+index 0000000000000000000000000000000000000000..8c0243f07f118759219ff22771a05c7c2f161034
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_lanes.zig
-@@ -0,0 +1,1878 @@
+@@ -0,0 +1,2712 @@
 +//! Inkling-2's CUDA lane backend: a slot a stream (its state on every rank), prompts in 2048-row chunks, then decode
 +//! windows. Rank 0 draws on the host from the softcapped fp32 logits rows: greedy, or the request's sampling keyed at
 +//! each row's position over the whole vocabulary (sample.zig). Without the drafter a window is the pending row alone.
@@ -2747,11 +3025,14 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +//! The lane plumbing follows minimax_m3/cuda_lanes.zig and glm/cuda_lanes.zig.
 +const std = @import("std");
 +const lanes = @import("lanes");
++const ink = @import("inkling2");
 +const ic = @import("inkling2_cuda");
 +const sample = @import("sample.zig");
++const image = @import("image.zig");
 +
 +const be = lanes.backend;
 +const engine = ic.engine;
++const vs = ink.vision_store;
 +
 +/// Drawn tokens a handle names.
 +const ring = 1024;
@@ -2778,10 +3059,121 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +    /// A grammar stream's prompt's last row (the softcapped fp32 logits, owned) until its first token is drawn:
 +    /// `first_masked` draws it under the grammar's mask (or `first` without one).
 +    first_row: []f32 = &.{},
++    /// An image prompt's pass (rank 0 with the vision tower): its images as the row store names them, and the pass's
++    /// pins and reservation there. Released when the pass ends, is dropped, or the stream opens again.
++    img: ?Images = null,
 +
 +    fn dropRow(l: *Lane, gpa: std.mem.Allocator) void {
 +        if (l.first_row.len > 0) gpa.free(l.first_row);
 +        l.first_row = &.{};
++    }
++};
++
++/// A prompt pass's images (cuda_vision_store.zig): the stream's, in prompt order, as the row store names them
++/// (`storeImage`), its `Need` (what it still needs, its pins and its reservation of store rows), and the units it ran
++/// of other images' tower jobs (logged once when the pass ends).
++const Images = struct {
++    list: [vs.max_images]vs.Image = undefined,
++    count: u32 = 0,
++    need: vs.Need = undefined,
++    help: vs.Help = .{},
++
++    fn images(p: *const Images) []const vs.Image {
++        return p.list[0..p.count];
++    }
++};
++
++/// A stream's image as the row store names it: the prompt rows it fills, its grid (the record's: `image.record`
++/// checks the stream's gh, gw and tokens against it) and the full digest of its pixels.
++fn storeImage(m: lanes.stream.Image) vs.Image {
++    return .{ .at = m.at, .tokens = m.tokens, .rows = m.gh, .cols = m.gw, .digest = m.digest };
++}
++
++/// The images of a kept prompt prefix of `at` rows (cuda_vision_store.zig prefixKey; cuda_snap.zig Kept.images): all
++/// zeros, with no hashing, for a prompt without images.
++pub fn imageKey(images: []const lanes.stream.Image, at: u32) error{TooManyImages}!vs.Digest {
++    if (images.len == 0) return @splat(0);
++    if (images.len > vs.max_images) return error.TooManyImages;
++    var list: [vs.max_images]vs.Image = undefined;
++    for (images, list[0..images.len]) |m, *o| o.* = storeImage(m);
++    return vs.prefixKey(list[0..images.len], at);
++}
++
++/// Rank 0, an image prompt's opening, before anything moves (cuda_vision_store.zig Need.init's rules, and): each
++/// image's record read back and agreeing with the stream's image (image.zig record: sides, grid and tokens), its
++/// digest the one the server sealed in the record and never all zeros, each ending before the prompt's last row (the
++/// last row is text: the first token's row and the drafter's tap), at most `v.max_images` images, and their tokens at
++/// most the row store's rows. The images in `out`; returns their tokens.
++fn checkImages(images: []const lanes.stream.Image, prompt: usize, v: ic.vision.Vision, out: *Images) !u32 {
++    if (images.len > v.max_images or images.len > vs.max_images) return error.TooManyImages;
++    var tokens: u64 = 0;
++    for (images, out.list[0..images.len]) |m, *o| {
++        const r = try image.record(m);
++        if (!std.mem.eql(u8, &r.rec.digest, &m.digest) or std.mem.allEqual(u8, &m.digest, 0)) return error.ImageDigestDiffers;
++        if (@as(u64, m.at) + m.tokens >= prompt) return error.ImageOutsidePrompt;
++        o.* = storeImage(m);
++        tokens += m.tokens;
++    }
++    out.count = @intCast(images.len);
++    _ = try vs.Need.init(out.images(), 0); // order, overlap, grids and digests
++    if (tokens > v.image_tokens) return error.ImageTokens;
++    return @intCast(tokens);
++}
++
++/// Rank 0's tower units for a prompt pass (cuda_vision_store.zig Units): the engine-mode tower (cuda_vision.zig
++/// Rank0) on the engine's stream, each unit's buffers borrowed from the op scratch (idle between forwards: every op
++/// takes its own and the forward resets it before each; the tower's state between units is its resident `x`).
++const TowerUnits = struct {
++    e: *engine.Engine,
++    v: *ic.vision.Rank0,
++    s: *const lanes.Stream,
++    list: []const vs.Image,
++
++    fn units(u: *TowerUnits) vs.Units {
++        return .{ .ctx = u, .begin = begin, .layers = layers, .merge = merge, .settle = settle, .now = now };
++    }
++
++    fn of(ctx: *anyopaque) *TowerUnits {
++        return @ptrCast(@alignCast(ctx));
++    }
++
++    /// The op scratch from its start: `len` bytes for this unit alone.
++    fn borrow(u: *TowerUnits, len: usize) !u64 {
++        u.e.scratch.reset();
++        u.e.scratch.kind = .other;
++        return u.e.scratch.take(len);
++    }
++
++    fn begin(ctx: *anyopaque, i: u32) anyerror!void {
++        const u = of(ctx);
++        const r = try image.record(u.s.images[i]);
++        const len = u.v.tower.sliceNeed(ic.vision.Grid.of(r.rec.height, r.rec.width));
++        try u.v.beginUnit(try u.borrow(len), len, r.rgb, r.rec.height, r.rec.width);
++        const m = u.list[i];
++        std.log.info("inkling2 rank 0: vision: image {d} of the prompt ({d}x{d}, {d} tokens at {d}) to the tower", .{ i, r.rec.width, r.rec.height, m.tokens, m.at });
++    }
++
++    fn layers(ctx: *anyopaque, k: u32) anyerror!void {
++        const u = of(ctx);
++        const len = u.v.unitNeed();
++        _ = try u.v.layersUnit(try u.borrow(len), len, k);
++    }
++
++    fn merge(ctx: *anyopaque, row0: u32) anyerror!void {
++        const u = of(ctx);
++        const len = u.v.unitNeed();
++        const out = try u.v.mergeUnit(try u.borrow(len), len, u.v.store.addr(row0));
++        const p = &u.v.pace;
++        const st = &u.v.store;
++        std.log.info("inkling2 rank 0: vision: the tower's image ({d} tokens) into store rows [{d}, {d}) in {d} unit(s){s}; the store: {d} entries, {d} evicted, {d} rows moved", .{ out.tokens, row0, row0 + out.tokens, p.units, if (p.layer_ns > 0) " (sliced beside decoders)" else "", st.entries.items.len, st.evicted, st.moved });
++    }
++
++    fn settle(ctx: *anyopaque) anyerror!void {
++        try of(ctx).v.stream.synchronize();
++    }
++
++    fn now(ctx: *anyopaque) u64 {
++        return @intCast(std.Io.Clock.awake.now(of(ctx).e.io).toNanoseconds());
 +    }
 +};
 +
@@ -2846,8 +3238,10 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +/// more than one row. The first node is `tp4_window_ms`/`tp4_draft_ms` (the server's shallow requests); the others were
 +/// measured as those were, on the same Sparks and build: 3,040 and 32,768 by `--exp check,price` (20 a width, two runs)
 +/// and `--exp deep-draft --price-depths` (10 a width, one run in one prefill of real text, slot 524,304), the cells'
-+/// medians; 131,072 .. 524,000 by the deep run alone; the window as a captured graph with every row's head logits plus
-+/// the keep, the draft with its keep; rows 2-8 on their line at every node. A round is priced at its stream's own
++/// medians; 131,072 .. 524,000 by the deep run alone, 1,048,000 by `--price-deep` on a synthetic fill (its draft 35 %
++/// above 524,000's, so a 1M stream is no longer priced by the 524,000 node); the window as a captured graph with
++/// every row's head logits plus the keep, the draft with its keep; rows 2-8 on their line at every node. A round is
++/// priced at its stream's own
 +/// context (interpolated between two nodes), and a plain round competes with the drafted depths (lanes/depth.zig
 +/// `depth`), so a stream deep enough that its drafts do not pay decodes plainly. In a shared round each stream pays
 +/// what its rows and its draft cost past `depth_from` (lanes/depth.zig `depthMs`): a deep stream drafts less or not at
@@ -2861,6 +3255,7 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +    .{ .context = 131_072, .window_ms = &.{ 36.2, 45.6, 49.9, 54.2, 58.5, 62.9, 67.2, 71.5 }, .draft_ms = 10.8 },
 +    .{ .context = 262_144, .window_ms = &.{ 44.3, 52.2, 57.1, 62.0, 66.9, 71.8, 76.7, 81.6 }, .draft_ms = 12.1 },
 +    .{ .context = 524_000, .window_ms = &.{ 58.0, 63.9, 69.6, 75.4, 81.2, 87.0, 92.7, 98.5 }, .draft_ms = 15.5 },
++    .{ .context = 1_048_000, .window_ms = &.{ 80.2, 90.9, 98.5, 106.0, 113.6, 121.2, 128.7, 136.3 }, .draft_ms = 20.9 },
 +};
 +
 +/// TF_INK2_DRAFT_CUT=0's prices: v0.2's own tables as it shipped them (measured on v0.2's kernels), so that `0`
@@ -2993,11 +3388,14 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +/// rounds) prices its greedy streams' held drafts by the drafter's chances of this round through the lone cut's
 +/// calibration map (`chainChances`; the deferred drafts then run before the verify, their chances read), and every
 +/// drafting greedy stream drafts its whole block, so the rows go to the drafts likeliest to land, a confident stream's
-+/// deeper ones too; `cut` (or `1`) the chances only, within the budget; `0` prices by each stream's learned rates, as
-+/// v0.2 does. Greedy streams without a grammar in the cut arm; off with TF_INK2_DRAFT_CUT=0 (v0.2's rounds). Outputs are
-+/// the same either way. GB10, four servers a setting (off, deepen), CONTEXT=32768 MAX_STREAMS=8, the bench prompts, the
-+/// time to the last request's end: 2 streams +1.7%, 4 streams +3.9%; replayed on texts whose drafts seldom land (a
-+/// first draft kept about 3 times in 10), 17-24% slower than v0.2 at 2 to 4 streams.
++/// deeper ones too; `cut` (or `1`) the chances only, within the budget; `0`, `off` or `false` (any case) price by each
++/// stream's learned rates, as v0.2 does. Every rank hashes the value as resolved (cuda_dspark.zig sharedCutEffective).
++/// Greedy streams without a grammar in the cut arm (TF_INK2_DRAFT_CUT=ab's whole arm has no chances read: neither
++/// priced nor deepened, Stream.no_chances); off with TF_INK2_DRAFT_CUT=0 or TF_INK2_DRAFT_DEPTH=0 (v0.2's rounds).
++/// Outputs are the same either way. GB10, v0.2's final kernels and tables (hold A6), two servers a setting (`0`, the
++/// default), CONTEXT=32768 MAX_STREAMS=8, the frozen bench prompts, the time to the last request's end: 2 streams
++/// +5.9%, 4 streams +5.5%, no other level slower beyond its spread; replayed on texts whose drafts seldom land (a first
++/// draft kept about 3 times in 10), 20-26% slower than with it off at 2 to 4 streams.
 +const shared_cut_default: lanes.config.SharedCut = .deepen;
 +
 +fn parseSharedCut(v: ?[]const u8) lanes.config.SharedCut {
@@ -3111,6 +3509,8 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +    store: ?StoreHooks = null,
 +    /// TF_INK2_DRAFT_CUT=ab: the streams opened so far (every other one is cut).
 +    cut_streams: u64 = 0,
++    /// The NVMe tier's write-behind has had an idle turn (logged once).
++    idle_seen: bool = false,
 +
 +    fn now(self: *const Lanes) i96 {
 +        return std.Io.Clock.awake.now(self.x.e.io).toNanoseconds();
@@ -3161,6 +3561,8 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +        .shared_round = sharedRoundFn,
 +        .first_masked = firstMaskedFn,
 +        .release = releaseFn,
++        .idle_pending = idlePendingFn,
++        .idle = idleFn,
 +    };
 +
 +    /// One row a window without the drafter (two for a forced token; any width is exact); with it, the pending row
@@ -3193,7 +3595,10 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +            .lone_cut = cut != .off,
 +            .draft_streams = shared and draftStreams(), // a shared round's drafts in one call: one pass for all
 +            .draft_pass = if (shared and draftStreams()) draftPass() else null,
-+            .shared_cut = if (cut == .off) .off else sharedCut(),
++            // the shared cut needs the context prices, as the lone cut does (lanes/config.zig lone_cut): with
++            // TF_INK2_DRAFT_DEPTH=0 an eager pass reads no chances (`nextCut`) and the chances' map is for shallow
++            // drafts, so shared rounds are v0.2's whether drafts are deferred or not (cuda_dspark.zig sharedCutResolved)
++            .shared_cut = if (cut == .off or !depthPriced()) .off else sharedCut(),
 +            .hidden_rows = shared,
 +            .batch_rows = batch_rows,
 +            .max_streams = batch_streams,
@@ -3375,18 +3780,31 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +        }
 +    }
 +
-+    /// A prompt begins: the stream's slot, and on the KV page pool its pages (`pagesFor`).
++    /// A prompt begins: the stream's slot, and on the KV page pool its pages (`pagesFor`). An image prompt (rank 0's
++    /// vision tower) is checked first (`checkImages`) and reserves its images' rows in the row store; LaneMemory (the
++    /// open requests hold the rows) before anything moves.
 +    fn opening(self: *Lanes, s: *lanes.Stream) !*Lane {
 +        const ids = s.prompt();
 +        if (ids.len == 0) return error.EmptyPrompt;
-+        if (s.images.len > 0) return error.NoVision;
++        const vision = if (s.images.len > 0) self.x.e.vision orelse return error.NoVision else null;
 +        if (ids.len + s.max_new + 1 > self.x.e.capacity()) return error.PromptTooLong;
++        var imgs: Images = .{};
++        const img_tokens = if (vision) |v| try checkImages(s.images, ids.len, v.limits, &imgs) else 0;
 +        // its slot, or the lowest one no other stream holds
 +        const again = self.lanes.getPtr(s) != null;
 +        const slot = if (self.lanes.getPtr(s)) |l| had: {
 +            l.dropRow(self.gpa);
++            self.dropImages(l); // its last pass's pins and rows
 +            break :had l.slot;
 +        } else self.freeSlot();
++        // every image's rows: where the pass starts (a kept state) is known only below, then the rows of the images
++        // it skips go back
++        var reserved: u32 = 0;
++        if (vision) |v| {
++            try v.store.reserve(img_tokens);
++            reserved = img_tokens;
++        }
++        errdefer if (reserved > 0) vision.?.store.unreserve(reserved);
 +        try self.lanes.put(self.gpa, s, .{ .slot = slot, .cut = self.cutting(s, again) });
 +        errdefer {
 +            _ = self.lanes.remove(s);
@@ -3400,10 +3818,127 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +        if (self.x.e.drafter == null and s.grammar != null) s.drafts = false;
 +        const l = self.lanes.getPtr(s).?;
 +        s.cut_arm = l.cut and draftCut() == .ab; // `ab`: each arm's rounds timed apart from the other's
-+        // a kept state's pages adopted and its fixed part restored (the prompt cache on pages), else the slot's pages
-+        l.from = if (s.prompt_logprobs != null) 0 else try self.resumeFrom(s, slot, ids.len, again);
-+        if (l.from == 0) try self.pagesFor(s, slot, ids.len, s.max_new, again, null);
++        // a stream not cut (TF_INK2_DRAFT_CUT=ab's whole arm) has no chances read (`probabilitiesFn`): the lane core
++        // neither deepens its drafts nor prices them by chances (Stream.no_chances), so its rounds are v0.2's
++        s.no_chances = !l.cut;
++        // a kept state's pages adopted and its fixed part restored (the prompt cache on pages), or a longer state read
++        // from the NVMe tier into fresh pages, else the slot's pages
++        l.from = 0;
++        var disk = false; // its pages opened by a read from the NVMe tier (never an image prompt's: `fromDisk`)
++        if (s.prompt_logprobs == null) {
++            if (try self.fromDisk(s, slot, ids, again)) |at| {
++                l.from = at; // its pages are open (0: a rank refused the file; a cold pass on them)
++                disk = true;
++            } else l.from = try self.resumeFrom(s, slot, ids.len, again);
++        }
++        if (!disk and l.from == 0) try self.pagesFor(s, slot, ids.len, s.max_new, again, null);
++        if (vision) |v| {
++            // the images a kept prefix holds need no tower and no splice (Need.init's skip rule)
++            imgs.need = try .init(imgs.images(), @intCast(l.from));
++            const t = imgs.need.tokens(imgs.images());
++            v.store.unreserve(img_tokens - t);
++            imgs.need.reserved = t;
++            reserved = 0;
++            l.img = imgs;
++        }
 +        return l;
++    }
++
++    /// The NVMe tier (cuda_nvme.zig): when it holds a prefix of the prompt at least `min_gain` tokens past the
++    /// device cache's resume point, the slot opens on fresh pages and every rank reads its file into them; the pass
++    /// starts there (or at 0 on the same pages when a rank refuses the file). Null: not from disk (nothing opened).
++    fn fromDisk(self: *Lanes, s: *lanes.Stream, slot: u32, ids: []const u32, again: bool) !?usize {
++        const e = self.x.e;
++        if (!e.nvme.on or s.images.len > 0) return null;
++        const ram: usize = if (s.reuse.saved != null) s.reuse.at else 0;
++        const i = ic.nvme.pick(e, ids, ram) orelse return null;
++        // fresh pages for the whole prompt; with a borrowed device state, only when they can be had (free, or from
++        // states the reclaim may give back), so a disk attempt never gives back states for an open that then fails:
++        // the device resume needs only the suffix's pages
++        if (s.reuse.saved != null) if (e.pool) |p| {
++            const n = ic.pages.need(ids.len, s.max_new, ic.state.spec_rows, p.entries);
++            if (n > p.total() or !(p.fits(n) or p.fits(n -| self.reclaimable()))) return null;
++        };
++        self.pagesFor(s, slot, ids.len, s.max_new, again, null) catch |err| switch (err) {
++            error.LaneMemory => if (s.reuse.saved != null) return null else return err,
++            else => return err,
++        };
++        const ok = ic.nvme.load(self.x, slot, i, null) catch |err| switch (err) {
++            error.NvmePages => false, // refused before its step (no rank moved): a cold pass on these pages
++            else => return err,
++        };
++        if (!ok) return 0;
++        s.cached = ic.nvme.entryAt(e, i);
++        return s.cached;
++    }
++
++    /// The lane's image pass ends: its pins and its reserved rows go back to the row store (a tower job only it held
++    /// is dropped), and the help it gave other images' towers is logged.
++    fn dropImages(self: *Lanes, l: *Lane) void {
++        if (l.img) |*p| {
++            const v = self.x.e.vision.?;
++            if (p.need.release(&v.store, p.images())) v.pace.job = null;
++            if (p.help.units > 0) std.log.info("inkling2 rank 0: vision: a prompt pass ran {d} units ({d} layers) of other images' towers, {d} in steps the decode share did not bill; since start {d} such units, {d} unbilled", .{ p.help.units, p.help.layers, p.help.unbilled, v.pace.help_units, v.pace.unbilled_help });
++            l.img = null;
++        }
++    }
++
++    /// What an image prompt's step does before its chunk's forward: a tower unit (the chunk waits for a later call),
++    /// nothing (`held`: a capped unit was due while the lane host held side work, Stream.side_held), or the chunk's
++    /// splice (null: no image row in it).
++    const Chunked = union(enum) { worked, held, ready: ?ic.embed.Splice };
++
++    /// Rank 0, before an image prompt's chunk [at, at + n): the tower's units for the chunk's images the row store
++    /// does not hold (a hit pins the stored rows; no tower), then the chunk's spans of stored rows.
++    /// - `max_rows` 0 (chunks without a cap): each tower whole in this step, then the chunk.
++    /// - else (--decode-share beside decoders) one unit a step, sized to about a capped chunk's time
++    ///   (cuda_vision_store.zig unit): `worked`. Another image's tower in flight is helped to its end first. While
++    ///   the lane host holds side work (decode time owed) no unit runs: `held`, unless every image of the chunk is
++    ///   stored (a hit is served).
++    fn imageChunk(self: *Lanes, s: *const lanes.Stream, p: *Images, at: usize, n: usize, max_rows: usize) !Chunked {
++        var u: TowerUnits = .{ .e = self.x.e, .v = self.x.e.vision.?, .s = s, .list = p.images() };
++        return self.imageChunkOn(s, p, at, n, max_rows, u.units());
++    }
++
++    fn imageChunkOn(self: *Lanes, s: *const lanes.Stream, p: *Images, at: usize, n: usize, max_rows: usize, t: vs.Units) !Chunked {
++        const v = self.x.e.vision.?;
++        const list = p.images();
++        const before = p.need.pinned;
++        var stored: @TypeOf(before) = .empty; // not pinned yet, and the store holds its rows: a hit if pinned now
++        for (list, 0..) |*m, i| if (!before.isSet(i)) if (v.store.find(&m.digest)) |e| if (e.ready) stored.set(i);
++        const cap: u32 = @intCast(@min(max_rows, std.math.maxInt(u32)));
++        if (cap > 0 and s.side_held and !p.need.stored(&v.store, list, @intCast(at), @intCast(n))) return .held;
++        // billed: a step the lane host times, or a capped unit (`worked`: side work it bills, lane_host_fill.zig sided)
++        const r = vs.unit(&p.need, &v.store, &v.pace, list, @intCast(at), @intCast(n), cap, s.settle_step or cap > 0, t, &p.help) catch |err| {
++            self.dropJob(v);
++            return err;
++        };
++        if (r == .worked) return .worked;
++        var hits = p.need.pinned.differenceWith(before).intersectWith(stored).iterator(.{});
++        while (hits.next()) |i| {
++            std.log.info("inkling2 rank 0: vision: image {d} of the prompt ({d} tokens at {d}) is in the row store (no tower)", .{ i, list[i].tokens, list[i].at });
++        }
++        var sp: ic.embed.Splice = .{};
++        const k = try p.need.spans(&v.store, list, @intCast(at), @intCast(n), sp.spans[0..]);
++        if (k == 0) return .{ .ready = null };
++        sp.count = @intCast(k);
++        sp.lo = sp.spans[0].first;
++        sp.hi = sp.spans[k - 1].first + sp.spans[k - 1].n;
++        return .{ .ready = sp };
++    }
++
++    /// A tower unit failed: the tower's state is unknown, so its job (the building entry) goes from the store and
++    /// from every pass's pins; the passes that need the image begin it again.
++    fn dropJob(self: *Lanes, v: *ic.vision.Rank0) void {
++        const j = v.store.job() orelse return;
++        if (v.pace.holds(&j.digest)) return;
++        const d = j.digest;
++        var it = self.lanes.valueIterator();
++        while (it.next()) |l| if (l.img) |*p| {
++            for (p.images(), 0..) |m, i| if (std.mem.eql(u8, &m.digest, &d)) p.need.pinned.unset(i);
++        };
++        v.store.abort(&d);
++        std.log.warn("inkling2 rank 0: vision: a tower unit failed: its image's job is dropped from the row store and every pass", .{});
 +    }
 +
 +    /// On the KV page pool (cuda_pages.zig): slot `slot` takes the pages of a prompt of `prompt` tokens, its reply and
@@ -3475,7 +4010,7 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +    fn resumeFrom(self: *Lanes, s: *lanes.Stream, slot: u32, len: usize, again: bool) !usize {
 +        const saved = s.reuse.saved orelse return 0;
 +        const k: *const ic.snap.Kept = @ptrCast(@alignCast(saved));
-+        const refused: anyerror = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at) error.SnapshotOutOfStep else ok: {
++        const refused: anyerror = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at) error.SnapshotOutOfStep else if (!sameImages(s, k)) error.ImageDigestDiffers else ok: {
 +            self.pagesFor(s, slot, len, s.max_new, again, k) catch |err| switch (err) {
 +                error.LaneMemory, error.RequestOverPool => return err,
 +                else => break :ok err,
@@ -3487,6 +4022,13 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +        s.reuse_failed = true;
 +        s.reuse_error = refused;
 +        return 0;
++    }
++
++    /// Whether a kept state's prefix holds the stream's images there (the prompt cache's keys compare them already;
++    /// this is the family's own check): zeros against zeros for text, with no hashing.
++    fn sameImages(s: *const lanes.Stream, k: *const ic.snap.Kept) bool {
++        const want = imageKey(s.images, k.at) catch return false;
++        return std.mem.eql(u8, &k.images, &want);
 +    }
 +
 +    /// The prompt pass passed `at` (a chunk's end, or a mark captured inside it): the store keeps the state there when
@@ -3515,17 +4057,49 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +        const in: ic.snap.Inside = if (split) .{ .n = 0, .rows = ic.snap.rowsTo(s.reuse.marks, at, want) } else ic.snap.inside(s.reuse.marks, at, want, &caps);
 +        const n = in.rows;
 +        const last = at + n == ids.len;
++        // rank 0's tower beside decoders: a settled chunk's time a row paces its units (host clock only)
++        const t0: ?i96 = if (s.settle_step and self.x.e.vision != null) self.now() else null;
 +        try self.flush(); // a deferred draft reads its stream's taps: before this forward writes them
++        // an image prompt: the towers of the chunk's images not stored yet, then its spliced rows (rank 0)
++        const side0: i96 = if (l.img != null) self.now() else 0;
++        const sp: ?ic.embed.Splice = if (l.img) |*p| switch (try self.imageChunk(s, p, at, n, max_rows)) {
++            .ready => |x| x,
++            .worked => {
++                // a tower unit was this step's work (it ran a layer or more, or the merger, under a chunk row cap):
++                // the chunk waits for the next call, which does not open the stream again. The unit ends on the
++                // device and its time goes to the lane host as side work (Stream.side_ns), which bills it to
++                // decoders and lets their round go before the prompt's next call, a short prompt's too
++                l.fill = at;
++                try self.x.e.stream.synchronize();
++                s.side_ns = @intCast(@max(1, self.now() - side0));
++                return false;
++            },
++            .held => {
++                // decode time is owed (another prompt's unit or a long step): no unit, nothing on the device. The
++                // lane host calls again once the decoders' round has paid it (Stream.side_wait)
++                l.fill = at;
++                s.side_wait = true;
++                return false;
++            },
++        } else null;
 +        if (in.n > 0 and s.reuse.hook != null) try ic.snap.capture(self.x, l.slot, at, n, caps[0..in.n]);
 +        self.x.e.want_logits = !(last and self.greedyRow(s, ids.len) and s.grammar == null); // a grammar's row is kept
 +        defer self.x.e.want_logits = true;
-+        try self.x.forward(l.slot, at, ids[at..][0..n], if (last) .{ .lo = n - 1, .n = 1 } else null);
++        const hr: ?ic.follow.Rows = if (last) .{ .lo = n - 1, .n = 1 } else null;
++        if (sp) |*x| try self.x.forwardImages(l.slot, at, ids[at..][0..n], hr, x) else try self.x.forward(l.slot, at, ids[at..][0..n], hr);
++        // the images the chunk finished: their pins go (their rows stay stored until evicted); all of them at the end
++        if (l.img) |*p| {
++            const v = self.x.e.vision.?;
++            if (p.need.passed(&v.store, p.images(), @intCast(at + n))) v.pace.job = null;
++        }
++        if (last) self.dropImages(l);
 +        if (!last) {
 +            keepMarks(s, at, n);
 +            l.fill = at + n;
 +            // the lane host bills this step's time to decoders (--decode-share): end it on the device, or its tail
 +            // lands in the next decode round's time and the share's debt sees only the launches
 +            if (s.settle_step) try self.x.e.stream.synchronize();
++            if (t0) |t| self.x.e.vision.?.pace.chunked(@intCast(self.now() - t), n);
 +            return false;
 +        }
 +        if (s.grammar != null) {
@@ -3565,6 +4139,7 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +    fn dropLane(self: *Lanes, s: *lanes.Stream) void {
 +        if (self.lanes.getPtr(s)) |l| {
 +            l.dropRow(self.gpa);
++            self.dropImages(l);
 +            self.x.e.unmapPages(l.slot);
 +        }
 +        _ = self.lanes.remove(s);
@@ -3643,13 +4218,21 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +            lns[m] = l;
 +            m += 1;
 +            if (m == engine.max_segs) {
-+                try self.x.draftMany(items[0..m], keeps[0..m], outs[0..m]);
-+                if (chances) try readChances(self.x.e, lns[0..m]);
++                try deferredPass(&self.x, self.x.e, items[0..m], keeps[0..m], outs[0..m], lns[0..m], chances);
 +                m = 0;
 +            }
 +        }
-+        if (m == 1) try self.x.draft(items[0].slot, keeps[0], items[0].anchor, outs[0]) else if (m > 1) try self.x.draftMany(items[0..m], keeps[0..m], outs[0..m]);
-+        if (chances and m > 0) try readChances(self.x.e, lns[0..m]);
++        if (m > 0) try deferredPass(&self.x, self.x.e, items[0..m], keeps[0..m], outs[0..m], lns[0..m], chances);
++    }
++
++    /// One pass of `flushWhere`'s deferred drafts (one stream: `draft`, several: `draftMany`; `x` the leader, `e` its
++    /// engine), and with `chances` the pass's chances to its lanes, in its order, only when one of them is cut: a pass
++    /// of lanes none of which is cut (TF_INK2_DRAFT_CUT=ab's whole arm) has no use for them, so no wait and no download,
++    /// as an eager pass of them (`eagerPass`).
++    fn deferredPass(x: anytype, e: anytype, items: []const engine.DraftItem, keeps: []const usize, outs: []const *[ic.dspark.drafts]u32, lns: []const *Lane, chances: bool) !void {
++        if (lns.len == 1) try x.draft(items[0].slot, keeps[0], items[0].anchor, outs[0]) else try x.draftMany(items, keeps, outs);
++        if (!chances) return;
++        for (lns) |l| if (l.cut) return readChances(e, lns);
 +    }
 +
 +    /// The last drafter pass's chances, its streams' in its order, each to its own lane (`e`: the engine).
@@ -3961,11 +4544,26 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +        return chainChances(l, out);
 +    }
 +
++    /// The NVMe tier's write-behind waits (lane host: while no stream is live and nothing waits).
++    fn idlePendingFn(ptr: *anyopaque) bool {
++        return ic.nvme.pending(of(ptr).x.e);
++    }
++
++    /// One unit of it (a begin, a chunk or a commit, on every rank); the other ranks sleep again when none is left.
++    fn idleFn(ptr: *anyopaque) void {
++        const self = of(ptr);
++        if (!self.idle_seen) std.log.info("inkling2: NVMe prompt cache: the write-behind's first idle turn", .{});
++        self.idle_seen = true;
++        _ = ic.nvme.step(self.x) catch |err| std.log.err("inkling2: NVMe prompt cache: a write step ({s})", .{@errorName(err)});
++        if (!ic.nvme.pending(self.x.e) and self.lanes.count() == 0) self.x.idle() catch |err| std.log.err("inkling2: the other ranks' idle step: {s}", .{@errorName(err)});
++    }
++
 +    /// The stream left: its slot is free for the next stream (its state stays allocated on every rank).
 +    fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
 +        const self = of(ptr);
 +        if (self.lanes.getPtr(s)) |l| {
 +            l.dropRow(self.gpa);
++            self.dropImages(l); // a pass cancelled before its end still holds its images' pins and rows
 +            self.x.e.unmapPages(l.slot); // its pages back to the pool (rank 0's; nothing is sent)
 +        }
 +        _ = self.lanes.remove(s);
@@ -4127,7 +4725,9 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +    // a lone round or one of 5 or more live streams (not open): v0.2's proposals-only flush whatever the switches say
 +    try t.expect(!leftOutChances(false, .on, .deepen) and !leftOutChances(false, .ab, .cut));
 +    try t.expectEqual(lanes.config.SharedCut.off, parseSharedCut("0"));
++    for ([_][]const u8{ "off", "false", "OFF", "False" }) |v| try t.expectEqual(lanes.config.SharedCut.off, parseSharedCut(v));
 +    try t.expectEqual(lanes.config.SharedCut.deepen, parseSharedCut("yes"));
++    try t.expectEqual(lanes.config.SharedCut.deepen, parseSharedCut("00")); // exactly `0`: other digits stay the default
 +    try t.expectEqual(lanes.config.SharedCut.cut, parseSharedCut("cut"));
 +    try t.expectEqual(lanes.config.SharedCut.cut, parseSharedCut("1"));
 +    try t.expectEqual(lanes.config.SharedCut.deepen, parseSharedCut("deepen"));
@@ -4137,6 +4737,41 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +    var c = try lanes.config.Config.init(t.allocator, m, ic.state.spec_rows, ic.state.spec_rows - 1);
 +    defer c.deinit(t.allocator);
 +    try t.expectEqual(lanes.config.SharedCut.deepen, c.shared_cut);
++}
++
++test "inkling2 lanes: the settings fingerprint's shared cut is the one the lane core's config resolves" {
++    // cuda_dspark.zig sharedCutEffective (every rank's fingerprint) against the lanes' own resolution (factsCut, then
++    // lanes/config.zig), for every combination of the switches either reads
++    const names = [_][*:0]const u8{ "TF_INK2_DRAFT_CUT", "TF_INK2_BATCH", "TF_INK2_DRAFT_STREAMS", "TF_INK2_DRAFT_PRICE", "TF_INK2_DRAFT_DEPTH", "TF_INK2_SHARED_CUT" };
++    for (names) |n| if (std.c.getenv(n) != null) return error.SkipZigTest;
++    const env = struct {
++        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
++        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
++        fn put(name: [*:0]const u8, v: ?[*:0]const u8) void {
++            if (v) |x| _ = setenv(name, x, 1) else _ = unsetenv(name);
++        }
++    };
++    defer for (names) |n| env.put(n, null);
++    const gpa = std.testing.allocator;
++    var e: engine.Engine = undefined;
++    e.drafter = @ptrFromInt(@alignOf(ic.dspark.Drafter)); // never read: facts only ask whether a drafter is loaded
++    const l: Lanes = .{ .x = .{ .e = &e }, .gpa = gpa };
++    var seen = [_]bool{ false, false, false };
++    for ([_]?[*:0]const u8{ null, "0", "ab" }) |cut| for ([_]?[*:0]const u8{ null, "0" }) |batch| for ([_]?[*:0]const u8{ null, "0" }) |one| for ([_]?[*:0]const u8{ null, "0" }) |priced| for ([_]?[*:0]const u8{ null, "0", "ab" }) |dep| for ([_]?[*:0]const u8{ null, "0", "off", "false", "OFF", "cut", "1", "deepen", "2", "x" }) |shared| {
++        if (dep != null and cut != null and std.mem.eql(u8, std.mem.span(dep.?), "ab") and std.mem.eql(u8, std.mem.span(cut.?), "ab")) continue; // refused at start (abSwitches)
++        env.put("TF_INK2_DRAFT_DEPTH", dep);
++        env.put("TF_INK2_DRAFT_CUT", cut);
++        env.put("TF_INK2_BATCH", batch);
++        env.put("TF_INK2_DRAFT_STREAMS", one);
++        env.put("TF_INK2_DRAFT_PRICE", priced);
++        env.put("TF_INK2_SHARED_CUT", shared);
++        var cfg = try lanes.Config.init(gpa, l.facts(), ic.state.spec_rows, ic.state.spec_rows - 1);
++        defer cfg.deinit(gpa);
++        const hashed = ic.dspark.sharedCutEffective();
++        try std.testing.expectEqualStrings(@tagName(cfg.shared_cut), @tagName(hashed));
++        seen[@intFromEnum(hashed)] = true;
++    };
++    try std.testing.expect(seen[0] and seen[1] and seen[2]); // off, cut and deepen each reached
 +}
 +
 +test "inkling2 lanes: the lone cut's chances: a rising map under 1, each lane's own block, none unread" {
@@ -4301,6 +4936,28 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +    try Lanes.eagerPass(&d, &d, items[4..], &.{1}, &.{&g}, &.{&at});
 +    try std.testing.expectEqual(@as(usize, 2), d.reads);
 +    try std.testing.expect(!g.chances_ok);
++}
++
++test "inkling2 lanes: a deferred pass reads its chances only when one of its lanes is cut" {
++    // flushWhere's passes (the omitted streams' flush in a C2 round asks chances): lanes none of which is cut
++    // (TF_INK2_DRAFT_CUT=ab's whole arm) read nothing, one pass or several; a mixed pass reads every lane's, in order
++    var d: FakeDrafter = .{};
++    var a: Lane = .{ .slot = 1 };
++    var b: Lane = .{ .slot = 2 };
++    var c: Lane = .{ .slot = 3, .cut = true };
++    const items = [_]engine.DraftItem{ .{ .slot = a.slot, .anchor = 1 }, .{ .slot = b.slot, .anchor = 1 }, .{ .slot = c.slot, .anchor = 1 } };
++    try Lanes.deferredPass(&d, &d, items[0..1], &.{1}, &.{&a.held}, &.{&a}, true);
++    try Lanes.deferredPass(&d, &d, items[0..2], &.{ 1, 1 }, &.{ &a.held, &b.held }, &.{ &a, &b }, true);
++    try std.testing.expectEqual([2]usize{ 1, 1 }, d.passes);
++    try std.testing.expectEqual(@as(usize, 0), d.reads);
++    try std.testing.expect(!a.chances_ok and !b.chances_ok);
++    // with `chances` false nothing is read, cut or not
++    try Lanes.deferredPass(&d, &d, items[2..3], &.{1}, &.{&c.held}, &.{&c}, false);
++    try std.testing.expectEqual(@as(usize, 0), d.reads);
++    // a pass with a cut lane: every lane's chances, each its own stream's
++    try Lanes.deferredPass(&d, &d, &items, &.{ 1, 1, 1 }, &.{ &a.held, &b.held, &c.held }, &.{ &a, &b, &c }, true);
++    try std.testing.expectEqual(@as(usize, 1), d.reads);
++    for ([_]*const Lane{ &a, &b, &c }) |l| try FakeDrafter.expectOwn(l);
 +}
 +
 +test "inkling2 lanes: once draftFn's dispatch returns a lane's chances are its new block's, or none" {
@@ -4485,6 +5142,461 @@ index 0000000000000000000000000000000000000000..c40119a1b90d70ebb9075c1c017eb03c
 +    try std.testing.expectEqual(@as(u32, 0), try Lanes.readFn(&l, try Lanes.firstFn(&l, &s, 3)));
 +    // a row still kept when the lanes go is freed with them (the testing allocator checks)
 +    l.lanes.getPtr(&s).?.first_row = try a.dupe(f32, row2[0..10]);
++}
++
++test "inkling2 lanes: the backend's steps compile" {
++    std.testing.refAllDecls(Lanes); // the prompt chunk's image path (chunk, imageChunk, tower) runs only on a GPU
++}
++
++/// Rank 0's vision for the lanes' host tests: a row store of `rows` rows over no memory (nothing here runs the tower
++/// or compacts), no tower. The engine around it serves at `context` with no page pool.
++const HostVision = struct {
++    r: ic.vision.Rank0,
++
++    fn noCopy(_: *anyopaque, _: u64, _: u64, _: usize) anyerror!void {
++        return error.NoDeviceInHostTests;
++    }
++
++    fn noDone(_: *anyopaque) anyerror!void {
++        return error.NoDeviceInHostTests;
++    }
++
++    fn init(h: *HostVision, e: *engine.Engine, rows: u32, max_images: u32) !void {
++        h.r = undefined;
++        h.r.limits = .{ .image_tokens = rows, .max_images = max_images };
++        h.r.store = try .init(std.testing.allocator, 0x10_0000, rows, vs.row_bytes, .{ .ctx = h, .run = noCopy, .done = noDone });
++        h.r.pace = .{};
++        e.vision = &h.r;
++        e.pool = null;
++        e.o.context = 1 << 16;
++    }
++
++    fn deinit(h: *HostVision) void {
++        h.r.store.deinit();
++    }
++};
++
++/// An image as the server hands it to the lanes (image.zig carry and seal: the record, then the RGB), `h` x `w`
++/// pixels at prompt row `at`.
++const HostImage = struct {
++    floats: []f32,
++    img: lanes.stream.Image,
++
++    fn init(h: u32, w: u32, at: u32, seed: u8) !HostImage {
++        const c = try image.carry(std.testing.allocator, h, w);
++        for (c.rgb, 0..) |*b, i| b.* = @truncate(i *% 31 +% seed);
++        const d = image.seal(c.floats);
++        const g = image.grid(h, w);
++        return .{ .floats = c.floats, .img = .{ .pixels = c.floats, .gh = g[0], .gw = g[1], .at = at, .tokens = g[0] * g[1], .digest = d } };
++    }
++
++    fn deinit(x: *HostImage) void {
++        std.testing.allocator.free(x.floats);
++    }
++};
++
++test "inkling2 lanes: a text stream opens as without the vision tower: no images, nothing reserved, a zero image key" {
++    const a = std.testing.allocator;
++    var e: engine.Engine = undefined;
++    var l = hostLanes(&e);
++    defer l.deinit();
++    var hv: HostVision = undefined;
++    try hv.init(&e, 64, 4);
++    defer hv.deinit();
++    const ids = [_]u32{ 5, 6, 7, 8 };
++    var s = try lanes.Stream.init(a, .{ .id = "text", .prompt = &ids, .max_new = 8 });
++    defer s.deinit(a);
++    const lane = try l.opening(&s);
++    try std.testing.expect(lane.img == null);
++    try std.testing.expectEqual(@as(usize, 0), lane.from);
++    const st = &hv.r.store;
++    try std.testing.expect(st.committed == 0 and st.clock == 0 and st.entries.items.len == 0);
++    // the prompt cache's image key of a text prefix: zeros with no hashing, as a kept state's default
++    const zero: vs.Digest = @splat(0);
++    try std.testing.expectEqual(zero, try imageKey(s.images, 3));
++    const k: ic.snap.Kept = .{ .tag = 1, .at = 3, .off = 0, .bytes = 0 };
++    try std.testing.expect(Lanes.sameImages(&s, &k));
++    // without the tower the same: a text stream never reads Engine.vision
++    e.vision = null;
++    var t = try lanes.Stream.init(a, .{ .id = "text2", .prompt = &ids, .max_new = 8 });
++    defer t.deinit(a);
++    try std.testing.expect((try l.opening(&t)).img == null);
++    l.dropLane(&t);
++    l.dropLane(&s);
++    try std.testing.expectEqual(@as(u32, 0), l.lanes.count());
++}
++
++test "inkling2 lanes: an image prompt's opening refuses bad images before anything moves, and reserves its rows" {
++    const a = std.testing.allocator;
++    var e: engine.Engine = undefined;
++    var l = hostLanes(&e);
++    defer l.deinit();
++    var hv: HostVision = undefined;
++    try hv.init(&e, 20, 2);
++    defer hv.deinit();
++    const st = &hv.r.store;
++    var ids: [64]u32 = undefined;
++    for (&ids, 0..) |*t, i| t.* = @intCast(i + 1);
++    var im0 = try HostImage.init(80, 120, 10, 1); // 2 x 3 = 6 tokens at [10, 16)
++    defer im0.deinit();
++    var im1 = try HostImage.init(120, 120, 20, 2); // 3 x 3 = 9 tokens at [20, 29)
++    defer im1.deinit();
++    const Case = struct { images: []const lanes.stream.Image, prompt: usize = 64, want: anyerror };
++    var bad_digest = im0.img;
++    bad_digest.digest[31] ^= 1;
++    var zero_digest = try HostImage.init(40, 40, 10, 3);
++    defer zero_digest.deinit();
++    @memset(std.mem.sliceAsBytes(zero_digest.floats)[@offsetOf(image.Record, "digest")..][0..32], 0);
++    zero_digest.img.digest = @splat(0);
++    var not_ours = im0.img;
++    not_ours.pixels = &.{ 0, 0, 0 };
++    var wrong_grid = im0.img;
++    wrong_grid.gw = 2;
++    wrong_grid.tokens = 4;
++    var overlap = im1.img;
++    overlap.at = 15;
++    var late = im1.img;
++    late.at = 55; // [55, 64): its last row is the prompt's
++    var big = try HostImage.init(200, 200, 30, 4); // 25 tokens: past the store's 20
++    defer big.deinit();
++    const cases = [_]Case{
++        .{ .images = &.{not_ours}, .want = error.NotInkling2Image },
++        .{ .images = &.{wrong_grid}, .want = error.NotInkling2Image },
++        .{ .images = &.{bad_digest}, .want = error.ImageDigestDiffers },
++        .{ .images = &.{zero_digest.img}, .want = error.ImageDigestDiffers },
++        .{ .images = &.{ im0.img, overlap }, .want = error.ImageOrder },
++        .{ .images = &.{ im1.img, im0.img }, .want = error.ImageOrder },
++        .{ .images = &.{late}, .want = error.ImageOutsidePrompt },
++        .{ .images = &.{im0.img}, .prompt = 16, .want = error.ImageOutsidePrompt },
++        .{ .images = &.{ im0.img, im1.img, im0.img }, .want = error.TooManyImages }, // --vision-max-images 2
++        .{ .images = &.{big.img}, .want = error.ImageTokens },
++    };
++    for (cases) |c| {
++        var s = try lanes.Stream.init(a, .{ .id = "img", .prompt = ids[0..c.prompt], .max_new = 8, .images = c.images });
++        defer s.deinit(a);
++        try std.testing.expectError(c.want, l.opening(&s));
++        try std.testing.expect(l.lanes.count() == 0 and st.committed == 0 and st.entries.items.len == 0);
++    }
++    // without the tower an image prompt is refused by name
++    e.vision = null;
++    var nv = try lanes.Stream.init(a, .{ .id = "img", .prompt = &ids, .max_new = 8, .images = &.{im0.img} });
++    defer nv.deinit(a);
++    try std.testing.expectError(error.NoVision, l.opening(&nv));
++    e.vision = &hv.r;
++    // two good images: their 15 rows reserved; another such request waits (LaneMemory) with nothing moved
++    var s = try lanes.Stream.init(a, .{ .id = "img", .prompt = &ids, .max_new = 8, .images = &.{ im0.img, im1.img } });
++    defer s.deinit(a);
++    const lane = try l.opening(&s);
++    const p = &lane.img.?;
++    try std.testing.expectEqual(@as(u32, 15), st.committed);
++    try std.testing.expectEqual(@as(u32, 15), p.need.reserved);
++    try std.testing.expectEqual(@as(u32, 2), p.count);
++    try std.testing.expectEqual(vs.Image{ .at = 20, .tokens = 9, .rows = 3, .cols = 3, .digest = im1.img.digest }, p.images()[1]);
++    var t = try lanes.Stream.init(a, .{ .id = "img2", .prompt = &ids, .max_new = 8, .images = &.{im1.img} });
++    defer t.deinit(a);
++    try std.testing.expectError(error.LaneMemory, l.opening(&t));
++    try std.testing.expect(l.lanes.count() == 1 and st.committed == 15);
++    // the stream opening again (a new pass on its slot) gives its last pass's rows back first: no wait on itself
++    const again = try l.opening(&s);
++    try std.testing.expectEqual(@as(u32, 15), st.committed);
++    try std.testing.expectEqual(lane.slot, again.slot);
++    // a drop gives them back
++    l.dropLane(&s);
++    try std.testing.expect(l.lanes.count() == 0 and st.committed == 0);
++}
++
++test "inkling2 lanes: an image chunk's splice comes from the stored rows, pins go as chunks pass, and the lane's release frees all" {
++    const a = std.testing.allocator;
++    var e: engine.Engine = undefined;
++    var l = hostLanes(&e);
++    defer l.deinit();
++    var hv: HostVision = undefined;
++    try hv.init(&e, 40, 4);
++    defer hv.deinit();
++    const st = &hv.r.store;
++    var ids: [64]u32 = undefined;
++    for (&ids, 0..) |*t, i| t.* = @intCast(i + 1);
++    var im0 = try HostImage.init(80, 120, 10, 1); // [10, 16)
++    defer im0.deinit();
++    var im1 = try HostImage.init(120, 120, 20, 2); // [20, 29)
++    defer im1.deinit();
++    // both images already stored (an earlier request's towers): hits, no tower
++    const hold = [_]vs.Image{ storeImage(im0.img), storeImage(im1.img) };
++    for (&hold) |*m| {
++        _ = try st.alloc(&m.digest, m.tokens);
++        st.finish(&m.digest);
++        _ = st.unpin(&m.digest);
++    }
++    const r0 = st.find(&hold[0].digest).?.row0;
++    const r1 = st.find(&hold[1].digest).?.row0;
++    // a text stream beside it holds a lane, so releasing the image stream leaves the lanes busy (no idle step)
++    var txt = try lanes.Stream.init(a, .{ .id = "text", .prompt = ids[0..4], .max_new = 8 });
++    defer txt.deinit(a);
++    _ = try l.opening(&txt);
++    var s = try lanes.Stream.init(a, .{ .id = "img", .prompt = &ids, .max_new = 8, .images = &.{ im0.img, im1.img } });
++    defer s.deinit(a);
++    const lane = try l.opening(&s);
++    const p = &lane.img.?;
++    // a text chunk before the images: no splice, nothing pinned
++    try std.testing.expect((try l.imageChunk(&s, p, 0, 10, 0)).ready == null);
++    try std.testing.expectEqual(@as(u32, 0), st.find(&hold[0].digest).?.pins);
++    // a chunk cut inside image 0
++    const c1 = (try l.imageChunk(&s, p, 8, 5, 0)).ready.?;
++    try std.testing.expect(c1.count == 1 and c1.lo == 2 and c1.hi == 5);
++    try std.testing.expectEqual(vs.Span{ .first = 2, .n = 3, .src = st.addr(r0) }, c1.spans[0]);
++    try c1.check(5);
++    try std.testing.expect(!p.need.passed(st, p.images(), 13));
++    try std.testing.expectEqual(@as(u32, 1), st.find(&hold[0].digest).?.pins);
++    // the rest of image 0, text, and image 1 whole: two spans, text rows between them
++    const c2 = (try l.imageChunk(&s, p, 13, 32, 512)).ready.?;
++    try std.testing.expect(c2.count == 2 and c2.lo == 0 and c2.hi == 16);
++    try std.testing.expectEqual(vs.Span{ .first = 0, .n = 3, .src = st.addr(r0 + 3) }, c2.spans[0]);
++    try std.testing.expectEqual(vs.Span{ .first = 7, .n = 9, .src = st.addr(r1) }, c2.spans[1]);
++    try c2.check(32);
++    try c2.within(st.buf, @as(usize, st.rows) * vs.row_bytes);
++    _ = p.need.passed(st, p.images(), 45);
++    try std.testing.expect(st.find(&hold[0].digest).?.pins == 0 and st.find(&hold[1].digest).?.pins == 0);
++    try std.testing.expectEqual(@as(u32, 2), p.need.first);
++    try std.testing.expect((try l.imageChunk(&s, p, 45, 19, 0)).ready == null);
++    // the store's rows stay reserved until the pass ends; the stream's release (a cancel, or the end) frees them
++    try std.testing.expectEqual(@as(u32, 15), st.committed);
++    Lanes.releaseFn(&l, &s);
++    try std.testing.expect(st.committed == 0 and l.lanes.count() == 1);
++    // a pass dropped mid-image: its pins and rows go with the lane
++    const again = try l.opening(&s);
++    _ = (try l.imageChunk(&s, &again.img.?, 12, 2, 0)).ready.?;
++    try std.testing.expectEqual(@as(u32, 1), st.find(&hold[0].digest).?.pins);
++    l.dropLane(&s);
++    try std.testing.expect(st.committed == 0 and st.find(&hold[0].digest).?.pins == 0);
++    // a building entry whose tower state is not held (no unit began it): refused, and the entry dropped
++    var im2 = try HostImage.init(40, 80, 30, 9);
++    defer im2.deinit();
++    const other = storeImage(im2.img);
++    _ = try st.alloc(&other.digest, other.tokens);
++    var cold = try HostImage.init(40, 40, 30, 7);
++    defer cold.deinit();
++    var w = try lanes.Stream.init(a, .{ .id = "img4", .prompt = &ids, .max_new = 8, .images = &.{cold.img} });
++    defer w.deinit(a);
++    const lw = try l.opening(&w);
++    try std.testing.expectError(error.TowerJobLost, l.imageChunk(&w, &lw.img.?, 28, 4, 512));
++    try std.testing.expect(st.job() == null and st.find(&other.digest) == null);
++    l.dropLane(&w);
++    try std.testing.expectEqual(@as(u32, 0), st.committed);
++    l.dropLane(&txt);
++}
++
++/// Tower units for the lanes' host tests: device work counted, a clock that a layer advances, and a failure on demand.
++const HostUnits = struct {
++    work: u32 = 0,
++    begins: u32 = 0,
++    layers_run: u32 = 0,
++    merges: u32 = 0,
++    clock: u64 = 1,
++    fail: bool = false,
++
++    fn of(ctx: *anyopaque) *HostUnits {
++        return @ptrCast(@alignCast(ctx));
++    }
++    fn begin(ctx: *anyopaque, _: u32) anyerror!void {
++        of(ctx).begins += 1;
++        of(ctx).work += 1;
++    }
++    fn layers(ctx: *anyopaque, k: u32) anyerror!void {
++        const h = of(ctx);
++        if (h.fail) return error.FakeFault;
++        h.layers_run += k;
++        h.work += 1;
++        h.clock += 4_000_000 * @as(u64, k);
++    }
++    fn merge(ctx: *anyopaque, _: u32) anyerror!void {
++        of(ctx).merges += 1;
++        of(ctx).work += 1;
++    }
++    fn settle(_: *anyopaque) anyerror!void {}
++    fn now(ctx: *anyopaque) u64 {
++        return of(ctx).clock;
++    }
++    fn units(h: *HostUnits) vs.Units {
++        return .{ .ctx = h, .begin = begin, .layers = layers, .merge = merge, .settle = settle, .now = now };
++    }
++};
++
++test "inkling2 lanes: under a chunk row cap an image step is one tower unit (no forward), each step works, another stream helps, and a failed unit drops the job from every lane" {
++    const a = std.testing.allocator;
++    var e: engine.Engine = undefined;
++    var l = hostLanes(&e);
++    defer l.deinit();
++    var hv: HostVision = undefined;
++    try hv.init(&e, 64, 4);
++    defer hv.deinit();
++    const st = &hv.r.store;
++    const pace = &hv.r.pace;
++    var ids: [64]u32 = undefined;
++    for (&ids, 0..) |*t, i| t.* = @intCast(i + 1);
++    var im0 = try HostImage.init(80, 120, 10, 1); // [10, 16)
++    defer im0.deinit();
++    var im1 = try HostImage.init(120, 120, 20, 2); // [20, 29)
++    defer im1.deinit();
++    var hu: HostUnits = .{};
++    var sa = try lanes.Stream.init(a, .{ .id = "a", .prompt = &ids, .max_new = 8, .images = &.{im0.img} });
++    defer sa.deinit(a);
++    var sb = try lanes.Stream.init(a, .{ .id = "b", .prompt = &ids, .max_new = 8, .images = &.{im1.img} });
++    defer sb.deinit(a);
++    const la = try l.opening(&sa);
++    const lb = try l.opening(&sb);
++    const pa = &la.img.?;
++    const pb = &lb.img.?;
++    // a's first step: begin and one layer, timed (4 ms); no chunk goes out
++    try std.testing.expect(try l.imageChunkOn(&sa, pa, 8, 8, 512, hu.units()) == .worked);
++    try std.testing.expect(hu.begins == 1 and hu.layers_run == 1 and pace.layer_ns == 4_000_000);
++    // b's step meets a's job: it runs a's next unit (help, billed: a capped unit is side work the lane host bills,
++    // though b's step was not settled)
++    try std.testing.expect(try l.imageChunkOn(&sb, pb, 16, 8, 512, hu.units()) == .worked);
++    try std.testing.expectEqual(vs.Help{ .units = 1, .layers = 1, .unbilled = 0 }, pb.help);
++    try std.testing.expect(!pb.need.pinned.isSet(0));
++    // a's settled chunks paced at 20 us a row: 512 rows are 10.24 ms, 2 layers a unit
++    pace.chunked(20_000 * 512, 512);
++    var calls: u32 = 0;
++    while (true) : (calls += 1) {
++        const work = hu.work;
++        const r = try l.imageChunkOn(&sa, pa, 8, 8, 512, hu.units());
++        if (r == .ready) {
++            const sp = r.ready.?;
++            try std.testing.expect(sp.count == 1 and sp.lo == 2 and sp.hi == 8);
++            break;
++        }
++        try std.testing.expect(hu.work > work); // every step that is not the chunk ran a layer or the merger
++    }
++    try std.testing.expectEqual(@as(u32, 11), calls); // 21 layers left, 2 a unit, the merger with the last
++    try std.testing.expect(hu.layers_run == vs.tower_layers and hu.merges == 1);
++    // b's own image now: begin and a timed layer, then units until its chunk goes
++    sb.settle_step = true; // the lane host bills these steps
++    while (try l.imageChunkOn(&sb, pb, 16, 8, 512, hu.units()) == .worked) {}
++    sb.settle_step = false;
++    try std.testing.expect(hu.begins == 2 and hu.merges == 2 and st.find(&im1.img.digest).?.ready);
++    try std.testing.expectEqual(vs.Help{ .units = 1, .layers = 1, .unbilled = 0 }, pb.help);
++    // without a cap the whole tower and the chunk go in one step
++    var im2 = try HostImage.init(40, 80, 40, 3); // [40, 42)
++    defer im2.deinit();
++    var sc = try lanes.Stream.init(a, .{ .id = "c", .prompt = &ids, .max_new = 8, .images = &.{im2.img} });
++    defer sc.deinit(a);
++    const lc = try l.opening(&sc);
++    const work = hu.work;
++    const rc = try l.imageChunkOn(&sc, &lc.img.?, 32, 32, 0, hu.units());
++    try std.testing.expect(rc.ready != null and hu.work == work + 3 and hu.begins == 3);
++    l.dropLane(&sc);
++    // a failed unit: the job leaves the store and every lane's pins (d pins the same image), and d begins it again
++    var im3 = try HostImage.init(80, 80, 40, 4);
++    defer im3.deinit();
++    var sd = try lanes.Stream.init(a, .{ .id = "d", .prompt = &ids, .max_new = 8, .images = &.{im3.img} });
++    defer sd.deinit(a);
++    var se = try lanes.Stream.init(a, .{ .id = "e", .prompt = &ids, .max_new = 8, .images = &.{im3.img} });
++    defer se.deinit(a);
++    const ld = try l.opening(&sd);
++    const le = try l.opening(&se);
++    try std.testing.expect(try l.imageChunkOn(&sd, &ld.img.?, 32, 32, 512, hu.units()) == .worked);
++    try std.testing.expect(try l.imageChunkOn(&se, &le.img.?, 32, 32, 512, hu.units()) == .worked);
++    try std.testing.expectEqual(@as(u32, 2), st.job().?.pins);
++    hu.fail = true;
++    try std.testing.expectError(error.FakeFault, l.imageChunkOn(&sd, &ld.img.?, 32, 32, 512, hu.units()));
++    try std.testing.expect(st.job() == null and pace.job == null);
++    try std.testing.expect(ld.img.?.need.pinned.count() == 0 and le.img.?.need.pinned.count() == 0);
++    hu.fail = false;
++    const begins = hu.begins;
++    try std.testing.expect(try l.imageChunkOn(&se, &le.img.?, 32, 32, 512, hu.units()) == .worked);
++    try std.testing.expectEqual(begins + 1, hu.begins);
++    // the passes end: pins and rows back, the job dropped with its last pin
++    for ([_]*lanes.Stream{ &sa, &sb, &sd, &se }) |x| l.dropLane(x);
++    try std.testing.expect(st.committed == 0 and st.job() == null and l.lanes.count() == 0);
++    try std.testing.expect(pace.help_units == 1 and pace.unbilled_help == 0);
++}
++
++test "inkling2 lanes: while the lane host holds side work an image step runs no capped unit and takes no rows; a stored image is served" {
++    const a = std.testing.allocator;
++    var e: engine.Engine = undefined;
++    var l = hostLanes(&e);
++    defer l.deinit();
++    var hv: HostVision = undefined;
++    try hv.init(&e, 64, 4);
++    defer hv.deinit();
++    const st = &hv.r.store;
++    var ids: [64]u32 = undefined;
++    for (&ids, 0..) |*t, i| t.* = @intCast(i + 1);
++    var im0 = try HostImage.init(80, 120, 10, 1); // [10, 16)
++    defer im0.deinit();
++    var hu: HostUnits = .{};
++    var sa = try lanes.Stream.init(a, .{ .id = "a", .prompt = &ids, .max_new = 8, .images = &.{im0.img} });
++    defer sa.deinit(a);
++    var sb = try lanes.Stream.init(a, .{ .id = "b", .prompt = &ids, .max_new = 8, .images = &.{im0.img} });
++    defer sb.deinit(a);
++    const la = try l.opening(&sa);
++    const lb = try l.opening(&sb);
++    // decode time is owed: a cold image's capped step runs nothing, allocates no rows and pins nothing
++    sa.side_held = true;
++    const r = try l.imageChunkOn(&sa, &la.img.?, 8, 8, 512, hu.units());
++    try std.testing.expect(r != .worked and r != .ready);
++    try std.testing.expect(hu.work == 0 and st.job() == null and st.find(&im0.img.digest) == null);
++    try std.testing.expectEqual(@as(u32, 0), la.img.?.need.pinned.count());
++    // without a chunk row cap nothing is held: the whole tower and the chunk in one step
++    const rw = try l.imageChunkOn(&sa, &la.img.?, 8, 8, 0, hu.units());
++    try std.testing.expect(rw == .ready and hu.begins == 1 and hu.merges == 1);
++    // a stored image is served while held: a hit, no tower
++    sb.side_held = true;
++    const work = hu.work;
++    const rb = try l.imageChunkOn(&sb, &lb.img.?, 8, 8, 512, hu.units());
++    try std.testing.expect(rb == .ready and rb.ready.?.count == 1 and hu.work == work);
++    for ([_]*lanes.Stream{ &sa, &sb }) |x| l.dropLane(x);
++    try std.testing.expect(st.committed == 0 and st.job() == null and l.lanes.count() == 0);
++}
++
++test "inkling2 lanes: a kept state's image key names the images before its cut, and a resume refuses another image's state" {
++    const a = std.testing.allocator;
++    var e: engine.Engine = undefined;
++    var l = hostLanes(&e);
++    defer l.deinit();
++    var hv: HostVision = undefined;
++    try hv.init(&e, 40, 4);
++    defer hv.deinit();
++    var ids: [64]u32 = undefined;
++    for (&ids, 0..) |*t, i| t.* = @intCast(i + 1);
++    var im0 = try HostImage.init(80, 120, 10, 1); // [10, 16)
++    defer im0.deinit();
++    const imgs = [_]lanes.stream.Image{im0.img};
++    const zero: vs.Digest = @splat(0);
++    // the key is the store's prefixKey: zeros up to the image's first row, then its own
++    try std.testing.expectEqual(zero, try imageKey(&imgs, 10));
++    const key = try imageKey(&imgs, 11);
++    try std.testing.expectEqual(vs.prefixKey(&.{storeImage(im0.img)}, 11), key);
++    try std.testing.expect(!std.mem.eql(u8, &zero, &key));
++    try std.testing.expectEqual(key, try imageKey(&imgs, 40));
++    var many: [vs.max_images + 1]lanes.stream.Image = @splat(im0.img);
++    try std.testing.expectError(error.TooManyImages, imageKey(&many, 40));
++    // a state kept at 40 by a request with another image (one digest bit), or with none: refused before any rank
++    // moves, so the pass starts at 0 with every image's rows reserved
++    var other = im0.img;
++    other.digest[0] ^= 0x80;
++    for ([_]vs.Digest{ zero, try imageKey(&.{other}, 40) }) |kept_key| {
++        var k: ic.snap.Kept = .{ .tag = 1, .at = 40, .off = 0, .bytes = 0, .images = kept_key };
++        var s = try lanes.Stream.init(a, .{ .id = "img", .prompt = &ids, .max_new = 8, .images = &imgs, .reuse = .{ .saved = &k, .at = 40 } });
++        defer s.deinit(a);
++        try std.testing.expect(!Lanes.sameImages(&s, &k));
++        const lane = try l.opening(&s);
++        try std.testing.expect(s.reuse_failed);
++        try std.testing.expectEqual(@as(?anyerror, error.ImageDigestDiffers), s.reuse_error);
++        try std.testing.expectEqual(@as(usize, 0), lane.from);
++        try std.testing.expectEqual(@as(u32, 6), hv.r.store.committed);
++        l.dropLane(&s);
++    }
++    // the same images: the key agrees (the resume then goes on to its pages and restore, on the device)
++    const k: ic.snap.Kept = .{ .tag = 1, .at = 40, .off = 0, .bytes = 0, .images = key };
++    var s = try lanes.Stream.init(a, .{ .id = "img", .prompt = &ids, .max_new = 8, .images = &imgs });
++    defer s.deinit(a);
++    try std.testing.expect(Lanes.sameImages(&s, &k));
++    // a text request may resume an image request's state kept before its first image (both keys zeros)
++    const before: ic.snap.Kept = .{ .tag = 1, .at = 10, .off = 0, .bytes = 0, .images = try imageKey(&imgs, 10) };
++    var t = try lanes.Stream.init(a, .{ .id = "text", .prompt = &ids, .max_new = 8 });
++    defer t.deinit(a);
++    try std.testing.expect(Lanes.sameImages(&t, &before));
 +}
 +
 +/// A store of kept states over rank 0's allocator for `reclaimChain` (host tests): the states in the store's order

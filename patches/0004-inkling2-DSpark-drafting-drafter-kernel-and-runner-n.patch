@@ -1,20 +1,20 @@
-From 91ff75ed66f10cb3858fd38f639f5d072a185184 Mon Sep 17 00:00:00 2001
+From 336c3c2e942f3a1b2e470b8c5702bf9311bab96e Mon Sep 17 00:00:00 2001
 From: Scott Biggart <297695+swbiggart@users.noreply.github.com>
-Date: Tue, 17 Nov 2026 19:30:00 -0800
+Date: Fri, 20 Nov 2026 19:30:00 -0800
 Subject: [PATCH 4/8] inkling2: DSpark drafting: drafter kernel and runner,
  native fold tool, draft depth rule
 
 6 files (5 new, 1 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
-Part of the engine changes behind Inkling-2-Small TP4 v0.2 (github.com/swbiggart/inkling2-sparks).
+Part of the engine changes behind Inkling-2-Small TP4 v0.3 (github.com/swbiggart/inkling2-sparks).
 Apply the whole series in order with git am (scripts/build-engine.sh does); only the full series is built and gated.
 ---
- zig/kernels/cuda/inkling2_dspark.cu           |  878 +++++++++++++
+ zig/kernels/cuda/inkling2_dspark.cu           |  878 ++++++++++++
  zig/src/core/lanes/depth.zig                  |  618 ++++++++-
- zig/src/families/inkling2/cuda_dspark.zig     | 1140 +++++++++++++++++
+ zig/src/families/inkling2/cuda_dspark.zig     | 1177 +++++++++++++++++
  .../families/inkling2/cuda_dspark_main.zig    |  244 ++++
  zig/src/families/inkling2/fold.zig            |  422 ++++++
  zig/src/families/inkling2/fold_main.zig       |  171 +++
- 6 files changed, 3453 insertions(+), 20 deletions(-)
+ 6 files changed, 3490 insertions(+), 20 deletions(-)
  create mode 100644 zig/kernels/cuda/inkling2_dspark.cu
  create mode 100644 zig/src/families/inkling2/cuda_dspark.zig
  create mode 100644 zig/src/families/inkling2/cuda_dspark_main.zig
@@ -1728,10 +1728,10 @@ index fd65b6149910d44a0a322ed5c56c6df0772f178c..be99496cc202c84983b068d41622b7ca
  }
 diff --git a/zig/src/families/inkling2/cuda_dspark.zig b/zig/src/families/inkling2/cuda_dspark.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5ad0e7b944
+index 0000000000000000000000000000000000000000..bb336dc2cf8d99f599b73d0b117b2009cfadee56
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_dspark.zig
-@@ -0,0 +1,1140 @@
+@@ -0,0 +1,1177 @@
 +//! Inkling-2-Small's DSpark drafter (the checkpoint's mtp.safetensors: 5 dense layers, a block of 8, a recurrent Markov
 +//! head of rank 256) on the ranks' group, split as the target is: rank r of W holds query heads 48r/W.., key heads
 +//! 8r/W.., a W-th of the MLP's 18,432 and a W-th of the vocabulary (its unembed rows and the head folds). Every rank
@@ -1837,15 +1837,15 @@ index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5a
 +}
 +
 +/// TF_INK2_SHARED_CUT, normalized (cuda_lanes.zig reads it on rank 0 for its shared rounds; every rank puts the
-+/// effective value in the settings fingerprint, cuda_engine.zig): unset (and any unread spelling) `deepen`, `cut` or
-+/// `1`, `deepen` or `2`, `0` off.
++/// value as the lanes resolve it in the settings fingerprint, cuda_engine.zig, `sharedCutEffective`): unset (and any
++/// unread spelling) `deepen`, `cut` or `1`, `deepen` or `2`; off: `0`, `off` or `false` (any case).
 +pub const SharedCut = enum { off, cut, deepen };
 +
 +pub fn parseSharedCut(v: ?[]const u8) SharedCut {
 +    const x = v orelse return .deepen;
 +    if (std.mem.eql(u8, x, "cut") or std.mem.eql(u8, x, "1")) return .cut;
 +    if (std.mem.eql(u8, x, "deepen") or std.mem.eql(u8, x, "2")) return .deepen;
-+    if (std.mem.eql(u8, x, "0")) return .off;
++    if (std.mem.eql(u8, x, "0") or std.ascii.eqlIgnoreCase(x, "off") or std.ascii.eqlIgnoreCase(x, "false")) return .off;
 +    return .deepen;
 +}
 +
@@ -1857,6 +1857,20 @@ index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5a
 +pub fn switchedOff(name: [*:0]const u8) bool {
 +    const v = std.c.getenv(name) orelse return false;
 +    return v[0] == '0' and v[1] == 0;
++}
++
++/// The shared cut as the lanes resolve it (cuda_lanes.zig factsCut, lanes/config.zig): off whenever TF_INK2_DRAFT_CUT=0
++/// (the drafter makes no chances), shared forwards are off (TF_INK2_BATCH=0), the streams' drafts are not one pass
++/// (TF_INK2_DRAFT_STREAMS=0), the pass is not priced (TF_INK2_DRAFT_PRICE=0) or there are no context prices
++/// (TF_INK2_DRAFT_DEPTH=0, `depth_priced` false); else TF_INK2_SHARED_CUT's value.
++pub fn sharedCutResolved(cut: Cut, batch: bool, one_pass: bool, priced: bool, depth_priced: bool, shared: SharedCut) SharedCut {
++    if (cut == .off or !batch or !one_pass or !priced or !depth_priced) return .off;
++    return shared;
++}
++
++/// `sharedCutResolved` from this process's environment (the settings fingerprint's shared cut).
++pub fn sharedCutEffective() SharedCut {
++    return sharedCutResolved(draftCut(), !switchedOff("TF_INK2_BATCH"), !switchedOff("TF_INK2_DRAFT_STREAMS"), !switchedOff("TF_INK2_DRAFT_PRICE"), !switchedOff("TF_INK2_DRAFT_DEPTH"), sharedCut());
 +}
 +
 +pub const Kernels = struct {
@@ -2026,6 +2040,10 @@ index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5a
 +    unembed: u64 = 0, // bf16 [vn][H]
 +    fold_w: u64 = 0, // bf16 [vn][256]
 +    fold_b: u64 = 0, // bf16 [vn]
++    /// The bytes this rank loaded (mtp.safetensors' tensors, the unembed rows it read, the folds), xxh64 in load order,
++    /// when Options.content asked (the NVMe tier's files carry it: cuda_nvme.zig); 0 otherwise.
++    content: u64 = 0,
++    seen_h: ?std.hash.XxHash64 = null,
 +    // the forward's taps (bf16 [8][cap][H]) and the work buffers, for S <= most_streams streams' blocks at once
 +    // (stream s's block rows 8s .. 8s + 7)
 +    cap: usize,
@@ -2084,6 +2102,14 @@ index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5a
 +        try dr.own.append(dr.gpa, b);
 +        dr.bytes += n;
 +        return b.ptr;
++    }
++
++    /// Bytes loaded from `what` at `at`, into the content hash (Options.content).
++    fn seen(dr: *Drafter, what: []const u8, at: u64, bytes: []const u8) void {
++        const h = &(dr.seen_h orelse return);
++        h.update(what);
++        h.update(std.mem.asBytes(&at));
++        h.update(bytes);
 +    }
 +
 +    fn put(dr: *Drafter, bytes: []const u8) !u64 {
@@ -2544,6 +2570,8 @@ index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5a
 +    /// The target's unembed rows of this rank's slice (bf16 [V/W, H]) when it holds exactly them (the vocab-split
 +    /// head), shared instead of read again; 0: read from the checkpoint.
 +    unembed: u64 = 0,
++    /// Hash the bytes loaded into Drafter.content (the NVMe tier on).
++    content: bool = false,
 +};
 +
 +/// The rank's share of the drafter from `dir` (mtp.safetensors, the target's unembed rows, the folds file).
@@ -2554,7 +2582,7 @@ index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5a
 +    if (V % W != 0) return error.BadDraftSplit;
 +    const dr = try gpa.create(Drafter);
 +    errdefer gpa.destroy(dr);
-+    dr.* = .{ .gpa = gpa, .d = d, .k = try Kernels.load(d), .rank = o.rank, .world = o.world, .group = o.group, .hq = heads_all / W, .hk = kv_all / W, .inter = inter_all / W, .vn = V / W, .vlo = o.rank * (V / W), .valid = 0, .context = o.context, .cap = o.cap, .pack_from = packFrom() };
++    dr.* = .{ .gpa = gpa, .d = d, .k = try Kernels.load(d), .rank = o.rank, .world = o.world, .group = o.group, .hq = heads_all / W, .hk = kv_all / W, .inter = inter_all / W, .vn = V / W, .vlo = o.rank * (V / W), .valid = 0, .context = o.context, .cap = o.cap, .pack_from = packFrom(), .seen_h = if (o.content) std.hash.XxHash64.init(0) else null };
 +    errdefer {
 +        for (dr.own.items) |*b| b.free();
 +        dr.own.deinit(gpa);
@@ -2605,6 +2633,7 @@ index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5a
 +        const fw = try r.alloc(gpa, "fuse_weight", .bf16);
 +        defer gpa.free(fw);
 +        if (fw.len != 6 * ntaps * 2) return error.BadDraftCheckpoint;
++        dr.seen("fuse_weight", 0, fw);
 +        // alpha = bf16(softmax(fp32 fuse_weight)) per stage, kept as fp32
 +        var al: [6 * ntaps]f32 = undefined;
 +        for (0..6) |st| {
@@ -2641,6 +2670,7 @@ index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5a
 +        const host = try gpa.alloc(u8, n);
 +        defer gpa.free(host);
 +        if (try f.readPositionalAll(io, host, m.inv.offset(t) + dr.vlo * H * 2) != n) return error.ShortRead;
++        dr.seen("model.llm.unembed.weight", dr.vlo * H * 2, host);
 +        dr.unembed = try dr.put(host);
 +    }
 +    {
@@ -2657,10 +2687,12 @@ index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5a
 +        const hw = try gpa.alloc(u8, dr.vn * mrank * 2);
 +        defer gpa.free(hw);
 +        try fr.readInto(ew, dr.vlo * mrank * 2, hw);
++        dr.seen("fold_w", dr.vlo * mrank * 2, hw);
 +        dr.fold_w = try dr.put(hw);
 +        const hb = try gpa.alloc(u8, dr.vn * 2);
 +        defer gpa.free(hb);
 +        try fr.readInto(eb, dr.vlo * 2, hb);
++        dr.seen("fold_b", dr.vlo * 2, hb);
 +        dr.fold_b = try dr.put(hb);
 +    }
 +    // work buffers
@@ -2716,6 +2748,7 @@ index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5a
 +    }
 +    try s.synchronize();
 +    std.log.info("inkling2 dspark rank {d} of {d}: {d} q heads, {d} kv heads, MLP {d}, vocabulary {d}..{d}: {d:.2} GiB; a slot's caches {d:.3} GiB at {d} positions (the local layers' rings: {d} positions, {d} rows mirrored; {d} bytes a position)", .{ o.rank, o.world, hq, hk, I, dr.vlo, dr.vlo + dr.vn, @as(f64, @floatFromInt(dr.bytes)) / (1 << 30), @as(f64, @floatFromInt(dr.slotBytes())) / (1 << 30), o.context, ringRows(o.context, o.cap), localRows(o.context, o.cap), 2 * hk * D * 2 * @as(usize, if (ringRows(o.context, o.cap) < o.context) 1 else nlayers) });
++    if (dr.seen_h) |*h| dr.content = h.final(); // the NVMe tier's files carry it (0 there: no drafter)
 +    return dr;
 +}
 +
@@ -2744,6 +2777,7 @@ index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5a
 +        const host = try P.dr.gpa.alloc(u8, n);
 +        defer P.dr.gpa.free(host);
 +        try P.r.readInto(e, 0, host);
++        P.dr.seen(name, 0, host);
 +        return P.dr.put(host);
 +    }
 +
@@ -2754,6 +2788,7 @@ index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5a
 +        const host = try P.dr.gpa.alloc(u8, n * 2);
 +        defer P.dr.gpa.free(host);
 +        try P.r.readInto(e, 0, host);
++        P.dr.seen(name, 0, host);
 +        const out = try P.dr.gpa.alloc(f32, n);
 +        defer P.dr.gpa.free(out);
 +        for (out, 0..) |*o, i| o.* = ink.st.bf16ToF32(std.mem.readInt(u16, host[2 * i ..][0..2], .little));
@@ -2771,6 +2806,7 @@ index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5a
 +            const e = try P.entry(c[0]);
 +            if (e.rank != 2 or e.dim(1) != k or c[1] + c[2] > e.dim(0)) return error.BadDraftCheckpoint;
 +            try P.r.readInto(e, c[1] * k * 2, host[at..][0 .. c[2] * k * 2]);
++            P.dr.seen(c[0], c[1] * k * 2, host[at..][0 .. c[2] * k * 2]);
 +            at += c[2] * k * 2;
 +        }
 +        return P.pack(host, n, k);
@@ -2783,6 +2819,7 @@ index 0000000000000000000000000000000000000000..78f3aaa1c3b1fda32f43753ca4cc4f5a
 +        const all = try P.dr.gpa.alloc(u8, n * k * 2);
 +        defer P.dr.gpa.free(all);
 +        try P.r.readInto(e, 0, all);
++        P.dr.seen(name, 0, all);
 +        const host = try P.dr.gpa.alloc(u8, n * kc * 2);
 +        defer P.dr.gpa.free(host);
 +        for (0..n) |i| @memcpy(host[i * kc * 2 ..][0 .. kc * 2], all[(i * k + c0) * 2 ..][0 .. kc * 2]);

@@ -1,11 +1,11 @@
-From 3a4ca65601a46722c656472f47212a6f3213eb1b Mon Sep 17 00:00:00 2001
+From 55d3ee8a04551265dea3cbeafc53e112947135e5 Mon Sep 17 00:00:00 2001
 From: Scott Biggart <297695+swbiggart@users.noreply.github.com>
-Date: Tue, 17 Nov 2026 19:30:00 -0800
+Date: Fri, 20 Nov 2026 19:30:00 -0800
 Subject: [PATCH 5/8] inkling2: prompt cache: exact prefix snapshots,
  shared_first rules, store budget
 
 9 files (2 new, 7 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
-Part of the engine changes behind Inkling-2-Small TP4 v0.2 (github.com/swbiggart/inkling2-sparks).
+Part of the engine changes behind Inkling-2-Small TP4 v0.3 (github.com/swbiggart/inkling2-sparks).
 Apply the whole series in order with git am (scripts/build-engine.sh does); only the full series is built and gated.
 ---
  docs/profiles.md                              |   2 +-
@@ -14,10 +14,10 @@ Apply the whole series in order with git am (scripts/build-engine.sh does); only
  zig/src/core/prompt_cache_queue_room_test.zig |  30 +-
  zig/src/core/prompt_cache_reserve.zig         |  67 +-
  zig/src/core/prompt_rules.zig                 |   3 +
- zig/src/families/inkling2/cuda_snap.zig       | 801 ++++++++++++++++++
+ zig/src/families/inkling2/cuda_snap.zig       | 824 ++++++++++++++++++
  zig/src/families/inkling2/cuda_snap_test.zig  | 171 ++++
  zig/src/native/cuda_snaps.zig                 |   1 +
- 9 files changed, 1057 insertions(+), 33 deletions(-)
+ 9 files changed, 1080 insertions(+), 33 deletions(-)
  create mode 100644 zig/src/families/inkling2/cuda_snap.zig
  create mode 100644 zig/src/families/inkling2/cuda_snap_test.zig
 
@@ -250,10 +250,10 @@ index c3541f08bbcf1b8fe53baacbb1ca06611fbead58..6b67bae995ea0263dfdce2b1ea5316cf
  };
 diff --git a/zig/src/families/inkling2/cuda_snap.zig b/zig/src/families/inkling2/cuda_snap.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..a7c786753d803455e8bfe7cc8f394dce813363b9
+index 0000000000000000000000000000000000000000..194f0b64d0d66322a792a5524b7767bc796bb6cf
 --- /dev/null
 +++ b/zig/src/families/inkling2/cuda_snap.zig
-@@ -0,0 +1,801 @@
+@@ -0,0 +1,824 @@
 +//! Inkling-2's prompt cache on the KV page pool (v0.2 stage 2d; the copies of stage 1 are gone): a kept state at N is
 +//! the stream's whole pages [0, N / 256) by reference, and a copy of the slot's fixed part and the tail rows in one
 +//! slot of a small device arena a rank made at start-up; a resume adopts those pages and copies the fixed part back.
@@ -321,6 +321,9 @@ index 0000000000000000000000000000000000000000..a7c786753d803455e8bfe7cc8f394dce
 +    off: u64,
 +    bytes: u64,
 +    pages: []u32 = &.{},
++    /// The images of the kept prefix (rank 0's host only; cuda_vision_store.zig prefixKey over the images before
++    /// `at`): all zeros for a prefix without images. A resume refuses a state whose images differ (cuda_lanes.zig).
++    images: [32]u8 = @splat(0),
 +};
 +
 +/// Stage 1b: marks one prompt chunk captures inside it at most (more end chunks, as stage 1 did).
@@ -382,8 +385,10 @@ index 0000000000000000000000000000000000000000..a7c786753d803455e8bfe7cc8f394dce
 +}
 +
 +/// Before the commit of convolution state `conv_state` with rows x (the chunk's, from pos0): each mark m's state,
-+/// the commit kernel over (the old state, rows pos0 .. m - 1), into capture i at the convolution's place.
-+fn captureConv(ptr: *anyopaque, c: *const ops.Ctx, conv_state: u64, x: Mat) anyerror!void {
++/// the commit kernel over (the old state, rows pos0 .. m - 1), into capture i at the convolution's place. A chunk in
++/// parts (cuda_xover.zig: x the rows from part.pos0, the state the one before them): only the marks this part's rows
++/// reach (above part.pos0 and at most part.pos0 + x.rows, or at part.pos0 in the first part), from part.pos0.
++fn captureConv(ptr: *anyopaque, c: *const ops.Ctx, conv_state: u64, x: Mat, part: ?@import("cuda_forward.zig").Capture.Part) anyerror!void {
 +    const e: *Engine = @ptrCast(@alignCast(ptr));
 +    const a = &e.snap;
 +    const p = &a.capture;
@@ -397,7 +402,9 @@ index 0000000000000000000000000000000000000000..a7c786753d803455e8bfe7cc8f394dce
 +            if (q == conv_state) {
 +                for (p.marks[0..p.n], 0..) |m, i| {
 +                    const dst = cap.ptr + i * a.cap_stride + off;
-+                    const k = m - p.pos0;
++                    const lo = if (part) |pt| pt.pos0 else p.pos0;
++                    if (part) |pt| if (m < pt.pos0 or m > pt.pos0 + x.rows or (m == pt.pos0 and !pt.first)) continue;
++                    const k = m - lo;
 +                    if (k < conv.state_rows) try c.copy(dst, conv_state, @intCast(n)); // rows before the chunk stay
 +                    try state.convCommit(c, dst, x.slice(0, k));
 +                }
@@ -790,6 +797,22 @@ index 0000000000000000000000000000000000000000..a7c786753d803455e8bfe7cc8f394dce
 +/// The arena at `off` copied into slot `slot`, which then stands at `at` as if its own forwards had ended there.
 +pub fn copyIn(e: *Engine, slot: u32, at: usize, off: u64) !void {
 +    try copy(e, .in, slot, at, off, null);
++    try standAt(e, slot, at);
++}
++
++/// A state's fixed part at device address `base` (the NVMe tier's staging: mapped host memory, the bytes of an arena
++/// slot in the walk's order) copied into slot `slot`, which then stands at `at` as after `copyIn`.
++pub fn copyInFrom(e: *Engine, slot: u32, at: usize, base: u64) !void {
++    const n = try walk(e, null, .in, slot, at, 0, null);
++    if (n != rawBytes(e.w.layers, if (e.drafter) |dr| dr.hk else 0, at)) return error.SnapLayout;
++    const c = ctx(e);
++    _ = try walk(e, &c, .in, slot, at, base, null);
++    try standAt(e, slot, at);
++    e.snap.restores += 1;
++}
++
++/// The slot's scalars after its state at `at` was copied in (its forwards as if they had ended there).
++fn standAt(e: *Engine, slot: u32, at: usize) !void {
 +    const st = e.slots.items[slot].?;
 +    st.pos = at;
 +    st.last_pos0 = at;
@@ -833,7 +856,7 @@ index 0000000000000000000000000000000000000000..a7c786753d803455e8bfe7cc8f394dce
 +/// Tests: every byte of slot `slot`'s state (and its drafter caches) set to `byte`; not its rollback table (the
 +/// slot's own pointers, made once at its start), nor its first `shared` pages (a kept state's, adopted: other
 +/// streams and states read them).
-+fn poison(e: *Engine, slot: u32, byte: u8, shared: usize) !void {
++pub fn poison(e: *Engine, slot: u32, byte: u8, shared: usize) !void {
 +    const st = e.slots.items[slot] orelse return error.UnknownSlot;
 +    for (st.own.items) |b| if (b.ptr != st.keep_table and b.ptr != st.table) try b.fill8(byte, e.stream.handle);
 +    // on the pool: the slot's own mapped pages in every region

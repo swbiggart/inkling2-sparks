@@ -1,11 +1,11 @@
-From bddb9b73ba9e0d25cfc570698bafda6055a63112 Mon Sep 17 00:00:00 2001
+From 21be812dec69a20d2d5b317450cb7c08f875a451 Mon Sep 17 00:00:00 2001
 From: Scott Biggart <297695+swbiggart@users.noreply.github.com>
-Date: Tue, 17 Nov 2026 19:30:00 -0800
+Date: Fri, 20 Nov 2026 19:30:00 -0800
 Subject: [PATCH 6/8] inkling2: tooling: checkpoint-mode oracle and checks,
  template and tokenizer parity
 
-32 files (29 new, 3 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
-Part of the engine changes behind Inkling-2-Small TP4 v0.2 (github.com/swbiggart/inkling2-sparks).
+36 files (33 new, 3 changed upstream files), on TensorFold 223da7659b2f1ec7a6fe666cb064d839382d6fce.
+Part of the engine changes behind Inkling-2-Small TP4 v0.3 (github.com/swbiggart/inkling2-sparks).
 Apply the whole series in order with git am (scripts/build-engine.sh does); only the full series is built and gated.
 ---
  tools/bench_prompts.json                      |   96 +-
@@ -18,6 +18,7 @@ Apply the whole series in order with git am (scripts/build-engine.sh does); only
  tools/zig/inkling2_f64.py                     |  248 +++
  tools/zig/inkling2_g1.py                      |  300 +++
  tools/zig/inkling2_greedy.py                  |  112 ++
+ tools/zig/inkling2_image_fixtures.py          |  276 +++
  tools/zig/inkling2_inventory.py               |   68 +
  tools/zig/inkling2_margins.py                 |  395 ++++
  tools/zig/inkling2_margins_test.py            |   31 +
@@ -38,9 +39,12 @@ Apply the whole series in order with git am (scripts/build-engine.sh does); only
  tools/zig/inkling2_tensors.py                 |   91 +
  tools/zig/inkling2_tokengate.py               |  217 +++
  tools/zig/inkling2_tolerance.py               |  194 ++
+ tools/zig/inkling2_vision_check.py            |  658 +++++++
+ tools/zig/inkling2_vision_check_test.py       |   84 +
+ tools/zig/inkling2_vision_ref.py              |  930 ++++++++++
  tools/zig/template_parity.py                  |   31 +-
  tools/zig/tokenizer_parity.py                 |   17 +-
- 32 files changed, 9576 insertions(+), 23 deletions(-)
+ 36 files changed, 11524 insertions(+), 23 deletions(-)
  create mode 100644 tools/tests/test_inkling2_tokengate.py
  create mode 100644 tools/zig/inkling2_attn_check.py
  create mode 100644 tools/zig/inkling2_chain.py
@@ -50,6 +54,7 @@ Apply the whole series in order with git am (scripts/build-engine.sh does); only
  create mode 100644 tools/zig/inkling2_f64.py
  create mode 100644 tools/zig/inkling2_g1.py
  create mode 100644 tools/zig/inkling2_greedy.py
+ create mode 100644 tools/zig/inkling2_image_fixtures.py
  create mode 100644 tools/zig/inkling2_inventory.py
  create mode 100644 tools/zig/inkling2_margins.py
  create mode 100644 tools/zig/inkling2_margins_test.py
@@ -70,6 +75,9 @@ Apply the whole series in order with git am (scripts/build-engine.sh does); only
  create mode 100644 tools/zig/inkling2_tensors.py
  create mode 100644 tools/zig/inkling2_tokengate.py
  create mode 100644 tools/zig/inkling2_tolerance.py
+ create mode 100644 tools/zig/inkling2_vision_check.py
+ create mode 100644 tools/zig/inkling2_vision_check_test.py
+ create mode 100644 tools/zig/inkling2_vision_ref.py
 
 diff --git a/tools/bench_prompts.json b/tools/bench_prompts.json
 index da5c99e80749edb93560c7331e353d80e94d1ace..5f578a72f09d11187f8f1f35e166666fdf35725b 100644
@@ -2834,6 +2842,288 @@ index 0000000000000000000000000000000000000000..12c77c228426ad28660de3edcd68dfd0
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
+diff --git a/tools/zig/inkling2_image_fixtures.py b/tools/zig/inkling2_image_fixtures.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc0556c86cc4693fac77c3e3aa21d70a97d557ec
+--- /dev/null
++++ b/tools/zig/inkling2_image_fixtures.py
+@@ -0,0 +1,276 @@
++"""Inkling-2 image fixtures and what Transformers' Inkling2ImageProcessor makes of them (gate V1's oracle).
++
++Each case is opened with Pillow, turned upright (ImageOps.exif_transpose) and handed to the processor as the opened
++image, the route that composites alpha onto the processor's checkerboard (design decision D1). For each case the
++output records the upright size, the RGB bytes the processor's convert_to_rgb gives (sha256), the grid and the fp32
++pixel values (sha256 of their little-endian bytes, [rows * cols, 40, 40, 3]).
++
++  small: python -I inkling2_image_fixtures.py --out zig/tests/fixtures/inkling2/images.json
++  large: python -I inkling2_image_fixtures.py --large --out DIR/images.json   (pictures written beside it)
++  check: python -I inkling2_image_fixtures.py --check JSON   (the oracle here, on that json's own pictures)
++
++--check is gate V1's oracle run: encoders differ by platform, so the oracle is rerun on the committed bytes and every
++recorded field must come out equal (exit 1 on any difference, 2 on an empty set).
++
++The Zig side is zig/src/families/inkling2/image_test.zig; TF_INK2_IMAGE_FIXTURES names a large set's json.
++Needs Pillow 12.3.0 (libjpeg-turbo 3.1.4.1, libwebp 1.6.0: the decoders TensorFold pins), torch, torchvision and
++Transformers with models/inkling2 (the oracle's 109a7d19).
++"""
++
++from __future__ import annotations
++
++import argparse
++import base64
++import hashlib
++import io
++import json
++import os
++import platform
++import sys
++
++import numpy as np
++from PIL import Image, ImageOps, features
++
++SIDE = 4096  # the recipe's limit a side (design D2)
++PIXELS = 16 << 20  # TensorFold's decoded-pixel bound
++
++
++def sha(b: bytes) -> str:
++    return hashlib.sha256(b).hexdigest()
++
++
++def gradient(w: int, h: int, channels: int, seed: int) -> np.ndarray:
++    """Smooth ramps plus a noisy channel: every byte value appears, and the files stay small."""
++    y, x = np.mgrid[0:h, 0:w]
++    rng = np.random.default_rng(seed)
++    a = np.empty((h, w, 4), np.uint8)
++    a[..., 0] = (x * 255 // max(w - 1, 1)).astype(np.uint8)
++    a[..., 1] = (y * 255 // max(h - 1, 1)).astype(np.uint8)
++    a[..., 2] = ((x * 7 + y * 13) % 256).astype(np.uint8)
++    # alpha: every value 0..255 along a diagonal, with fully clear and fully opaque runs
++    a[..., 3] = np.clip(((x + 2 * y) % 320) - 32, 0, 255).astype(np.uint8)
++    if min(w, h) <= 64:
++        a[..., 2] = rng.integers(0, 256, (h, w), dtype=np.uint8)
++    return a[..., :channels]
++
++
++def enc(im: Image.Image, fmt: str, **kw) -> bytes:
++    buf = io.BytesIO()
++    im.save(buf, fmt, **kw)
++    return buf.getvalue()
++
++
++def exif_with(o: int) -> bytes:
++    e = Image.Exif()
++    e[0x0112] = o
++    return e.tobytes()
++
++
++def small_cases() -> list[tuple[str, bytes]]:
++    rgb = lambda w, h, s=1: Image.fromarray(gradient(w, h, 3, s))
++    rgba = lambda w, h, s=1: Image.fromarray(gradient(w, h, 4, s))
++    out: list[tuple[str, bytes]] = []
++    # PNG layouts (TensorFold's own decoder)
++    out.append(("png_rgb_1x1", enc(rgb(1, 1), "PNG")))
++    out.append(("png_rgb_39x41", enc(rgb(39, 41), "PNG")))
++    out.append(("png_rgb_40x40", enc(rgb(40, 40), "PNG")))
++    out.append(("png_rgb_41x39", enc(rgb(41, 39), "PNG")))
++    out.append(("png_rgb_448x336", enc(rgb(448, 336), "PNG")))
++    out.append(("png_rgba_partial_97x61", enc(rgba(97, 61), "PNG")))
++    out.append(("png_rgba_opaque_50x30", enc(Image.fromarray(np.dstack([gradient(50, 30, 3, 2), np.full((30, 50), 255, np.uint8)])), "PNG")))
++    out.append(("png_rgba_clear_17x9", enc(Image.fromarray(np.dstack([gradient(17, 9, 3, 3), np.zeros((9, 17), np.uint8)])), "PNG")))
++    out.append(("png_interlaced_rgba_83x45", interlaced(rgba(83, 45, 4))))
++    pal = rgb(64, 48).quantize(colors=200)
++    out.append(("png_palette_64x48", enc(pal, "PNG")))
++    out.append(("png_palette_trns_64x48", enc(pal, "PNG", transparency=bytes((i * 37) % 256 for i in range(200)))))
++    g = Image.fromarray(gradient(70, 33, 3, 5)[..., 0])
++    out.append(("png_gray_70x33", enc(g, "PNG")))
++    out.append(("png_gray_trns_70x33", enc(g, "PNG", transparency=128)))
++    la = Image.fromarray(np.dstack([gradient(45, 50, 3, 6)[..., 1], gradient(45, 50, 4, 6)[..., 3]]), "LA")
++    out.append(("png_gray_alpha_45x50", enc(la, "PNG")))
++    out.append(("png_rgb_trns_33x21", enc(rgb(33, 21, 7), "PNG", transparency=(0, 0, 0))))
++    g16 = Image.fromarray((gradient(60, 20, 3, 8)[..., 0].astype(np.uint16) * 257 + np.arange(60, dtype=np.uint16)[None, :]).astype(np.uint16), "I;16")
++    out.append(("png_gray16_60x20", enc(g16, "PNG")))
++    out.append(("png_1bit_37x29", enc(rgb(37, 29).convert("1"), "PNG")))
++    for o in (3, 6, 8):
++        out.append((f"png_exif{o}_rgba_43x27", enc(rgba(43, 27, 9), "PNG", exif=exif_with(o))))
++    # JPEG (libjpeg-turbo 3.1.4.1)
++    out.append(("jpeg_baseline_448x336", enc(rgb(448, 336), "JPEG", quality=85)))
++    out.append(("jpeg_progressive_123x77", enc(rgb(123, 77, 10), "JPEG", quality=90, progressive=True)))
++    out.append(("jpeg_444_61x39", enc(rgb(61, 39, 11), "JPEG", quality=92, subsampling=0)))
++    out.append(("jpeg_422_61x39", enc(rgb(61, 39, 11), "JPEG", quality=92, subsampling=1)))
++    out.append(("jpeg_420_odd_41x39", enc(rgb(41, 39, 12), "JPEG", quality=75, subsampling=2)))
++    out.append(("jpeg_gray_88x40", enc(rgb(88, 40, 13).convert("L"), "JPEG", quality=80)))
++    out.append(("jpeg_1x1", enc(rgb(1, 1), "JPEG")))
++    for o in range(1, 9):
++        out.append((f"jpeg_exif{o}_57x31", enc(rgb(57, 31, 14), "JPEG", quality=88, exif=exif_with(o))))
++    out.append(("jpeg_cmyk_16x16", enc(rgb(16, 16).convert("CMYK"), "JPEG")))
++    # a multi-picture JPEG: Pillow opens an MpoImageFile of two frames, which the processor's route refuses
++    out.append(("jpeg_mpo_two_48x32", enc(rgb(48, 32, 22), "MPO", save_all=True, append_images=[rgb(48, 32, 23)])))
++    # WebP (libwebp 1.6.0)
++    out.append(("webp_lossy_157x93", enc(rgb(157, 93, 15), "WEBP", quality=80)))
++    out.append(("webp_lossless_64x48", enc(rgb(64, 48, 16), "WEBP", lossless=True)))
++    out.append(("webp_lossy_alpha_57x41", enc(rgba(57, 41, 17), "WEBP", quality=70)))
++    out.append(("webp_lossless_alpha_40x80", enc(rgba(40, 80, 18), "WEBP", lossless=True)))
++    out.append(("webp_exif6_alpha_30x20", enc(rgba(30, 20, 19), "WEBP", lossless=True, exif=exif_with(6))))
++    # refusals before any pixel is allocated
++    out.append(("png_side_4097x1", enc(rgb(4097, 1), "PNG")))
++    out.append(("png_side_1x4097", enc(rgb(1, 4097), "PNG")))
++    frames = [rgb(16, 16, s) for s in (20, 21)]
++    out.append(("png_animated_16x16", enc(frames[0], "PNG", save_all=True, append_images=frames[1:])))
++    out.append(("gif_16x16", enc(rgb(16, 16), "GIF")))
++    return out
++
++
++def interlaced(im: Image.Image) -> bytes:
++    """Pillow cannot write Adam7; build it from the rows with zlib (filter 0 per pass row)."""
++    import struct
++    import zlib
++
++    a = np.asarray(im.convert("RGBA"))
++    h, w = a.shape[:2]
++    raw = bytearray()
++    for x0, y0, dx, dy in ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)):
++        sub = a[y0::dy, x0::dx]
++        if sub.shape[0] == 0 or sub.shape[1] == 0:
++            continue
++        for row in sub:
++            raw += b"\x00" + row.tobytes()
++
++    def chunk(kind: bytes, body: bytes) -> bytes:
++        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
++
++    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 1)) + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
++
++
++def large_cases() -> list[tuple[str, bytes]]:
++    rgb = lambda w, h, s=1: Image.fromarray(gradient(w, h, 3, s))
++    rgba = lambda w, h, s=1: Image.fromarray(gradient(w, h, 4, s))
++    out: list[tuple[str, bytes]] = []
++    for w, h in ((1024, 768), (1920, 1080), (2048, 2048), (3840, 2160), (4096, 4096)):
++        out.append((f"png_rgb_{w}x{h}", enc(rgb(w, h, w + h), "PNG")))
++        out.append((f"jpeg_{w}x{h}", enc(rgb(w, h, w + h), "JPEG", quality=85)))
++    out.append(("png_rgba_1920x1080", enc(rgba(1920, 1080, 31), "PNG")))
++    out.append(("webp_lossy_1920x1080", enc(rgb(1920, 1080, 32), "WEBP", quality=80)))
++    out.append(("webp_alpha_1024x768", enc(rgba(1024, 768, 33), "WEBP", quality=75)))
++    out.append(("jpeg_exif6_4032x3024", enc(rgb(4032, 3024, 34), "JPEG", quality=85, exif=exif_with(6))))
++    out.append(("png_4096x4097", enc(rgb(4096, 4097, 35), "PNG")))
++    return out
++
++
++def processor():
++    from transformers.models.inkling2.image_processing_inkling2 import Inkling2ImageProcessor
++
++    # processor_config.json's image_processor block (its values are the class defaults)
++    return Inkling2ImageProcessor(do_convert_rgb=True, do_normalize=True, do_rescale=True, image_mean=[0.5, 0.5, 0.5], image_std=[0.5, 0.5, 0.5], rescale_factor=0.00392156862745098, size={"height": 40, "width": 40})
++
++
++def oracle(proc, data: bytes) -> dict:
++    """The processor's outcome for one picture, or the refusal the server must give."""
++    import torch
++    from torchvision.transforms.v2 import functional as tvF
++
++    im = Image.open(io.BytesIO(data))
++    if im.format not in ("PNG", "JPEG", "MPO", "WEBP"):  # MPO: Pillow's name for a multi-picture JPEG
++        return {"problem": "format"}
++    if getattr(im, "n_frames", 1) != 1:  # animated PNG or WebP, multi-picture JPEG: one frame is served
++        return {"problem": "animated"}
++    if im.mode == "CMYK":
++        return {"problem": "cmyk"}
++    if max(im.size) > SIDE or im.size[0] * im.size[1] > PIXELS:
++        return {"problem": "side", "width": im.size[0], "height": im.size[1]}
++    im = ImageOps.exif_transpose(im)
++    # the RGB the processor composites (process_image, then convert_to_rgb), recorded for the decode check
++    t = tvF.pil_to_tensor(im.convert("RGBA" if im.has_transparency_data else "RGB"))
++    rgb = proc.convert_to_rgb(t) if t.shape[0] == 4 else t
++    assert rgb.dtype == torch.uint8 and rgb.shape[0] == 3, (rgb.dtype, rgb.shape)
++    hwc = rgb.permute(1, 2, 0).contiguous().numpy()
++    out = proc(images=[im], return_tensors="pt")
++    pv = out["pixel_values"]
++    thw = out["image_grid_thw"].tolist()[0]
++    assert pv.dtype == torch.float32 and tuple(pv.shape[1:]) == (40, 40, 3), (pv.dtype, pv.shape)
++    vals = pv.contiguous().numpy().astype("<f4", copy=False)
++    return {
++        "width": im.width,
++        "height": im.height,
++        "grid": [thw[1], thw[2]],
++        "rgb": sha(hwc.tobytes()),
++        "values": sha(vals.tobytes()),
++        "mode": im.mode,
++    }
++
++
++def check(proc, path: str) -> None:
++    with open(path) as f:
++        want = json.load(f)
++    base = os.path.dirname(os.path.abspath(path))
++    equal, differ = 0, []
++    for c in want["cases"]:
++        data = base64.b64decode(c["b64"]) if "b64" in c else open(os.path.join(base, c["file"]), "rb").read()
++        got = {"name": c["name"], "bytes": sha(data)}
++        got.update(oracle(proc, data))
++        keys = [k for k in c if k not in ("b64", "file")]
++        bad = [k for k in sorted(set(keys) | set(got)) if c.get(k) != got.get(k)]
++        if bad:
++            differ.append((c["name"], {k: (c.get(k), got.get(k)) for k in bad}))
++        else:
++            equal += 1
++    print(f"CHECK {path}: {equal}/{len(want['cases'])} cases equal on every field ({sum('problem' in c for c in want['cases'])} refusals)")
++    for name, d in differ:
++        print("  DIFFER", name, d)
++    if not want["cases"]:
++        sys.exit(2)
++    if differ:
++        sys.exit(1)
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    ap.add_argument("--out")
++    ap.add_argument("--large", action="store_true", help="the large set: pictures written beside --out, not inlined")
++    ap.add_argument("--check", help="a fixtures json: rerun the oracle on its pictures and compare every field")
++    args = ap.parse_args()
++    if not args.out and not args.check:
++        ap.error("--out or --check")
++    import PIL
++    import torch
++    import torchvision
++    import transformers
++
++    assert PIL.__version__ == "12.3.0", PIL.__version__
++    assert features.version_feature("libjpeg_turbo") == "3.1.4.1", features.version_feature("libjpeg_turbo")
++    assert features.version("webp") == "1.6.0", features.version("webp")
++    proc = processor()
++    if args.check:
++        check(proc, args.check)
++        return
++    cases = []
++    for name, data in large_cases() if args.large else small_cases():
++        c = {"name": name, "bytes": sha(data)}
++        if args.large:
++            fn = name + {"\x89P": ".png", "\xff\xd8": ".jpg", "RI": ".webp"}.get(data[:2].decode("latin-1"), ".bin")
++            with open(os.path.join(os.path.dirname(os.path.abspath(args.out)), fn), "wb") as f:
++                f.write(data)
++            c["file"] = fn
++        else:
++            c["b64"] = base64.b64encode(data).decode()
++        c.update(oracle(proc, data))
++        cases.append(c)
++        print(name, c.get("grid", c.get("problem")), file=sys.stderr)
++    source = {
++        "route": "Image.open, ImageOps.exif_transpose, Inkling2ImageProcessor(images=[opened image]) (alpha onto its checkerboard)",
++        "pillow": PIL.__version__,
++        "libjpeg_turbo": features.version_feature("libjpeg_turbo"),
++        "libwebp": features.version("webp"),
++        "torch": torch.__version__,
++        "torchvision": torchvision.__version__,
++        "transformers": transformers.__version__,
++        "machine": platform.machine(),
++    }
++    with open(args.out, "w") as f:
++        json.dump({"source": source, "cases": cases}, f, indent=0)
++        f.write("\n")
++
++
++if __name__ == "__main__":
++    main()
 diff --git a/tools/zig/inkling2_inventory.py b/tools/zig/inkling2_inventory.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..b5ff33a391bf34f46bc5c6dcc931988950ddd9fa
@@ -9798,6 +10088,1696 @@ index 0000000000000000000000000000000000000000..d0aa1fc218dbfce94c2530397ef0f832
 +    if a.json:
 +        with open(a.json, "w") as f:
 +            json.dump(res, f, indent=1)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/zig/inkling2_vision_check.py b/tools/zig/inkling2_vision_check.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..439c6517e223ff0ecbdf615dda2ac04a57663d5a
+--- /dev/null
++++ b/tools/zig/inkling2_vision_check.py
+@@ -0,0 +1,658 @@
++"""Inkling-2 vision tower gates V2-V5: the native tower's tables, ops, output rows and pinned bits against the image
++oracle's files (tools/zig/inkling2_vision_ref.py). Every command prints one JSON verdict on stdout (progress goes to
++stderr), carries the counts of the tables, ops, rows, layers and fixtures it looked at, and exits 1 on any FAIL. A
++verdict over zero items is EMPTY, which counts as a failure: PASS is printed only over a non-empty, complete set.
++
++USAGE = python tools/zig/inkling2_vision_check.py v2 TABLES OURS [--strict-nan] [--json OUT]
++        python tools/zig/inkling2_vision_check.py v3 --model DIR --torch FIXTURE.sdpa.ops.safetensors
++                   --ours OURS.ops.safetensors [--ours-from-torch] [--grid R,C] [--threads N] [--json OUT]
++        python tools/zig/inkling2_vision_check.py v4 --forms-dir DIR --fixture NAME --ours OURS.safetensors
++                   [--bar-forms sdpa,sdpa+red32,...] [--rows-only] [--json OUT]
++        python tools/zig/inkling2_vision_check.py v5 FILE... [--key rows] [--variants a,b,...] [--json OUT]
++
++  v2  Bit-equal tables. TABLES is the oracle's `tables` output (tables.safetensors); OURS uses the same key names:
++        gelu.in, gelu.out          all 65,536 bf16 inputs and torch's erf GELU of each (on the GPU model of the run)
++        rope.inv_freq [16], rope.cos / rope.sin [416, 16]   fp32, angles pos * inv_freq for pos 0..415
++        pos.idx.<r>x<c> [4rc, 4], pos.w.<r>x<c> [4rc, 4], pos.ids.<r>x<c> [4rc, 2]
++                                   bilinear taps, fp32 weights and (row, col) ids of a token grid, patches in block
++                                   order (Transformers' vision_utils); ids without the model's +1
++      Each table key of TABLES must be in OURS with the same shape and the same bits (floats compared as their bit
++      patterns; integer tables by value, any integer width). Two NaNs count as equal whatever their payloads unless
++      --strict-nan (the count is reported). Keys only OURS has are listed and not judged.
++
++  v3  Per op, on torch default's recorded inputs (the oracle's `tower --ops` file of form sdpa; one image). Each op
++      is recomputed here in float64 from TORCH'S RECORDED INPUTS with the checkpoint's weights (bf16 -> f64), and
++      both torch default's output and ours are measured against it: normwise rel error (inkling2_f64.rel) and max
++      |diff|; also ours' bit-equal share with torch, the share of ours equal to bf16(fp64), and the rounding floor
++      rel(bf16(fp64)) with torch's distance over it. PASS per op iff rel(ours) <= rel(torch default) (with --tie-rel
++      TIE: <= rel(torch) * (1 + TIE); the strict verdict is kept beside it as verdict_strict). OURS is the native
++      tool's dump made from the same inputs, with these keys (the same shapes as torch's; [S, ...] rows with row 0
++      the class token, patches in block order):
++        E2.patch.out        from E2.patch.in
++        E4.embeddings.out   from torch's E2.patch.out + the position sum (taps and fp32 weights from vision_utils as
++                            the model computes them) and the class row class_embedding + cls_position_embedding
++        E5.ln_pre.out       from E5.ln_pre.in
++        L<i>.L1.ln_1.out, L<i>.L2.{q,k,v}_proj.out    from L<i>.L1.ln_1.in / L<i>.L2.{q,k,v}_proj.in
++        L<i>.rot.{q,k}_out  from L<i>.rot.{q,k}_in [S, 16, 64]
++        L<i>.core.out       [1, 16, S, 64] from L<i>.core.{q,k,v}: softmax over all keys, scale 0.125, query blocks
++        L<i>.L2.out_proj.out
++        L<i>.res1.out       layer.in + lambda_1 * out_proj.out (torch's L<i>.L7.ln_2.in)
++        L<i>.L7.ln_2.out
++        L<i>.L8.gelu.out    gelu(fc1(L<i>.L8.fc1.in)), erf form (torch's L<i>.L8.gelu.out)
++        L<i>.L8.fc2.out
++        L<i>.res2.out       L7.ln_2.in + lambda_2 * fc2.out (torch's L<i>.layer.out)
++        M2.linear_1.out, M2.gelu.out (from M2.gelu.in), M2.linear_2.out
++      for every layer i the torch file recorded. fp64 rotary (a choice, the same as the oracle's fp64 form): inv_freq
++      = 1 / theta^(2j/32) in float64, angles = position * inv_freq in float64 (positions: patches (row, col) + 1,
++      the class row (0, 0); column angles in the first 16 pairs), cos/sin and the rotation in float64. The fp64 cos
++      is checked against torch's recorded fp32 cos/sin (a layout check; it stops on a mismatch above 1e-4).
++      --ours-from-torch reads OURS as another oracle ops file and maps torch's keys to ours' (the self-test; that
++      file's ops ran on its own inputs, so past the first op its numbers are not a same-input comparison).
++      --grid R,C, else the grid of the sibling rows file (FIXTURE.sdpa.safetensors), else OURS' `grid`.
++
++  v4  Free-running output. DIR holds the oracle's tower files <NAME>.<form>.safetensors (rows [T, 4608] and the
++      sampled layer rows layer.<i> at layer.rows); <NAME>.fp64.safetensors is the reference. OURS has `rows` and the
++      23 `layer.<i>` either at the reference's `layer.rows` (then OURS' own layer.rows must equal it) or at every
++      tower row (then those rows are taken). Each of rows and every layer: rel vs fp64; PASS iff ours <= the largest
++      rel among torch's own forms present (--bar-forms, default sdpa, sdpa+red32, eager, eager+red32, sdpa-math;
++      f32core and any other form in DIR are reported, never a bar). --rows-only judges the output rows alone (the
++      verdict records it).
++
++  v5  Pinned bits. FILE...: engine output files of the same fixtures under different variants (row block, query
++      block, slice, run, GPU). Fixture and variant come from the file's safetensors metadata (`fixture`, `variant`)
++      or else from its name, <fixture>.<variant>.safetensors with <fixture> ending in an image extension (.png,
++      .jpg, .jpeg, .webp; without one, the first dot splits). sha256 of KEY's bytes (bf16 as int16, the oracle's
++      rows_sha256) per file; PASS per fixture iff every file holds KEY nonempty, all have one shape, one dtype and one
++      sha256, and at least 2 distinct variants are present (and every --variants name, when given). KEY `rows` (the
++      default, the tower's output rows) must also be bf16 [T, 4608].
++
++Runs on the CPU (torch threads --threads, default 16); v3 imports Transformers' Inkling2 code for the config, the
++position taps and the position ids. Transformers (Apache-2.0) is imported at run time; this file copies none of it.
++"""
++
++import argparse
++import hashlib
++import json
++import math
++import os
++import re
++import sys
++import time
++
++import torch
++import torch.nn.functional as F
++from safetensors import safe_open
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from inkling2_f64 import rel  # noqa: E402  (the normwise relative error every gate uses)
++
++BF = torch.bfloat16
++TORCH_FORMS = ["sdpa", "sdpa+red32", "eager", "eager+red32", "sdpa-math"]
++TOWER_WIDTH = 4608  # the tower's output rows: bf16 [T, 4608]
++IMAGE_EXT = re.compile(r"^(?P<fixture>.+?\.(?:png|jpe?g|webp))\.(?P<variant>.+)$", re.IGNORECASE)
++
++
++def log(*a):
++    print(*a, file=sys.stderr, flush=True)
++
++
++def file_sha(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        for b in iter(lambda: f.read(1 << 24), b""):
++            h.update(b)
++    return h.hexdigest()
++
++
++def tensor_sha(t: torch.Tensor) -> str:
++    """sha256 of the tensor's bytes (bf16 as its int16 bits): the oracle's rows_sha256."""
++    t = t.detach().contiguous().cpu()
++    if t.dtype == BF:
++        t = t.view(torch.int16)
++    return hashlib.sha256(t.numpy().tobytes()).hexdigest()
++
++
++BITS = {BF: torch.int16, torch.float16: torch.int16, torch.float32: torch.int32, torch.float64: torch.int64}
++
++
++def bits(t: torch.Tensor) -> torch.Tensor:
++    return t.view(BITS[t.dtype])
++
++
++def share_equal(a: torch.Tensor, b: torch.Tensor) -> float:
++    """Share of elements with the same bits (0 for different dtypes or shapes)."""
++    if a.dtype != b.dtype or a.shape != b.shape:
++        return 0.0
++    if not a.numel():
++        return 1.0
++    if a.is_floating_point():
++        return float((bits(a) == bits(b)).double().mean())
++    return float((a == b).double().mean())
++
++
++def max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
++    return float((a.double() - b.double()).abs().max()) if a.numel() else 0.0
++
++
++def finish(report: dict, a) -> int:
++    report["tool_sha256"] = file_sha(os.path.abspath(__file__))
++    report["torch"] = torch.__version__
++    report["argv"] = sys.argv[1:]
++    report["utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++    text = json.dumps(report, indent=1)
++    if getattr(a, "json", ""):
++        with open(a.json, "w") as f:
++            f.write(text + "\n")
++    print(text)
++    return 0 if report["verdict"] == "PASS" else 1
++
++
++def overall(verdicts: list) -> str:
++    if not verdicts:
++        return "EMPTY"
++    return "PASS" if all(v == "PASS" for v in verdicts) else "FAIL"
++
++
++# ----------------------------------------------------------------------------------------------------- v2
++
++
++def cmd_v2(a) -> int:
++    ft, fo = safe_open(a.tables, framework="pt"), safe_open(a.ours, framework="pt")
++    tkeys, okeys = sorted(ft.keys()), set(fo.keys())
++    items = []
++    for k in tkeys:
++        want = ft.get_tensor(k)
++        it = {"key": k, "shape": list(want.shape), "dtype": str(want.dtype).replace("torch.", ""),
++              "elements": want.numel()}
++        if k not in okeys:
++            items.append(it | {"verdict": "FAIL", "note": "missing in OURS"})
++            continue
++        got = fo.get_tensor(k)
++        it["ours_dtype"] = str(got.dtype).replace("torch.", "")
++        if tuple(got.shape) != tuple(want.shape):
++            items.append(it | {"verdict": "FAIL", "note": f"shape {list(got.shape)}"})
++            continue
++        if want.is_floating_point():
++            if got.dtype != want.dtype:
++                items.append(it | {"verdict": "FAIL", "note": "dtype differs"})
++                continue
++            same = bits(got) == bits(want)
++            both_nan = torch.isnan(got) & torch.isnan(want)
++            nan_payload = int((both_nan & ~same).sum())
++            ok = same if a.strict_nan else (same | both_nan)
++            it |= {"equal": int(ok.sum()), "nan_payload_differs": nan_payload,
++                   "max_abs_finite": max_abs(got[(fin := torch.isfinite(want) & torch.isfinite(got))], want[fin])}
++        else:
++            if got.is_floating_point():
++                items.append(it | {"verdict": "FAIL", "note": "float against an integer table"})
++                continue
++            ok = got.to(torch.int64) == want.to(torch.int64)
++            it |= {"equal": int(ok.sum())}
++        it["differ"] = it["elements"] - it["equal"]
++        it["verdict"] = "PASS" if it["elements"] > 0 and it["differ"] == 0 else ("EMPTY" if not it["elements"] else
++                                                                                  "FAIL")
++        if it["differ"]:
++            bad = (~ok).reshape(-1).nonzero()[:5].reshape(-1).tolist()
++            it["first_differ_at"] = bad
++        items.append(it)
++        log(f"v2 {k:22s} {it['verdict']} {it['equal']}/{it['elements']}")
++    v = overall([i["verdict"] for i in items])
++    rep = {"cmd": "v2", "verdict": v,
++           "counts": {"tables": len(items), "tables_pass": sum(i["verdict"] == "PASS" for i in items),
++                      "elements": sum(i["elements"] for i in items),
++                      "elements_differ": sum(i.get("differ", i["elements"]) for i in items),
++                      "ours_only_keys": sorted(okeys - set(tkeys))},
++           "strict_nan": a.strict_nan, "inputs": {"tables": a.tables, "tables_sha256": file_sha(a.tables),
++                                                  "ours": a.ours, "ours_sha256": file_sha(a.ours)},
++           "items": items}
++    return finish(rep, a)
++
++
++# ----------------------------------------------------------------------------------------------------- v3
++
++
++class Weights:
++    """The checkpoint's model.visual.* tensors, bf16 -> float64 on the CPU, read on demand."""
++
++    def __init__(self, folder: str):
++        self.folder = folder
++        idx = os.path.join(folder, "model.safetensors.index.json")
++        self.map = json.load(open(idx))["weight_map"]
++        self.files = {}
++        self.dtypes = set()
++
++    def __call__(self, name: str) -> torch.Tensor:
++        full = "model.visual." + name
++        shard = self.map[full]
++        if shard not in self.files:
++            self.files[shard] = safe_open(os.path.join(self.folder, shard), framework="pt")
++        t = self.files[shard].get_tensor(full)
++        self.dtypes.add(str(t.dtype))
++        if t.dtype != BF:
++            raise SystemExit(f"{full}: {t.dtype}, expected bf16")
++        return t.double()
++
++
++def ours_adapter_key(op: str) -> str:
++    """Torch's key holding the value of ours' key `op` (for --ours-from-torch and torch's own output)."""
++    m = re.match(r"^(L\d+)\.(res1|res2)\.out$", op)
++    if m:
++        return m.group(1) + (".L7.ln_2.in" if m.group(2) == "res1" else ".layer.out")
++    return op
++
++
++def f64_core(q, k, v, scale: float, log_every: float = 30.0):
++    """softmax(q.k^T * scale) . v in float64 over all keys, in query blocks. q, k, v: [1, H, S, D]."""
++    q, k, v = q.double(), k.double(), v.double()
++    S = q.shape[2]
++    blk = max(16, min(S, int(2 ** 30 // (8 * q.shape[1] * max(S, 1)))))
++    out = torch.empty_like(q)
++    kt = k.transpose(2, 3)
++    t0, last = time.time(), time.time()
++    for a in range(0, S, blk):
++        s = torch.matmul(q[:, :, a:a + blk], kt) * scale
++        out[:, :, a:a + blk] = torch.matmul(torch.softmax(s, dim=-1), v)
++        if time.time() - last > log_every:
++            last = time.time()
++            log(f"  core {a + blk}/{S} rows, {time.time() - t0:.0f} s")
++    return out
++
++
++def cmd_v3(a) -> int:
++    from transformers.models.inkling2 import modeling_inkling2 as M
++    from transformers.models.inkling2.configuration_inkling2 import Inkling2VisionConfig
++
++    torch.set_num_threads(a.threads)
++    raw = json.load(open(os.path.join(a.model, "config.json")))["vision_config"]
++    cfg = Inkling2VisionConfig(**raw)
++    eps = float(cfg.layer_norm_eps)
++    theta = float(cfg.rope_parameters["rope_theta"])
++    heads, hidden = cfg.num_attention_heads, cfg.hidden_size
++    hd = hidden // heads
++    merge = cfg.spatial_merge_size
++    if cfg.hidden_act != "gelu":
++        raise SystemExit(f"hidden_act {cfg.hidden_act}: this check computes the erf GELU")
++    W = Weights(a.model)
++    ft = safe_open(a.torch, framework="pt")
++    fo = safe_open(a.ours, framework="pt")
++    tkeys, okeys = set(ft.keys()), set(fo.keys())
++    T_ = ft.get_tensor  # torch's recorded tensors
++
++    # grid: --grid, the sibling rows file, or ours' grid
++    grid, grid_from = None, None
++    if a.grid:
++        grid, grid_from = [int(x) for x in a.grid.split(",")], "--grid"
++    else:
++        sib = re.sub(r"\.ops\.safetensors$", ".safetensors", a.torch)
++        if sib != a.torch and os.path.exists(sib):
++            g = safe_open(sib, framework="pt").get_tensor("grid").reshape(-1).tolist()
++            grid, grid_from = g[-2:], os.path.basename(sib)
++        elif "grid" in okeys:
++            grid, grid_from = fo.get_tensor("grid").reshape(-1).tolist()[-2:], "OURS grid"
++    if grid is None:
++        raise SystemExit("no grid: pass --grid R,C")
++    rows_, cols_ = grid
++    P = 4 * rows_ * cols_
++    S = P + 1
++    if T_("E2.patch.in").shape[0] != P or T_("E5.ln_pre.in").shape[0] != S:
++        raise SystemExit(f"grid {rows_}x{cols_} (P {P}) does not match the torch file "
++                         f"(E2.patch.in {list(T_('E2.patch.in').shape)}, one image only)")
++    layers = sorted(int(m.group(1)) for k in tkeys if (m := re.match(r"^L(\d+)\.layer\.in$", k)))
++    thw = torch.tensor([[1, rows_ * merge, cols_ * merge]])
++    idx, wts = M.get_vision_interpolation_indices_and_weights(thw, num_grid_per_side=cfg.posemb_grid_size,
++                                                              mode="bilinear", align_corners=False,
++                                                              spatial_merge_size=merge, kwargs={})
++    pid = M.get_vision_position_ids(thw, merge, kwargs={}).to(torch.int64)
++    pos = torch.zeros(S, 2, dtype=torch.int64)
++    pos[1:] = pid + 1
++    inv64 = 1.0 / (theta ** (torch.arange(0, hd // 2, 2, dtype=torch.float64) / (hd // 2)))
++    fr = pos[..., None].double() * inv64  # [S, 2, 16]: column 0 = row, 1 = col
++
++    def recompose(x):
++        return torch.cat([x[:, 1], x[:, 0]], dim=-1).repeat_interleave(2, dim=-1)  # column angles first
++
++    cos64, sin64 = recompose(fr.cos()), recompose(fr.sin())
++    table_check = {}
++    for i in layers:
++        if f"L{i}.rot.cos" in tkeys:
++            table_check[f"L{i}"] = {"cos_max_abs_vs_torch_fp32": max_abs(cos64, T_(f"L{i}.rot.cos")),
++                                    "sin_max_abs_vs_torch_fp32": max_abs(sin64, T_(f"L{i}.rot.sin"))}
++            if max(table_check[f"L{i}"].values()) > 1e-4:
++                raise SystemExit(f"fp64 rotary tables disagree with torch's recorded ones: {table_check}")
++
++    def rot64(x):
++        x = x.double()
++        x2 = x.view(*x.shape[:-1], -1, 2)
++        r = torch.stack((-x2[..., 1], x2[..., 0]), dim=-1).flatten(start_dim=-2)
++        return x * cos64[:, None, :] + r * sin64[:, None, :]
++
++    def lin(x, w, b=None):
++        return F.linear(x.double(), w, b)
++
++    def ln(x, p):
++        return F.layer_norm(x.double(), (hidden,), W(p + ".weight"), W(p + ".bias"), eps)
++
++    def bb(n):
++        return "backbone." + n
++
++    # (ours' key, fp64 from torch's recorded inputs)
++    plan = [("E2.patch.out", lambda: lin(T_("E2.patch.in"), W(bb("embeddings.patch_embedding.weight"))))]
++
++    def e4():
++        table = W(bb("embeddings.position_embedding"))
++        posum = (table[idx] * wts.double()[:, :, None]).sum(1)
++        out = torch.empty(S, hidden, dtype=torch.float64)
++        out[0] = W(bb("embeddings.class_embedding")) + W(bb("embeddings.cls_position_embedding"))
++        out[1:] = T_("E2.patch.out").double() + posum
++        return out
++
++    plan += [("E4.embeddings.out", e4), ("E5.ln_pre.out", lambda: ln(T_("E5.ln_pre.in"), bb("ln_pre")))]
++    for i in layers:
++        L, p = f"L{i}.", bb(f"layers.{i}.")
++        plan.append((L + "L1.ln_1.out", lambda L=L, p=p: ln(T_(L + "L1.ln_1.in"), p + "ln_1")))
++        for n in ("q", "k", "v"):
++            plan.append((L + f"L2.{n}_proj.out", lambda L=L, p=p, n=n: lin(
++                T_(L + f"L2.{n}_proj.in"), W(p + f"self_attn.{n}_proj.weight"), W(p + f"self_attn.{n}_proj.bias"))))
++        for n in ("q", "k"):
++            plan.append((L + f"rot.{n}_out", lambda L=L, n=n: rot64(T_(L + f"rot.{n}_in"))))
++        plan.append((L + "core.out", lambda L=L: f64_core(T_(L + "core.q"), T_(L + "core.k"), T_(L + "core.v"),
++                                                           hd ** -0.5)))
++        plan.append((L + "L2.out_proj.out", lambda L=L, p=p: lin(
++            T_(L + "L2.out_proj.in"), W(p + "self_attn.out_proj.weight"), W(p + "self_attn.out_proj.bias"))))
++        plan.append((L + "res1.out", lambda L=L, p=p: T_(L + "layer.in").double()
++                     + W(p + "ls_1.gamma") * T_(L + "L2.out_proj.out").double()))
++        plan.append((L + "L7.ln_2.out", lambda L=L, p=p: ln(T_(L + "L7.ln_2.in"), p + "ln_2")))
++        plan.append((L + "L8.gelu.out", lambda L=L, p=p: F.gelu(lin(
++            T_(L + "L8.fc1.in"), W(p + "mlp.c_fc.weight"), W(p + "mlp.c_fc.bias")))))
++        plan.append((L + "L8.fc2.out", lambda L=L, p=p: lin(
++            T_(L + "L8.fc2.in"), W(p + "mlp.c_proj.weight"), W(p + "mlp.c_proj.bias"))))
++        plan.append((L + "res2.out", lambda L=L, p=p: T_(L + "L7.ln_2.in").double()
++                     + W(p + "ls_2.gamma") * T_(L + "L8.fc2.out").double()))
++    plan += [("M2.linear_1.out", lambda: lin(T_("M2.linear_1.in"), W("proj_in.weight"))),
++             ("M2.gelu.out", lambda: F.gelu(T_("M2.gelu.in").double())),
++             ("M2.linear_2.out", lambda: lin(T_("M2.linear_2.in"), W("proj_out.weight")))]
++
++    items = []
++    for op, f64 in plan:
++        tk = ours_adapter_key(op)
++        ok_key = tk if a.ours_from_torch else op
++        it = {"op": op, "torch_key": tk}
++        t0 = time.time()
++        if tk not in tkeys:
++            items.append(it | {"verdict": "FAIL", "note": "missing in the torch file"})
++            continue
++        tv = T_(tk)
++        it |= {"shape": list(tv.shape), "rows": int(tv.shape[2] if ".core." in op else tv.shape[0]),
++               "elements": tv.numel()}
++        with torch.no_grad():
++            ref = f64().reshape(tv.shape)
++        rb = ref.to(tv.dtype)
++        it |= {"rel_torch": rel(tv, ref), "max_abs_torch": max_abs(tv, ref),
++               "torch_eq_bf16_fp64": share_equal(tv, rb), "rel_floor_bf16_fp64": rel(rb, ref)}
++        it["torch_over_floor"] = it["rel_torch"] / it["rel_floor_bf16_fp64"] if it["rel_floor_bf16_fp64"] else None
++        if ok_key not in okeys:
++            items.append(it | {"verdict": "FAIL", "note": f"{ok_key} missing in OURS"})
++            log(f"v3 {op:22s} MISSING in OURS")
++            continue
++        ov = fo.get_tensor(ok_key)
++        if ov.numel() != tv.numel():
++            items.append(it | {"verdict": "FAIL", "note": f"OURS shape {list(ov.shape)}"})
++            continue
++        if list(ov.shape) != list(tv.shape):
++            it["note"] = f"OURS shape {list(ov.shape)} read as {list(tv.shape)}"
++            ov = ov.reshape(tv.shape)
++        if ov.dtype != tv.dtype:
++            items.append(it | {"verdict": "FAIL", "note": f"OURS dtype {ov.dtype}, torch's {tv.dtype}"})
++            continue
++        it |= {"rel_ours": rel(ov, ref), "max_abs_ours": max_abs(ov, ref), "bit_equal_ours_torch": share_equal(ov, tv),
++               "ours_eq_bf16_fp64": share_equal(ov, rb)}
++        it["ratio"] = it["rel_ours"] / it["rel_torch"] if it["rel_torch"] > 0 else (
++            0.0 if it["rel_ours"] == 0 else math.inf)
++        it["verdict_strict"] = "PASS" if it["rel_ours"] <= it["rel_torch"] else "FAIL"
++        it["verdict"] = "PASS" if it["rel_ours"] <= it["rel_torch"] * (1 + a.tie_rel) else "FAIL"
++        it["seconds"] = round(time.time() - t0, 2)
++        items.append(it)
++        log(f"v3 {op:22s} torch {it['rel_torch']:.3e} ours {it['rel_ours']:.3e} ratio {it['ratio']:.3f} "
++            f"eq(o,t) {it['bit_equal_ours_torch']:.4f} {it['verdict']} ({it['seconds']} s)")
++        del ref, rb, tv, ov
++    v = overall([i["verdict"] for i in items])
++    rep = {"cmd": "v3", "verdict": v,
++           "counts": {"ops": len(items), "ops_pass": sum(i["verdict"] == "PASS" for i in items),
++                      "ops_fail": sum(i["verdict"] != "PASS" for i in items), "layers": layers,
++                      "tower_rows": S, "tokens": rows_ * cols_, "fixtures": 1},
++           "tie_rel": a.tie_rel, "ops_fail_strict": sum(i.get("verdict_strict", "FAIL") != "PASS" for i in items),
++           "grid": [rows_, cols_], "grid_from": grid_from, "ours_from_torch": a.ours_from_torch,
++           "fp64_rotary": "inv_freq = 1/theta^(2j/32) and angles = pos * inv_freq in float64",
++           "rotary_table_check": table_check, "weights_dtypes": sorted(W.dtypes),
++           "inputs": {"model": a.model, "torch": a.torch, "torch_sha256": file_sha(a.torch), "ours": a.ours,
++                      "ours_sha256": file_sha(a.ours)},
++           "items": items}
++    return finish(rep, a)
++
++
++# ----------------------------------------------------------------------------------------------------- v4
++
++
++def dist(got: torch.Tensor, ref: torch.Tensor) -> dict:
++    return {"rel": rel(got, ref), "max_abs": max_abs(got, ref),
++            "bit_equal_to_rounded_ref": share_equal(got, ref.to(got.dtype)) if got.dtype != ref.dtype else 1.0}
++
++
++def form_path(d: str, name: str, form: str):
++    for n in (name, name + ".png"):
++        p = os.path.join(d, f"{n}.{form}.safetensors")
++        if os.path.exists(p):
++            return p
++    return None
++
++
++def load_tower(path: str) -> dict:
++    f = safe_open(path, framework="pt")
++    return {k: f.get_tensor(k) for k in f.keys()}
++
++
++def cmd_v4(a) -> int:
++    torch.set_num_threads(a.threads)
++    ref_path = form_path(a.forms_dir, a.fixture, "fp64")
++    if not ref_path:
++        raise SystemExit(f"no {a.fixture}.fp64.safetensors in {a.forms_dir}")
++    ref = load_tower(ref_path)
++    name = os.path.basename(ref_path)[:-len(".fp64.safetensors")]
++    lkeys = sorted((k for k in ref if re.match(r"^layer\.\d+$", k)), key=lambda k: int(k.split(".")[1]))
++    sel = ref.get("layer.rows")
++    bar_forms = a.bar_forms.split(",")
++    others = sorted(re.sub(r"\.safetensors$", "", os.path.basename(p)[len(name) + 1:])
++                    for p in os.listdir(a.forms_dir) if p.startswith(name + ".") and p.endswith(".safetensors")
++                    and not p.endswith(".ops.safetensors") and ".packed." not in p)
++    others = [f for f in others if f not in bar_forms and f != "fp64"]
++    forms = {}
++    for f in bar_forms + others:
++        p = form_path(a.forms_dir, name, f)
++        if not p:
++            continue
++        g = load_tower(p)
++        d = {"bar": f in bar_forms, "rows": dist(g["rows"], ref["rows"]), "rows_sha256": tensor_sha(g["rows"]),
++             "layers": {k: rel(g[k], ref[k]) for k in lkeys if k in g}}
++        forms[f] = d
++        log(f"v4 {f:14s} rows rel {d['rows']['rel']:.4e}{'' if d['bar'] else '  (not a bar)'}")
++    ours = load_tower(a.ours)
++    items = []
++    bars = [f for f in forms if forms[f]["bar"]]
++    # rows
++    it = {"item": "rows", "rows": int(ref["rows"].shape[0]), "bar_forms": bars}
++    if "rows" not in ours or ours["rows"].shape != ref["rows"].shape:
++        it |= {"verdict": "FAIL", "note": f"OURS rows {list(ours['rows'].shape) if 'rows' in ours else None}"}
++    elif not bars:
++        it |= {"verdict": "EMPTY", "note": "no torch form present"}
++    else:
++        bar = max(forms[f]["rows"]["rel"] for f in bars)
++        d = dist(ours["rows"], ref["rows"])
++        it |= {"rel_ours": d["rel"], "max_abs_ours": d["max_abs"], "ours_eq_bf16_fp64": d["bit_equal_to_rounded_ref"],
++               "bar": bar, "bar_form": max(bars, key=lambda f: forms[f]["rows"]["rel"]),
++               "rel_sdpa": forms.get("sdpa", {}).get("rows", {}).get("rel"),
++               "verdict": "PASS" if d["rel"] <= bar else "FAIL"}
++    if "grid" in ours and "grid" in ref and ours["grid"].reshape(-1).tolist() != ref["grid"].reshape(-1).tolist():
++        it |= {"verdict": "FAIL", "note": f"grid {ours['grid'].tolist()} vs {ref['grid'].tolist()}"}
++    items.append(it)
++    # layers
++    S = None
++    if "rows" in ref:
++        S = 4 * int(ref["rows"].shape[0]) + 1
++    ours_rows_ok = "layer.rows" not in ours or (sel is not None and torch.equal(ours["layer.rows"], sel))
++    for k in lkeys:
++        it = {"item": k, "rows": int(ref[k].shape[0])}
++        lb = [f for f in bars if k in forms[f]["layers"]]
++        if k not in ours:
++            if a.rows_only:
++                continue
++            items.append(it | {"verdict": "FAIL", "note": "missing in OURS"})
++            continue
++        o = ours[k]
++        if "layer.rows" in ours:
++            if not ours_rows_ok:
++                items.append(it | {"verdict": "FAIL", "note": "OURS layer.rows differ from the reference's"})
++                continue
++        elif S is not None and sel is not None and o.shape[0] == S:
++            o = o[sel]
++        if o.shape != ref[k].shape:
++            items.append(it | {"verdict": "FAIL", "note": f"OURS {k} shape {list(o.shape)}"})
++            continue
++        if not lb:
++            items.append(it | {"verdict": "EMPTY", "note": "no torch form has this layer"})
++            continue
++        bar = max(forms[f]["layers"][k] for f in lb)
++        r = rel(o, ref[k])
++        items.append(it | {"rel_ours": r, "bar": bar, "bar_form": max(lb, key=lambda f: forms[f]["layers"][k]),
++                           "rel_sdpa": forms.get("sdpa", {}).get("layers", {}).get(k),
++                           "verdict": "PASS" if r <= bar else "FAIL"})
++    for i in items:
++        if "rel_ours" in i:
++            log(f"v4 ours {i['item']:9s} rel {i['rel_ours']:.4e} bar {i['bar']:.4e} ({i['bar_form']}) {i['verdict']}")
++    v = overall([i["verdict"] for i in items])
++    nl = sum(1 for i in items if i["item"] != "rows")
++    rep = {"cmd": "v4", "verdict": v, "fixture": name,
++           "counts": {"fixtures": 1, "items": len(items), "items_pass": sum(i["verdict"] == "PASS" for i in items),
++                      "output_rows": int(ref["rows"].shape[0]), "layers": nl,
++                      "layers_in_reference": len(lkeys), "sampled_layer_rows": int(sel.numel()) if sel is not None
++                      else 0, "bar_forms": len(bars)},
++           "rows_only": a.rows_only, "forms": forms,
++           "inputs": {"forms_dir": a.forms_dir, "reference": os.path.basename(ref_path),
++                      "reference_sha256": file_sha(ref_path), "ours": a.ours, "ours_sha256": file_sha(a.ours),
++                      "ours_rows_sha256": tensor_sha(ours["rows"]) if "rows" in ours else None},
++           "items": items}
++    return finish(rep, a)
++
++
++# ----------------------------------------------------------------------------------------------------- v5
++
++
++def label(path: str):
++    f = safe_open(path, framework="pt")
++    md = f.metadata() or {}
++    if md.get("fixture") and md.get("variant"):
++        return md["fixture"], md["variant"], "metadata"
++    base = os.path.basename(path)
++    base = base[:-len(".safetensors")] if base.endswith(".safetensors") else base
++    m = IMAGE_EXT.match(base)
++    if m:
++        return m.group("fixture"), m.group("variant"), "name"
++    if "." in base:
++        fx, var = base.split(".", 1)
++        return fx, var, "name"
++    return base, "", "name"
++
++
++def v5_problems(t: torch.Tensor, key: str) -> list:
++    """Why one file's tensor cannot pin bits: empty, or (KEY `rows`, the tower's output) not bf16 [T, 4608]."""
++    out = []
++    if t.numel() == 0:
++        out.append(f"empty ({list(t.shape)})")
++    if key == "rows":
++        if t.dtype != BF:
++            out.append(f"dtype {str(t.dtype).replace('torch.', '')}, the tower's rows are bfloat16")
++        if t.dim() != 2 or t.shape[-1] != TOWER_WIDTH:
++            out.append(f"shape {list(t.shape)}, the tower's rows are [T, {TOWER_WIDTH}]")
++    return out
++
++
++def cmd_v5(a) -> int:
++    groups = {}
++    for p in a.files:
++        fx, var, how = label(p)
++        f = safe_open(p, framework="pt")
++        if a.key not in f.keys():
++            groups.setdefault(fx, []).append({"file": p, "variant": var, "labelled_by": how, "sha256": None,
++                                              "note": f"no {a.key}", "problems": [f"no {a.key}"]})
++            continue
++        t = f.get_tensor(a.key)
++        groups.setdefault(fx, []).append({"file": p, "variant": var, "labelled_by": how, "sha256": tensor_sha(t),
++                                          "shape": list(t.shape), "dtype": str(t.dtype).replace("torch.", ""),
++                                          "numel": t.numel(), "problems": v5_problems(t, a.key)})
++    need = [x for x in a.variants.split(",") if x] if a.variants else []
++    items = []
++    for fx, fs in sorted(groups.items()):
++        shas = {}
++        for x in fs:
++            shas.setdefault(x["sha256"], []).append(x["variant"])
++        variants = sorted({x["variant"] for x in fs})
++        missing = [x for x in need if x not in variants]
++        shapes = sorted({tuple(x["shape"]) for x in fs if "shape" in x})
++        dtypes = sorted({x["dtype"] for x in fs if "dtype" in x})
++        problems = [f"{x['variant']}: {q}" for x in fs for q in x["problems"]]
++        if len(shapes) > 1:
++            problems.append(f"shapes differ: {[list(s) for s in shapes]}")
++        if len(dtypes) > 1:
++            problems.append(f"dtypes differ: {dtypes}")
++        ok = (len(shas) == 1 and None not in shas and len(variants) >= 2 and not missing and not problems)
++        it = {"fixture": fx, "files": len(fs), "variants": variants, "distinct_sha256": len(shas),
++              "groups": [{"sha256": s, "variants": v} for s, v in shas.items()], "missing_variants": missing,
++              "shapes": [list(s) for s in shapes], "dtypes": dtypes, "problems": problems,
++              "verdict": "PASS" if ok else "FAIL"}
++        if len(variants) < 2:
++            it["note"] = "fewer than 2 variants"
++        items.append(it)
++        log(f"v5 {fx:28s} {len(fs)} files, {len(variants)} variants, {len(shas)} distinct sha256: {it['verdict']}"
++            + (f" ({'; '.join(problems)})" if problems else ""))
++    v = overall([i["verdict"] for i in items])
++    rep = {"cmd": "v5", "verdict": v, "key": a.key,
++           "counts": {"fixtures": len(items), "fixtures_pass": sum(i["verdict"] == "PASS" for i in items),
++                      "files": len(a.files)},
++           "items": items, "files": [x for fs in groups.values() for x in fs]}
++    return finish(rep, a)
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    sub = ap.add_subparsers(dest="cmd", required=True)
++    s2 = sub.add_parser("v2")
++    s2.add_argument("tables")
++    s2.add_argument("ours")
++    s2.add_argument("--strict-nan", action="store_true")
++    s3 = sub.add_parser("v3")
++    s3.add_argument("--model", required=True)
++    s3.add_argument("--torch", required=True)
++    s3.add_argument("--ours", required=True)
++    s3.add_argument("--ours-from-torch", action="store_true")
++    s3.add_argument("--grid", default="")
++    s3.add_argument("--tie-rel", type=float, default=0.0,
++                    help="PASS iff rel(ours) <= rel(torch) * (1 + TIE); default 0, the rule as written")
++    s4 = sub.add_parser("v4")
++    s4.add_argument("--forms-dir", required=True)
++    s4.add_argument("--fixture", required=True)
++    s4.add_argument("--ours", required=True)
++    s4.add_argument("--bar-forms", default=",".join(TORCH_FORMS))
++    s4.add_argument("--rows-only", action="store_true")
++    s5 = sub.add_parser("v5")
++    s5.add_argument("files", nargs="+")
++    s5.add_argument("--key", default="rows")
++    s5.add_argument("--variants", default="")
++    for s in (s2, s3, s4, s5):
++        s.add_argument("--json", default="")
++        s.add_argument("--threads", type=int, default=16)
++    a = ap.parse_args()
++    torch.set_num_threads(a.threads)
++    return {"v2": cmd_v2, "v3": cmd_v3, "v4": cmd_v4, "v5": cmd_v5}[a.cmd](a)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/zig/inkling2_vision_check_test.py b/tools/zig/inkling2_vision_check_test.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..69da6f5b96cf32836f7a205dc2be5a8047f06fcc
+--- /dev/null
++++ b/tools/zig/inkling2_vision_check_test.py
+@@ -0,0 +1,84 @@
++"""inkling2_vision_check.py v5 on small made files: a fixture passes only on nonempty tensors with one shape, one
++dtype and one sha256 across its variants, and the default tower rows must be bf16 [T, 4608].
++python3 -I inkling2_vision_check_test.py (needs torch and safetensors, as the checker does)"""
++import argparse
++import contextlib
++import io
++import json
++import os
++import sys
++import tempfile
++import unittest
++
++import torch
++from safetensors.torch import save_file
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import inkling2_vision_check as vc  # noqa: E402
++
++BF = torch.bfloat16
++
++
++def rows(n: int, width: int = 4608, dtype=BF) -> torch.Tensor:
++    return (torch.arange(n * width, dtype=torch.float32).reshape(n, width) % 251).to(dtype)
++
++
++class V5(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def file(self, variant: str, t: torch.Tensor, key: str = "rows", fixture: str = "cat.png") -> str:
++        p = os.path.join(self.tmp.name, f"{fixture}.{variant}.safetensors")
++        save_file({key: t.contiguous()}, p)
++        return p
++
++    def v5(self, files, key: str = "rows", variants: str = ""):
++        a = argparse.Namespace(files=files, key=key, variants=variants, json="", threads=1)
++        out = io.StringIO()
++        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
++            code = vc.cmd_v5(a)
++        return code, json.loads(out.getvalue())
++
++    def test_equal_tower_rows_pass(self):
++        code, rep = self.v5([self.file("rb32", rows(3)), self.file("rb64", rows(3))])
++        self.assertEqual((code, rep["verdict"]), (0, "PASS"))
++
++    def test_empty_rows_fail(self):
++        code, rep = self.v5([self.file("rb32", rows(0)), self.file("rb64", rows(0))])
++        self.assertEqual((code, rep["verdict"]), (1, "FAIL"))
++        code, rep = self.v5([self.file("l0", rows(0, 8), key="layer.0"), self.file("l1", rows(0, 8), key="layer.0")],
++                            key="layer.0")
++        self.assertEqual((code, rep["verdict"]), (1, "FAIL"))
++
++    def test_same_bytes_other_shape_fail(self):
++        t = rows(4, 8)
++        code, rep = self.v5([self.file("a", t, key="layer.3"), self.file("b", t.reshape(8, 4), key="layer.3")],
++                            key="layer.3")
++        self.assertEqual((code, rep["verdict"]), (1, "FAIL"))
++
++    def test_same_bytes_other_dtype_fail(self):
++        t = rows(4, 8)
++        code, rep = self.v5([self.file("a", t, key="layer.3"), self.file("b", t.view(torch.int16), key="layer.3")],
++                            key="layer.3")
++        self.assertEqual((code, rep["verdict"]), (1, "FAIL"))
++
++    def test_tower_rows_must_be_bf16_at_4608(self):
++        f32 = rows(3, dtype=torch.float32)
++        code, rep = self.v5([self.file("a", f32), self.file("b", f32)])
++        self.assertEqual((code, rep["verdict"]), (1, "FAIL"))
++        code, rep = self.v5([self.file("a", rows(3, 4096)), self.file("b", rows(3, 4096))])
++        self.assertEqual((code, rep["verdict"]), (1, "FAIL"))
++        code, rep = self.v5([self.file("a", rows(3).reshape(-1)), self.file("b", rows(3).reshape(-1))])
++        self.assertEqual((code, rep["verdict"]), (1, "FAIL"))
++
++    def test_other_key_any_width(self):
++        code, rep = self.v5([self.file("a", rows(2, 8), key="layer.3"), self.file("b", rows(2, 8), key="layer.3")],
++                            key="layer.3")
++        self.assertEqual((code, rep["verdict"]), (0, "PASS"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/zig/inkling2_vision_ref.py b/tools/zig/inkling2_vision_ref.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6be70e8b8dae1de51cb85fc17c547bd8ea5fc5fe
+--- /dev/null
++++ b/tools/zig/inkling2_vision_ref.py
+@@ -0,0 +1,930 @@
++"""Inkling-2-Small's vision tower and image prompts through Transformers' own Inkling2 modules: the image oracle.
++
++The tower (`model.visual.*`, 422 bf16 tensors, 0.61 GiB, all in the last shard) is small, so it is built whole on one
++GPU as Transformers' `Inkling2VisionModel` with the checkpoint's tensors assigned under Transformers' own renames
++(conversion_mapping.py, the `model.visual.` rules). The processor is Transformers' `Inkling2Processor` /
++`Inkling2ImageProcessor` (torchvision backend). Image prompts reuse the text oracle (`inkling2_ref.py`, imported
++unchanged): the embed rows at <|unused_200054|> (200054) are replaced, in order, by the tower's rows, exactly as
++`Inkling2Model.forward` does (`masked_scatter` after the normed embedding), and only in the pass that was given the
++image (a 200054 the model generates later is plain text).
++
++USAGE = python tools/zig/inkling2_vision_ref.py CMD MODEL_DIR --out OUT_DIR [options]
++
++  fixtures OUT                      the image set (deterministic PNG, JPEG, WebP; sizes 1x1 .. 4096x4096) + SHA256SUMS
++  process  --fixtures DIR           Transformers' processor on each fixture by both routes (the opened upright PIL
++                                    image: alpha onto the checkerboard; the base64 string: alpha dropped): RGB bytes,
++                                    fp32 pixel values, grid; prompt ids for one user message per image
++  tower    --fixtures DIR --images a,b --forms sdpa,eager,...   the tower's output rows by form; --ops dumps every
++                                    op's inputs and outputs (layers --op-layers), --packed runs the images as one call
++  tables                            rotary cos/sin, GELU over all bf16 inputs, position taps for a list of grids
++  greedy   --fixtures DIR --set NAME --decode N   image prompts through the text oracle: greedy ids, margins
++  probe    --fixtures DIR --set NAME             the largest prompts: the tower and the text oracle's prefill, with
++                                                 each one's peak GPU memory (does one GPU hold it?)
++
++Tower forms (--forms; the manifest names what ran):
++  sdpa         Transformers' default for the tower (its `_supports_sdpa`): torch's scaled_dot_product_attention, the
++               kernel torch picks; `sdpa-flash`, `sdpa-efficient`, `sdpa-cudnn`, `sdpa-math` force one kernel
++  eager        Transformers' eager core (bf16 q.k, fp32 softmax rounded to bf16, bf16 P.V); refused when the scores
++               of one image would not fit (16 S^2 x 8 bytes over --eager-max-gib)
++  f32core      fp32 q.k, scale, softmax and P.V in query blocks, one bf16 rounding of each head's output (the
++               native core's proposed rounding points), the rest as `sdpa`
++  fp64         the whole module in float64 from the bf16 weights and the bf16-cast pixels; rotary angles, cos and sin
++               in float64; attention in float64 query blocks; the position taps' indices and fp32 weights as
++               Transformers computes them (they are the definition)
++  Suffix `+red32` (e.g. `sdpa+red32`): bf16 matmuls reduced in fp32 (torch's
++  allow_bf16_reduced_precision_reduction off); without it, torch's default (on).
++
++Every run sets TF32 off and probes it (inkling2_ref.tf32_guard). Transformers must contain models/inkling2
++(main from 109a7d19); its image processor needs torchvision (and Pillow for PIL inputs). On the oracle host the two
++live in a --target folder on PYTHONPATH, not in the venv.
++
++Output (OUT_DIR/<cmd>/...): safetensors per image and form, manifest.json with versions, the attention kernel that
++ran, GPU, settings, sha256 of every input and output, wall times and peak memory.
++
++Adapted parts keep their notices. Transformers (Apache-2.0) is imported at run time; the tensor renames below
++(`VISUAL_RENAMES`) follow its conversion_mapping.py (Inkling2, `model.visual.` rules) at 109a7d19, Copyright 2026 the
++HuggingFace Team, Apache License 2.0.
++"""
++
++import argparse
++import base64
++import hashlib
++import io
++import json
++import math
++import os
++import re
++import sys
++import time
++
++import torch
++import torch.nn.functional as F
++from safetensors import safe_open
++from safetensors.torch import save_file
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import inkling2_ref as R  # noqa: E402  (the text oracle, unchanged)
++
++BF = torch.bfloat16
++IMAGE_TOKEN = 200054
++TOKEN_PX = 40
++
++# Transformers' conversion_mapping.py (Inkling2, `model.visual.` rules, 109a7d19), applied in order.
++VISUAL_RENAMES = [
++    (r"^model\.visual\.backbone\.embeddings\.position_embedding$", "embeddings.position_embedding.weight"),
++    (r"^model\.visual\.backbone\.embeddings\.", "embeddings."),
++    (r"^model\.visual\.backbone\.ln_pre\.", "pre_layernorm."),
++    (r"^model\.visual\.backbone\.layers\.", "layers."),
++    (r"^model\.visual\.proj_in\.", "merger.linear_1."),
++    (r"^model\.visual\.proj_out\.", "merger.linear_2."),
++    (r"^(layers\.\d+)\.ln_1\.", r"\1.layernorm_before."),
++    (r"^(layers\.\d+)\.ln_2\.", r"\1.layernorm_after."),
++    (r"^(layers\.\d+)\.mlp\.c_fc\.", r"\1.mlp.fc1."),
++    (r"^(layers\.\d+)\.mlp\.c_proj\.", r"\1.mlp.fc2."),
++    (r"^(layers\.\d+)\.ls_1\.gamma$", r"\1.lambda_1"),
++    (r"^(layers\.\d+)\.ls_2\.gamma$", r"\1.lambda_2"),
++]
++
++
++def hf_visual(name: str) -> str:
++    out = name
++    for pat, rep in VISUAL_RENAMES:
++        out = re.sub(pat, rep, out)
++    return out
++
++
++def sha256_bytes(b: bytes) -> str:
++    return hashlib.sha256(b).hexdigest()
++
++
++def tensor_sha(t: torch.Tensor) -> str:
++    t = t.detach().contiguous().cpu()
++    if t.dtype == BF:
++        t = t.view(torch.int16)
++    return hashlib.sha256(t.numpy().tobytes()).hexdigest()
++
++
++# ----------------------------------------------------------------------------------------------- fixtures
++
++SIZES = [(1, 1), (39, 41), (40, 40), (448, 336), (1024, 768), (1024, 1024), (1920, 1080), (2048, 2048),
++         (2560, 1440), (3840, 2160), (4096, 4096)]  # (width, height)
++
++
++def _scene(w: int, h: int, seed: int, text: str = ""):
++    """A deterministic picture with structure the model can describe: a sky-to-ground gradient, a sun, a house,
++    a few coloured shapes, and optionally a sign with `text`. Everything is integer geometry; noise is seeded."""
++    import numpy as np
++    from PIL import Image, ImageDraw, ImageFont
++
++    g = np.random.default_rng(seed)
++    y = np.linspace(0.0, 1.0, h, dtype=np.float64)[:, None]
++    x = np.linspace(0.0, 1.0, w, dtype=np.float64)[None, :]
++    sky = np.stack([90 + 80 * y + 0 * x, 150 + 60 * y + 0 * x, 235 - 40 * y + 0 * x], -1)
++    ground = np.stack([70 + 40 * x + 0 * y, 140 - 30 * y + 0 * x, 60 + 0 * x + 0 * y], -1)
++    img = np.where(y[..., None] < 0.62, sky, ground)
++    img = img + g.normal(0, 3.0, img.shape)
++    im = Image.fromarray(np.clip(np.rint(img), 0, 255).astype(np.uint8), "RGB")
++    d = ImageDraw.Draw(im)
++    s = min(w, h)
++    if s >= 40:
++        r = max(2, s // 12)
++        d.ellipse([w - 3 * r, r, w - r, 3 * r], fill=(250, 210, 40))
++        hx, hy, hw = w // 5, int(h * 0.62), max(4, w // 5)
++        d.rectangle([hx, hy - hw * 3 // 4, hx + hw, hy], fill=(180, 60, 50))
++        d.polygon([(hx - hw // 8, hy - hw * 3 // 4), (hx + hw // 2, hy - hw * 5 // 4),
++                   (hx + hw + hw // 8, hy - hw * 3 // 4)], fill=(90, 50, 40))
++        d.rectangle([hx + hw * 2 // 5, hy - hw * 2 // 5, hx + hw * 3 // 5, hy], fill=(60, 40, 30))
++        for k in range(int(g.integers(2, 5))):
++            cx, cy, rr = int(g.integers(w // 2, w)), int(g.integers(h * 2 // 3, h)), max(2, s // 20)
++            col = [(30, 90, 200), (220, 120, 30), (240, 240, 240), (120, 30, 160)][k % 4]
++            d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], fill=col)
++        if text:
++            fs = max(10, s // 10)
++            try:
++                font = ImageFont.load_default(size=fs)
++            except TypeError:
++                font = ImageFont.load_default()
++            bx, by = w // 2 - fs * len(text) // 3, h // 3
++            d.rectangle([bx - fs // 3, by - fs // 3, bx + fs * len(text) * 2 // 3 + fs // 3, by + fs + fs // 3],
++                        fill=(250, 250, 245), outline=(20, 20, 20), width=max(1, fs // 12))
++            d.text((bx, by), text, fill=(200, 20, 20), font=font)
++    return im
++
++
++def _chart(w: int, h: int, seed: int):
++    import numpy as np
++    from PIL import Image, ImageDraw, ImageFont
++
++    g = np.random.default_rng(seed)
++    im = Image.new("RGB", (w, h), (255, 255, 255))
++    d = ImageDraw.Draw(im)
++    vals = g.integers(10, 100, 5)
++    fs = max(10, min(w, h) // 20)
++    try:
++        font = ImageFont.load_default(size=fs)
++    except TypeError:
++        font = ImageFont.load_default()
++    bw = w // 8
++    for i, v in enumerate(vals):
++        x0 = w // 10 + i * (bw + w // 40)
++        y0 = int(h * 0.85) - int(v / 100 * h * 0.7)
++        d.rectangle([x0, y0, x0 + bw, int(h * 0.85)], fill=[(66, 133, 244), (219, 68, 55), (244, 180, 0),
++                                                             (15, 157, 88), (171, 71, 188)][i])
++        d.text((x0, int(h * 0.87)), "ABCDE"[i], fill=(0, 0, 0), font=font)
++        d.text((x0, y0 - fs - 2), str(int(v)), fill=(0, 0, 0), font=font)
++    d.line([w // 12, int(h * 0.85), w - w // 20, int(h * 0.85)], fill=(0, 0, 0), width=2)
++    return im, [int(v) for v in vals]
++
++
++def make_fixtures(out: str) -> dict:
++    """The set: scenes and charts at every size in SIZES as PNG; formats and layouts at 448x336 (RGBA with partial
++    alpha, palette with tRNS, gray, gray+alpha, 16-bit, interlaced PNG; baseline, progressive, gray JPEG and EXIF
++    orientations 1-8; lossy, lossless and alpha WebP)."""
++    import numpy as np
++    from PIL import Image
++
++    os.makedirs(out, exist_ok=True)
++    made = {}
++
++    def save(im, name, **kw):
++        p = os.path.join(out, name)
++        im.save(p, **kw)
++        made[name] = {"w": im.size[0], "h": im.size[1], "mode": im.mode}
++
++    words = ["STOP", "OPEN", "EXIT", "SALE", "CAFE", "PARK", "BANK", "TAXI", "HOTEL", "MUSEUM", "BAKERY"]
++    for i, (w, h) in enumerate(SIZES):
++        save(_scene(w, h, 1000 + i, words[i % len(words)]), f"scene_{w}x{h}.png", compress_level=6)
++    for i, (w, h) in enumerate([(448, 336), (1024, 768), (1920, 1080)]):
++        im, vals = _chart(w, h, 2000 + i)
++        save(im, f"chart_{w}x{h}.png", compress_level=6)
++        made[f"chart_{w}x{h}.png"]["values"] = vals
++    base = _scene(448, 336, 3000, "CAFE")
++    a = np.array(base.convert("RGBA"))
++    yy, xx = np.mgrid[0:336, 0:448]
++    a[..., 3] = np.clip((xx * 255) // 447, 0, 255).astype(np.uint8)
++    a[:40, :40, 3] = 0
++    save(Image.fromarray(a, "RGBA"), "rgba_448x336.png", compress_level=6)
++    pal = base.convert("P", palette=Image.Palette.ADAPTIVE, colors=64)
++    pal.info["transparency"] = 0
++    save(pal, "palette_trns_448x336.png", transparency=0)
++    save(base.convert("L"), "gray_448x336.png")
++    la = Image.merge("LA", (base.convert("L"), Image.fromarray(a[..., 3])))
++    save(la, "gray_alpha_448x336.png")
++    i16 = Image.fromarray(np.array(base.convert("L")).astype(np.uint16) * 257)
++    save(i16, "gray16_448x336.png")
++    save(base, "baseline_448x336.jpg", quality=90)
++    save(base, "progressive_448x336.jpg", quality=90, progressive=True)
++    save(base.convert("L"), "gray_448x336.jpg", quality=90)
++    for o in range(1, 9):
++        ex = Image.Exif()
++        ex[0x0112] = o
++        save(base, f"exif{o}_448x336.jpg", quality=90, exif=ex.tobytes())
++    save(base, "lossy_448x336.webp", quality=80, method=4)
++    save(base, "lossless_448x336.webp", lossless=True)
++    save(Image.fromarray(a, "RGBA"), "alpha_448x336.webp", lossless=True)
++    sums = {}
++    for name in sorted(made):
++        sums[name] = R.sha256(os.path.join(out, name))
++    with open(os.path.join(out, "SHA256SUMS"), "w") as f:
++        for name, h in sums.items():
++            f.write(f"{h}  {name}\n")
++    with open(os.path.join(out, "fixtures.json"), "w") as f:
++        json.dump({"fixtures": made, "note": "interlaced PNG: Pillow writes no Adam7; V-b supplies one if needed"},
++                  f, indent=1)
++    return made
++
++
++def open_upright(path: str):
++    """The opened image turned upright (EXIF orientation applied), mode kept: the PIL route of the processor."""
++    from PIL import Image, ImageOps
++
++    im = Image.open(path)
++    im.load()
++    return ImageOps.exif_transpose(im)
++
++
++def data_url(path: str) -> str:
++    ext = os.path.splitext(path)[1].lower()
++    mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}[ext]
++    return f"data:{mime};base64," + base64.b64encode(open(path, "rb").read()).decode()
++
++
++# ----------------------------------------------------------------------------------------------- the tower
++
++
++def vision_config(folder: str, attn: str):
++    from transformers.models.inkling2.configuration_inkling2 import Inkling2VisionConfig
++
++    raw = json.load(open(os.path.join(folder, "config.json")))["vision_config"]
++    cfg = Inkling2VisionConfig(**raw)
++    cfg._attn_implementation = attn
++    return cfg
++
++
++def build_tower(folder: str, attn: str, dev, dtype=BF):
++    from transformers.models.inkling2 import modeling_inkling2 as M
++
++    cfg = vision_config(folder, attn)
++    src = R.Source(folder)
++    names = src.names("model.visual.")
++    if len(names) != 422:
++        raise SystemExit(f"model.visual.*: {len(names)} tensors, expected 422")
++    with torch.device("meta"):
++        tower = M.Inkling2VisionModel(cfg)
++    sd = {}
++    for n in names:
++        t = src.get(n)
++        if t.dtype != BF:
++            raise SystemExit(f"{n}: {t.dtype}, expected bf16")
++        sd[hf_visual(n)] = t.to(dev).to(dtype)
++    missing = set(k for k, _ in tower.named_parameters()) - set(sd)
++    extra = set(sd) - set(k for k, _ in tower.named_parameters())
++    if missing or extra:
++        raise SystemExit(f"tower names: missing {sorted(missing)[:5]} extra {sorted(extra)[:5]}")
++    tower.load_state_dict(sd, strict=False, assign=True)
++    # buffers (inv_freq) were built on meta: rebuild them on the device
++    inv, _ = M.Inkling2VisionRotaryEmbedding.compute_axial_rope_parameters(cfg)
++    tower.rotary_emb.inv_freq = inv.to(dev)
++    tower.rotary_emb.original_inv_freq = inv.clone().to(dev)
++    for n, t in list(tower.named_parameters()) + list(tower.named_buffers()):
++        if t.device.type == "meta":
++            raise RuntimeError(f"{n} was not loaded")
++    weights_sha = hashlib.sha256()
++    for n in names:
++        weights_sha.update(n.encode())
++        weights_sha.update(tensor_sha(src.get(n)).encode())
++    return tower.eval(), cfg, weights_sha.hexdigest()
++
++
++# --- attention cores registered with Transformers' AttentionInterface
++
++CAPTURE = {"on": False, "layer": None, "layers": set(), "ops": {}}
++BLOCK = {"q": 1024}
++
++
++def _cap(name: str, t: torch.Tensor):
++    if CAPTURE["on"] and CAPTURE["layer"] in CAPTURE["layers"]:
++        CAPTURE["ops"].setdefault(f"L{CAPTURE['layer']}.{name}", []).append(t.detach().cpu())
++
++
++def blocked_core(module, query, key, value, attention_mask, scaling, dropout=0.0, **kw):
++    """softmax(q.k * scale) . v without a mask over one image, in query blocks. q, k, v: [1, H, S, D].
++    In float64 for an fp64 module; for bf16 inputs (form f32core): fp32 scores, softmax and P.V, one bf16 rounding."""
++    if attention_mask is not None:
++        raise RuntimeError("the tower's attention has no mask")
++    work = torch.float64 if query.dtype == torch.float64 else torch.float32
++    q, k, v = query.to(work), key.to(work), value.to(work)
++    S = q.shape[2]
++    out = torch.empty_like(q)
++    for a in range(0, S, BLOCK["q"]):
++        s = torch.matmul(q[:, :, a:a + BLOCK["q"]], k.transpose(2, 3)) * scaling
++        p = torch.softmax(s, dim=-1)
++        out[:, :, a:a + BLOCK["q"]] = torch.matmul(p, v)
++    out = out.to(query.dtype)
++    _cap("core.q", query)
++    _cap("core.k", key)
++    _cap("core.v", value)
++    _cap("core.out", out)
++    return out.transpose(1, 2).contiguous(), None
++
++
++def make_capturing(inner):
++    def core(module, query, key, value, attention_mask, scaling, dropout=0.0, **kw):
++        o, w = inner(module, query, key, value, attention_mask, scaling=scaling, dropout=dropout, **kw)
++        _cap("core.q", query)
++        _cap("core.k", key)
++        _cap("core.v", value)
++        _cap("core.out", o.transpose(1, 2))
++        return o, w
++    return core
++
++
++def register_cores():
++    from transformers import AttentionInterface
++    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
++    from transformers.models.inkling2 import modeling_inkling2 as M
++
++    AttentionInterface.register("tf_blocked", blocked_core)
++    AttentionInterface.register("tf_sdpa", make_capturing(ALL_ATTENTION_FUNCTIONS["sdpa"]))
++    AttentionInterface.register("tf_eager", make_capturing(M.eager_attention_forward))
++
++
++def patch_rotary_fp64():
++    """For the fp64 form: rotary angles, cos and sin in float64 and the rotation in float64 (Transformers casts to
++    fp32 inside apply_rotary_pos_emb_vision and computes the angles in fp32)."""
++    from transformers.models.inkling2 import modeling_inkling2 as M
++
++    def fwd(self, x, position_ids):
++        inv = 1.0 / (self.config.rope_parameters["rope_theta"] ** (
++            torch.arange(0, 32, 2, dtype=torch.float64, device=x.device) / 32))
++        freqs = position_ids[..., None].to(torch.float64) * inv
++        return self.recomposition_frequencies(freqs.cos()), self.recomposition_frequencies(freqs.sin())
++
++    def rot(q, k, cos, sin):
++        cos, sin = cos.unsqueeze(-2).to(q.dtype), sin.unsqueeze(-2).to(q.dtype)
++        return (q * cos) + (M.rotate_pairwise(q) * sin), (k * cos) + (M.rotate_pairwise(k) * sin)
++
++    M.Inkling2VisionRotaryEmbedding.forward = torch.no_grad()(fwd)
++    M.apply_rotary_pos_emb_vision = rot
++
++
++def patch_rotary_capture():
++    from transformers.models.inkling2 import modeling_inkling2 as M
++
++    inner = M.apply_rotary_pos_emb_vision
++
++    def rot(q, k, cos, sin):
++        _cap("rot.q_in", q)
++        _cap("rot.k_in", k)
++        _cap("rot.cos", cos)
++        _cap("rot.sin", sin)
++        qe, ke = inner(q, k, cos, sin)
++        _cap("rot.q_out", qe)
++        _cap("rot.k_out", ke)
++        return qe, ke
++
++    M.apply_rotary_pos_emb_vision = rot
++
++
++def hook_ops(tower, layers: set):
++    """Forward hooks that record each op's input and output for the chosen layers, the embedding and the merger."""
++    hs = []
++
++    def rec(tag):
++        def h(m, a, o):
++            if CAPTURE["on"]:
++                CAPTURE["ops"].setdefault(tag + ".in", []).append(a[0].detach().cpu())
++                CAPTURE["ops"].setdefault(tag + ".out", []).append((o[0] if isinstance(o, tuple) else o).detach().cpu())
++        return h
++
++    e = tower.embeddings
++    hs.append(e.patch_embedding.register_forward_hook(rec("E2.patch")))
++    hs.append(e.register_forward_hook(lambda m, a, o: CAPTURE["ops"].setdefault("E4.embeddings.out", []).append(
++        o.detach().cpu()) if CAPTURE["on"] else None))
++    hs.append(tower.pre_layernorm.register_forward_hook(rec("E5.ln_pre")))
++    for i, L in enumerate(tower.layers):
++        def pre(m, a, i=i):
++            CAPTURE["layer"] = i
++        hs.append(L.register_forward_pre_hook(pre))
++        if i not in layers:
++            continue
++        p = f"L{i}."
++        hs.append(L.register_forward_hook(rec(p + "layer")))
++        hs.append(L.layernorm_before.register_forward_hook(rec(p + "L1.ln_1")))
++        for n in ("q_proj", "k_proj", "v_proj", "out_proj"):
++            hs.append(getattr(L.self_attn, n).register_forward_hook(rec(p + "L2." + n)))
++        hs.append(L.layernorm_after.register_forward_hook(rec(p + "L7.ln_2")))
++        hs.append(L.mlp.fc1.register_forward_hook(rec(p + "L8.fc1")))
++        hs.append(L.mlp.activation_fn.register_forward_hook(rec(p + "L8.gelu")))
++        hs.append(L.mlp.fc2.register_forward_hook(rec(p + "L8.fc2")))
++    m = tower.merger
++    hs.append(m.linear_1.register_forward_hook(rec("M2.linear_1")))
++    hs.append(m.act.register_forward_hook(rec("M2.gelu")))
++    hs.append(m.linear_2.register_forward_hook(rec("M2.linear_2")))
++    return hs
++
++
++def sample_tower_rows(S: int) -> list[int]:
++    rows = set(range(min(S, 33))) | set(range(max(0, S - 32), S)) | set(range(0, S, 64))
++    return sorted(rows)
++
++
++def run_tower(tower, pixel_values: torch.Tensor, grid: torch.Tensor, dtype=BF, layer_rows: bool = True):
++    """pooler_output [T, 4608] and each layer's output at sampled rows (incl. the class row 0)."""
++    feeds = {}
++    hooks = []
++    if layer_rows:
++        S = int((grid.prod(-1) * 4 + 1).sum())
++        keep = torch.tensor(sample_tower_rows(S))
++        for i, L in enumerate(tower.layers):
++            hooks.append(L.register_forward_hook(
++                lambda m, a, o, i=i: feeds.__setitem__(f"layer.{i}", (o[0] if isinstance(o, tuple) else o)[
++                    keep.to(o.device if not isinstance(o, tuple) else o[0].device)].detach().cpu())))
++        feeds["layer.rows"] = keep
++    pv = pixel_values.to(BF).to(dtype)  # the model's own cast (bf16), then the form's dtype
++    try:
++        with torch.no_grad():
++            out = tower(pixel_values=pv, image_grid_thw=grid)
++    finally:
++        for h in hooks:
++            h.remove()
++    return out.pooler_output, feeds
++
++
++SDPA_BACKENDS = {"flash": "FLASH_ATTENTION", "efficient": "EFFICIENT_ATTENTION", "cudnn": "CUDNN_ATTENTION",
++                 "math": "MATH"}
++
++
++def form_context(form: str):
++    """(attn implementation name, dtype, a context manager factory or None)."""
++    base = form.split("+")[0]
++    if base == "fp64":
++        return "tf_blocked", torch.float64, None
++    if base == "f32core":
++        return "tf_blocked", BF, None
++    if base == "eager":
++        return "tf_eager", BF, None
++    if base == "sdpa":
++        return "tf_sdpa", BF, None
++    if base.startswith("sdpa-"):
++        from torch.nn.attention import SDPBackend, sdpa_kernel
++        b = getattr(SDPBackend, SDPA_BACKENDS[base[5:]])
++        return "tf_sdpa", BF, (lambda: sdpa_kernel([b]))
++    raise SystemExit(f"unknown form {form}")
++
++
++def distances(got: torch.Tensor, ref64: torch.Tensor) -> dict:
++    """got (any dtype) against an fp64 reference: max and mean |diff|, relative norm, and the share bit-equal to
++    the reference rounded to got's dtype."""
++    g, r = got.double(), ref64.double()
++    d = (g - r).abs()
++    rr = ref64.to(got.dtype) if got.dtype != torch.float64 else ref64
++    return {"max_abs": float(d.max()), "mean_abs": float(d.mean()),
++            "rel_norm": float((g - r).norm() / max(float(r.norm()), 1e-300)),
++            "bit_equal_to_rounded_ref": float((got == rr).float().mean())}
++
++
++# ----------------------------------------------------------------------------------------------- commands
++
++
++def cmd_process(a, dev):
++    from transformers import AutoProcessor
++    from transformers.image_utils import load_image  # noqa: F401  (the string route goes through it)
++
++    proc = AutoProcessor.from_pretrained(a.model_dir)
++    fx = json.load(open(os.path.join(a.fixtures, "fixtures.json")))["fixtures"]
++    names = a.images.split(",") if a.images else sorted(fx)
++    out = os.path.join(a.out, "process")
++    os.makedirs(out, exist_ok=True)
++    man = {"fixtures_sha256": {}, "routes": {}, "files_out_sha256": {}}
++    for n in names:
++        p = os.path.join(a.fixtures, n)
++        man["fixtures_sha256"][n] = R.sha256(p)
++        rec = {}
++        for route, img in (("pil", open_upright(p)), ("string", data_url(p))):
++            bf = proc.image_processor(images=[img], return_tensors="pt")
++            pv, grid = bf["pixel_values"], bf["image_grid_thw"]
++            rec[f"{route}.pixel_values"] = pv.float().contiguous()
++            rec[f"{route}.grid"] = grid.to(torch.int64)
++            man["routes"].setdefault(n, {})[route] = {"grid": grid[0].tolist(), "tokens": int(grid.prod()),
++                                                      "pixel_values_sha256": tensor_sha(pv.float())}
++        msg = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Describe this image."}]}]
++        text = proc.apply_chat_template(msg, tokenize=False, add_generation_prompt=True, reasoning_effort="none")
++        enc = proc(text=[text], images=[open_upright(p)], return_tensors="pt")
++        rec["prompt.ids"] = enc["input_ids"][0].to(torch.int64)
++        man["routes"][n]["prompt_tokens"] = int(enc["input_ids"].shape[1])
++        man["routes"][n]["prompt_ids_sha256"] = tensor_sha(enc["input_ids"][0].to(torch.int64))
++        path = os.path.join(out, n + ".safetensors")
++        save_file(rec, path)
++        man["files_out_sha256"][os.path.basename(path)] = R.sha256(path)
++        print(f"{n}: grid {man['routes'][n]['pil']['grid']}, tokens {man['routes'][n]['pil']['tokens']}, "
++              f"pil==string {man['routes'][n]['pil']['pixel_values_sha256'] == man['routes'][n]['string']['pixel_values_sha256']}",
++              flush=True)
++    return out, man
++
++
++def processed(proc, path: str):
++    bf = proc.image_processor(images=[open_upright(path)], return_tensors="pt")
++    return bf["pixel_values"], bf["image_grid_thw"]
++
++
++def cmd_tower(a, dev):
++    from transformers import AutoProcessor
++
++    register_cores()
++    forms = a.forms.split(",")
++    if any(f.split("+")[0] == "fp64" for f in forms) and len(set(f.split("+")[0] == "fp64" for f in forms)) > 1:
++        raise SystemExit("run fp64 in its own invocation (it patches the rotary code)")
++    if forms[0].split("+")[0] == "fp64":
++        patch_rotary_fp64()
++    if a.ops:
++        patch_rotary_capture()
++    proc = AutoProcessor.from_pretrained(a.model_dir)
++    names = a.images.split(",")
++    out = os.path.join(a.out, "tower")
++    os.makedirs(out, exist_ok=True)
++    man_path = os.path.join(out, "manifest.json")
++    man = json.load(open(man_path)) if os.path.exists(man_path) else {"runs": {}}
++    inputs = []
++    for n in names:
++        pv, grid = processed(proc, os.path.join(a.fixtures, n))
++        inputs.append((n, pv, grid))
++    for form in forms:
++        attn, dtype, ctxf = form_context(form)
++        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = "+red32" not in form
++        tower, cfg, wsha = build_tower(a.model_dir, attn, dev, dtype)
++        hooks = hook_ops(tower, set(int(x) for x in a.op_layers.split(","))) if a.ops else []
++        CAPTURE["layers"] = set(int(x) for x in a.op_layers.split(",")) if a.ops else set()
++        groups = [inputs] if a.packed else [[x] for x in inputs]
++        for grp in groups:
++            pv = torch.cat([g[1] for g in grp]).to(dev)
++            grid = torch.cat([g[2] for g in grp])
++            S = int((grid.prod(-1) * 4 + 1).max())
++            if form.split("+")[0] == "eager" and 16 * S * S * 8 / 2**30 > a.eager_max_gib:
++                print(f"{form} {'+'.join(g[0] for g in grp)}: S {S} needs ~{16 * S * S * 8 / 2**30:.0f} GiB of "
++                      f"scores; refused (--eager-max-gib {a.eager_max_gib})", flush=True)
++                continue
++            CAPTURE["ops"], CAPTURE["on"] = {}, bool(a.ops)
++            torch.cuda.reset_peak_memory_stats(dev)
++            torch.cuda.synchronize(dev)
++            t0 = time.time()
++            if ctxf:
++                with ctxf():
++                    rows, feeds = run_tower(tower, pv, grid, dtype)
++            else:
++                rows, feeds = run_tower(tower, pv, grid, dtype)
++            torch.cuda.synchronize(dev)
++            wall = time.time() - t0
++            CAPTURE["on"] = False
++            key = ("packed:" if a.packed else "") + "+".join(g[0] for g in grp)
++            splits = rows.split(grid.prod(-1).tolist())
++            for (n, _, g), r in zip(grp, splits):
++                rec = {"rows": r.contiguous().cpu(), "grid": g.to(torch.int64)}
++                if len(grp) == 1:
++                    rec.update(feeds)
++                tag = f"{n}.{form}{'.packed' if a.packed else ''}"
++                path = os.path.join(out, tag + ".safetensors")
++                save_file({k: v.contiguous() for k, v in rec.items()}, path)
++                man["runs"][tag] = {"image": n, "form": form, "attn_impl": attn, "dtype": str(dtype),
++                                    "bf16_reduced_precision_reduction":
++                                        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
++                                    "packed_with": [x[0] for x in grp], "grid": g[0].tolist(),
++                                    "tokens": int(g.prod()), "tower_rows": int(g.prod()) * 4 + 1,
++                                    "rows_sha256": tensor_sha(r), "file_sha256": R.sha256(path),
++                                    "wall_s_group": round(wall, 3),
++                                    "peak_gib_group": round(torch.cuda.max_memory_allocated(dev) / 2**30, 2),
++                                    "weights_sha256": wsha}
++                print(f"{tag}: rows {tuple(r.shape)} sha {man['runs'][tag]['rows_sha256'][:16]} "
++                      f"{wall:.2f} s peak {man['runs'][tag]['peak_gib_group']} GiB", flush=True)
++            if a.ops and len(grp) == 1:
++                ops = {}
++                for k, v in CAPTURE["ops"].items():
++                    ops[k] = v[0] if len(v) == 1 else torch.cat([x.reshape(-1, x.shape[-1]) for x in v])
++                opath = os.path.join(out, f"{grp[0][0]}.{form}.ops.safetensors")
++                save_file({k: v.contiguous() for k, v in ops.items()}, opath)
++                man["runs"][f"{grp[0][0]}.{form}"]["ops_file_sha256"] = R.sha256(opath)
++        for h in hooks:
++            h.remove()
++        del tower
++        torch.cuda.empty_cache()
++    if forms and forms[0].split("+")[0].startswith("sdpa"):
++        man["sdpa_flags"] = {"flash": torch.backends.cuda.flash_sdp_enabled(),
++                             "mem_efficient": torch.backends.cuda.mem_efficient_sdp_enabled(),
++                             "cudnn": torch.backends.cuda.cudnn_sdp_enabled(),
++                             "math": torch.backends.cuda.math_sdp_enabled()}
++    return out, man
++
++
++def cmd_tables(a, dev):
++    from transformers.models.inkling2 import modeling_inkling2 as M
++
++    out = os.path.join(a.out, "tables")
++    os.makedirs(out, exist_ok=True)
++    rec = {}
++    allbits = torch.arange(-32768, 32768, dtype=torch.int32).to(torch.int16).view(BF).to(dev)
++    rec["gelu.in"] = allbits.cpu()
++    rec["gelu.out"] = F.gelu(allbits).cpu()  # ACT2FN["gelu"]: GELUActivation, the erf form
++    cfg = vision_config(a.model_dir, "eager")
++    inv, _ = M.Inkling2VisionRotaryEmbedding.compute_axial_rope_parameters(cfg)
++    pos = torch.arange(0, 416, device=dev)
++    freqs = pos[:, None].float() * inv.to(dev)[None]
++    rec["rope.inv_freq"] = inv.cpu()
++    rec["rope.cos"] = freqs.cos().cpu()
++    rec["rope.sin"] = freqs.sin().cpu()
++    grids = [(1, r, c) for r, c in ((1, 1), (9, 12), (20, 26), (26, 26), (27, 48), (52, 52), (54, 96), (103, 103))]
++    for g in grids:
++        thw = torch.tensor([g]) * torch.tensor([1, 2, 2])
++        idx, w = M.get_vision_interpolation_indices_and_weights(thw, num_grid_per_side=cfg.posemb_grid_size,
++                                                                 mode="bilinear", align_corners=False,
++                                                                 spatial_merge_size=2, kwargs={})
++        rec[f"pos.idx.{g[1]}x{g[2]}"] = idx.to(torch.int64).cpu()
++        rec[f"pos.w.{g[1]}x{g[2]}"] = w.float().cpu()
++        pid = M.get_vision_position_ids(thw, 2, kwargs={})
++        rec[f"pos.ids.{g[1]}x{g[2]}"] = pid.to(torch.int64).cpu()
++    path = os.path.join(out, "tables.safetensors")
++    save_file({k: v.contiguous() for k, v in rec.items()}, path)
++    return out, {"files_out_sha256": {"tables.safetensors": R.sha256(path)}, "grids": grids}
++
++
++# --- image prompts through the text oracle
++
++SETS = {
++    # (name, effort, [(fixture, ...)], question): one user message, the images first, then the question
++    "g0": [("scene_448x336", "none", ["scene_448x336.png"], "Describe this image in two sentences.")],
++    "probe": [("four_2048", "none", ["scene_2048x2048.png"] * 4, "What do these four pictures have in common?"),
++              ("one_4096", "none", ["scene_4096x4096.png"], "Describe this image.")],
++    "top1": [
++        ("t01", "none", ["scene_40x40.png"], "What colour is this image mostly?"),
++        ("t02", "none", ["scene_448x336.png"], "Describe this image in two sentences."),
++        ("t03", "none", ["chart_448x336.png"], "Which bar is the tallest, and what is its value?"),
++        ("t04", "none", ["scene_1024x768.png"], "What does the sign say?"),
++        ("t05", "none", ["chart_1024x768.png"], "List the five bar values from left to right."),
++        ("t06", "none", ["scene_1024x1024.png"], "Is there a house in this picture? Describe it."),
++        ("t07", "none", ["scene_1920x1080.png"], "What time of day does this look like, and why?"),
++        ("t08", "none", ["chart_1920x1080.png"], "Summarise this chart."),
++        ("t09", "none", ["rgba_448x336.png"], "Describe what you see, including the background."),
++        ("t10", "none", ["scene_448x336.png", "chart_448x336.png"], "Compare the two images."),
++        ("t11", "low", ["scene_2048x2048.png"], "Count the round shapes in this picture."),
++        ("t12", "none", ["scene_2560x1440.png"], "Write a one-line caption for this picture."),
++    ],
++}
++
++
++def image_specs(proc, fixtures: str, set_name: str):
++    from PIL import Image  # noqa: F401
++
++    specs = []
++    for name, effort, files, q in SETS[set_name]:
++        content = [{"type": "image"} for _ in files] + [{"type": "text", "text": q}]
++        msgs = [{"role": "user", "content": content}]
++        text = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, reasoning_effort=effort)
++        imgs = [open_upright(os.path.join(fixtures, f)) for f in files]
++        enc = proc(text=[text], images=imgs, return_tensors="pt")
++        ids = enc["input_ids"][0].tolist()
++        specs.append({"name": name, "effort": effort, "messages": msgs, "text": text, "ids": ids, "files": files,
++                      "pixel_values": enc["pixel_values"], "grid": enc["image_grid_thw"],
++                      "image_tokens": int(sum(1 for t in ids if t == IMAGE_TOKEN))})
++    return specs
++
++
++class SplicedEmbed(torch.nn.Module):
++    """The normed embedding, then the tower's rows over the 200054 rows of a prompt that was given its images
++    (`Inkling2Model.forward`: masked_scatter after the embedding). Other calls (decode steps) are plain text."""
++
++    def __init__(self, emb, rows_by_prompt: dict):
++        super().__init__()
++        self.emb, self.rows = emb, rows_by_prompt
++
++    def forward(self, ids):
++        e = self.emb(ids)
++        if ids.shape[1] > 1:
++            key = tuple(ids[0].tolist())
++            if key in self.rows:
++                r = self.rows[key].to(e.device, e.dtype)
++                mask = (ids == IMAGE_TOKEN)[..., None].expand_as(e)
++                if int((ids == IMAGE_TOKEN).sum()) != r.shape[0]:
++                    raise RuntimeError("image rows and placeholders differ")
++                e = e.masked_scatter(mask, r)
++        return e
++
++
++def tower_rows_for(specs, a, dev):
++    """Each prompt's tower rows (all its images in one call, as get_image_features does), in --tower-form."""
++    register_cores()
++    attn, dtype, ctxf = form_context(a.tower_form)
++    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = "+red32" not in a.tower_form
++    tower, cfg, wsha = build_tower(a.model_dir, attn, dev, dtype)
++    rows, info = {}, {}
++    for s in specs:
++        torch.cuda.reset_peak_memory_stats(dev)
++        t0 = time.time()
++        pv, grid = s["pixel_values"].to(dev), s["grid"]
++        if ctxf:
++            with ctxf():
++                r, _ = run_tower(tower, pv, grid, dtype, layer_rows=False)
++        else:
++            r, _ = run_tower(tower, pv, grid, dtype, layer_rows=False)
++        torch.cuda.synchronize(dev)
++        rows[tuple(s["ids"])] = r.to(BF).cpu()
++        info[s["name"]] = {"tower_s": round(time.time() - t0, 3), "rows_sha256": tensor_sha(r.to(BF)),
++                           "tower_peak_gib": round(torch.cuda.max_memory_allocated(dev) / 2**30, 2),
++                           "grid": grid.tolist(), "image_tokens": s["image_tokens"]}
++        print(f"{s['name']}: tower {info[s['name']]['tower_s']} s, rows {tuple(r.shape)}, "
++              f"peak {info[s['name']]['tower_peak_gib']} GiB", flush=True)
++    del tower
++    torch.cuda.empty_cache()
++    return rows, info, wsha
++
++
++def cmd_greedy(a, dev, probe: bool = False):
++    from transformers import AutoProcessor
++
++    R.ATTN["form"] = a.attn
++    proc = AutoProcessor.from_pretrained(a.model_dir)
++    specs = image_specs(proc, a.fixtures, a.set)
++    if a.only:
++        specs = [s for s in specs if s["name"] in a.only.split(",")]
++    out = os.path.join(a.out, ("probe" if probe else "greedy") + f"-{a.set}" + (f"-{a.only}" if a.only else ""),
++                       a.mode)
++    os.makedirs(out, exist_ok=True)
++    rows, info, wsha = tower_rows_for(specs, a, dev)
++    # the text oracle's setting (inkling2_ref.main): --attn fp32 reduces bf16 matmuls in fp32
++    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = a.attn != "fp32"
++    cfg = R.text_config(a.model_dir, a.layers)
++    model = R.Model(a.model_dir, cfg, dev, a.mode)
++    orig = model.embed
++    model.embed = lambda: SplicedEmbed(orig(), rows)
++    man = R.provenance(a.model_dir)
++    man.update({"set": a.set, "mode": a.mode, "attn": a.attn, "tower_form": a.tower_form, "tower_weights": wsha,
++                "bf16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
++                "prompts": [{k: s[k] for k in ("name", "effort", "messages", "text", "files", "image_tokens")}
++                            | {"tokens": len(s["ids"]), "ids_sha": R.ids_sha(s["ids"])} for s in specs],
++                "tower": info, "pythonpath": os.environ.get("PYTHONPATH", "")})
++    import PIL
++    import torchvision
++    man.update({"pillow": PIL.__version__, "torchvision": torchvision.__version__})
++    t0 = time.time()
++    if probe:
++        torch.cuda.reset_peak_memory_stats(dev)
++        files, times = R.teacher_forced(model, specs, out, cfg.num_hidden_layers)
++        man.update({"files_out_sha256": files, "layer_times_s": times, "prefill_wall_s": round(time.time() - t0, 1),
++                    "prefill_peak_gib": round(torch.cuda.max_memory_allocated(dev) / 2**30, 2)})
++    else:
++        margins = [[] for _ in specs]
++        outs, report = R.greedy_decode(model, specs, a.decode, torch.device(a.expert_device), a.expert_cache, None,
++                                       margins=margins)
++        tok = proc.tokenizer
++        res = {}
++        for s, o, mg in zip(specs, outs, margins):
++            res[s["name"]] = {"prompt_ids_sha": R.ids_sha(s["ids"]), "ids": o, "ids_sha": R.ids_sha(o),
++                              "text": tok.decode(o, skip_special_tokens=False), **report[s["name"]], "margins": mg}
++            print(f"--- {s['name']}\n{res[s['name']]['text']}", flush=True)
++        with open(os.path.join(out, "decode.json"), "w") as f:
++            json.dump(res, f, indent=1, ensure_ascii=False)
++        man.update({"decode_wall_s": round(time.time() - t0, 1),
++                    "peak_gib": round(torch.cuda.max_memory_allocated(dev) / 2**30, 2),
++                    "decode_sha256": R.sha256(os.path.join(out, "decode.json"))})
++    for s in specs:  # the prompts' ids, for the engine side
++        save_file({"ids": torch.tensor(s["ids"], dtype=torch.int64), "rows": rows[tuple(s["ids"])],
++                   "pixel_values": s["pixel_values"].float().contiguous(), "grid": s["grid"].to(torch.int64)},
++                  os.path.join(out, s["name"] + ".prompt.safetensors"))
++    return out, man
++
++
++def cmd_export(a, dev):
++    """The engine's inputs per fixture: the processor's RGB (alpha composited, upright; recovered exactly from its
++    fp32 pixel values, which are checked to round-trip bit for bit), its size, grid and pixel values."""
++    from transformers import AutoProcessor
++
++    proc = AutoProcessor.from_pretrained(a.model_dir)
++    out = os.path.join(a.out, "inputs")
++    os.makedirs(out, exist_ok=True)
++    man = {"files_out_sha256": {}, "inputs": {}}
++    for n in a.images.split(","):
++        im = open_upright(os.path.join(a.fixtures, n))
++        W_, H_ = im.size
++        pv, grid = processed(proc, os.path.join(a.fixtures, n))
++        rows, cols = int(grid[0, 1]), int(grid[0, 2])
++        full = pv.reshape(rows, cols, TOKEN_PX, TOKEN_PX, 3).permute(0, 2, 1, 3, 4).reshape(rows * TOKEN_PX,
++                                                                                            cols * TOKEN_PX, 3)
++        x = torch.round(full[:H_, :W_].double() * 127.5 + 127.5)
++        if x.min() < 0 or x.max() > 255:
++            raise SystemExit(f"{n}: pixel values outside 0..255")
++        rgb = x.to(torch.uint8)
++        back = (rgb.float() - 127.5) / 127.5
++        if not torch.equal(back, full[:H_, :W_]):
++            raise SystemExit(f"{n}: RGB does not round-trip to the processor's pixel values")
++        pad = full.clone()
++        pad[:H_, :W_] = 0
++        if H_ < rows * TOKEN_PX or W_ < cols * TOKEN_PX:
++            padv = full[H_:].flatten().tolist()[:1] + full[:, W_:].flatten().tolist()[:1]
++            if any(v != float((torch.tensor(-1.0) - 127.5) / 127.5) for v in padv):  # fp32, as the processor
++                raise SystemExit(f"{n}: unexpected padding value {padv}")
++        rec = {"rgb": rgb.contiguous(), "hw": torch.tensor([H_, W_], dtype=torch.int32),
++               "grid": grid[0].to(torch.int64), "pixel_values": pv.float().contiguous()}
++        path = os.path.join(out, n + ".input.safetensors")
++        save_file(rec, path)
++        man["files_out_sha256"][os.path.basename(path)] = R.sha256(path)
++        man["inputs"][n] = {"h": H_, "w": W_, "grid": [rows, cols], "rgb_sha256": tensor_sha(rgb),
++                            "pixel_values_sha256": tensor_sha(pv.float())}
++        print(f"{n}: {H_}x{W_} grid {rows}x{cols} rgb {man['inputs'][n]['rgb_sha256'][:16]}", flush=True)
++    return out, man
++
++
++def cmd_compare(a, dev):
++    """Each tower form's output rows (and sampled layer rows) against the fp64 form's, per image: the distances of
++    `distances`, and which forms are bit-equal to each other."""
++    from safetensors.torch import load_file
++
++    src = os.path.join(a.out, "tower")
++    man = json.load(open(os.path.join(src, "manifest.json")))
++    res = {}
++    for img in sorted({r["image"] for r in man["runs"].values()}):
++        tags = {r["form"] + (".packed" if len(r["packed_with"]) > 1 else ""): t for t, r in man["runs"].items()
++                if r["image"] == img}
++        if "fp64" not in tags:
++            continue
++        ref = load_file(os.path.join(src, tags["fp64"] + ".safetensors"))
++        out = {}
++        for f, t in sorted(tags.items()):
++            got = load_file(os.path.join(src, t + ".safetensors"))
++            d = {"rows": distances(got["rows"], ref["rows"]), "rows_sha256": man["runs"][t]["rows_sha256"]}
++            layers = {}
++            for k in got:
++                if k.startswith("layer.") and k != "layer.rows" and k in ref:
++                    layers[k] = distances(got[k], ref[k])["rel_norm"]
++            d["layer_rel_norm"] = layers
++            out[f] = d
++        shas = {}
++        for f, d in out.items():
++            shas.setdefault(d["rows_sha256"], []).append(f)
++        res[img] = {"forms": out, "bit_equal_groups": [g for g in shas.values()]}
++        print(f"{img}:")
++        for f, d in out.items():
++            r = d["rows"]
++            print(f"  {f:22s} rel {r['rel_norm']:.3e} max {r['max_abs']:.3e} mean {r['mean_abs']:.3e} "
++                  f"bit=ref {r['bit_equal_to_rounded_ref']:.3f}", flush=True)
++    dst = os.path.join(a.out, "compare")
++    os.makedirs(dst, exist_ok=True)
++    json.dump(res, open(os.path.join(dst, "compare.json"), "w"), indent=1)
++    return dst, {"tower_manifest_sha256": R.sha256(os.path.join(src, "manifest.json"))}
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
++    ap.add_argument("cmd", choices=["fixtures", "process", "tower", "tables", "greedy", "probe", "compare", "export"])
++    ap.add_argument("model_dir", help="checkpoint folder (fixtures: the output folder)")
++    ap.add_argument("--out", default="")
++    ap.add_argument("--fixtures", default="")
++    ap.add_argument("--images", default="", help="fixture file names, comma-separated")
++    ap.add_argument("--forms", default="sdpa")
++    ap.add_argument("--packed", action="store_true", help="tower: all --images in one call (as one request)")
++    ap.add_argument("--ops", action="store_true", help="tower: record every op's input and output")
++    ap.add_argument("--op-layers", default="0,11,22")
++    ap.add_argument("--eager-max-gib", type=float, default=40.0)
++    ap.add_argument("--q-block", type=int, default=1024, help="query block of the f32core and fp64 cores")
++    ap.add_argument("--set", default="g0")
++    ap.add_argument("--mode", choices=["full", "checkpoint"], default="checkpoint")
++    ap.add_argument("--attn", choices=["eager", "fp32"], default="fp32", help="the text oracle's core (v0.2: fp32)")
++    ap.add_argument("--tower-form", default="sdpa+red32", help="greedy/probe: the tower form whose rows enter the prompt")
++    ap.add_argument("--layers", type=int, default=0)
++    ap.add_argument("--only", default="", help="greedy/probe: only these prompts of --set")
++    ap.add_argument("--decode", type=int, default=64)
++    ap.add_argument("--expert-device", default="cuda:0")
++    ap.add_argument("--expert-cache", type=int, default=1000)
++    ap.add_argument("--device", default="cuda:0")
++    a = ap.parse_args()
++    BLOCK["q"] = a.q_block
++    if a.cmd == "fixtures":
++        made = make_fixtures(a.model_dir)
++        print(f"{len(made)} fixtures in {a.model_dir}")
++        return 0
++    dev = torch.device(a.device)
++    tf32 = R.tf32_guard(dev)
++    t0 = time.time()
++    if a.cmd == "process":
++        out, man = cmd_process(a, dev)
++    elif a.cmd == "tower":
++        out, man = cmd_tower(a, dev)
++    elif a.cmd == "tables":
++        out, man = cmd_tables(a, dev)
++    elif a.cmd == "compare":
++        out, man = cmd_compare(a, dev)
++    elif a.cmd == "export":
++        out, man = cmd_export(a, dev)
++    else:
++        out, man = cmd_greedy(a, dev, probe=a.cmd == "probe")
++    import transformers
++    man.update({"cmd": a.cmd, "argv": sys.argv[1:], "tf32": tf32, "torch": torch.__version__,
++                "cuda": torch.version.cuda, "transformers": transformers.__version__,
++                "gpu": torch.cuda.get_device_name(dev) if dev.type == "cuda" else None, "wall_s": round(time.time() - t0, 1),
++                "tool_sha256": R.sha256(os.path.abspath(__file__)),
++                "text_oracle_sha256": R.sha256(os.path.abspath(R.__file__))})
++    with open(os.path.join(out, "manifest.json"), "w") as f:
++        json.dump(man, f, indent=1, ensure_ascii=False)
++    print(f"done: {out} ({man['wall_s']} s)", flush=True)
 +    return 0
 +
 +
