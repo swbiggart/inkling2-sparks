@@ -32,8 +32,8 @@ HTTP_HOST=127.0.0.1
 HTTP_PORT=8890
 # CONTEXT=, PARALLEL=, MAX_STREAMS=, PROMPT_CACHE_GIB=, MEMORY_RESERVE_GIB=: release-defaults.sh (set one here only to differ).
 # CONTEXT is the one knob: the streams that fit at it run at once (PARALLEL=auto), at most MAX_STREAMS (4; up to 8);
-# CONTEXT is also the largest request: CONTEXT=524288 serves a 524,288-token request (one stream, DSpark by depth);
-# CONTEXT=1048576 (1M) serves one plain stream.
+# CONTEXT is also the largest request: CONTEXT=524288 serves requests of up to 524,288 tokens, and each such request
+# takes one stream (DSpark by depth); CONTEXT=1048576 (1M) serves one stream, DSpark by depth too.
 EXTRA_ARGS=""                       # more serve flags, the same on every rank
 
 # The fabric ports status.sh checks on every host (fabric/host/): the switch-facing port's two PCIe halves.

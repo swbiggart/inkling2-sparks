@@ -40,4 +40,4 @@ services:
       - ${RUN:?}:${RUN}
     command: >-
       serve ${MODEL} --backend cuda --tp 4 --rank ${RANK} --context ${CONTEXT:?} --parallel ${PARALLEL:?}
-      --prompt-cache-gib ${PROMPT_CACHE_GIB:?} --decode-share ${DECODE_SHARE:?} --host ${HTTP_HOST:-127.0.0.1} --port ${HTTP_PORT:-8890} ${EXTRA_ARGS:-}
+      --prompt-cache-gib ${PROMPT_CACHE_GIB:?} --decode-share ${DECODE_SHARE:?} ${VISION_ARGS:-} --host ${HTTP_HOST:-127.0.0.1} --port ${HTTP_PORT:-8890} ${EXTRA_ARGS:-}

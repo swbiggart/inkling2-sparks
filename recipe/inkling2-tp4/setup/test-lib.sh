@@ -9,7 +9,7 @@
 # copy whose server is gone. bench.sh check with a stand-in ssh: a refused, denied, dropped or cut-short host counts as
 # failed. In a repository, tools/tests/test_inkling2_bench.py (incomplete replies fail the bench tool's verdicts). Then
 # weights/test-checkpoint.sh (the checkpoint drop-in: checkpoint.py check/serve and copy-rank.sh --server on
-# 127.0.0.1). Prints PASS/FAIL lines; exits 0 only if all pass.
+# 127.0.0.1), and weights/test-vision.sh (VISION's weights step: v0.2's commands while off). Prints PASS/FAIL lines; exits 0 only if all pass.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 w=$(mktemp -d "${TMPDIR:-/tmp}/inkling2-lib-test.XXXXXX") || exit 1
@@ -267,11 +267,42 @@ if [ -f "${bt}" ]; then
     no "bench tool: tools/tests/test_inkling2_bench.py exit ${rc}: $(printf '%s\n' "${out}" | grep -E '^(FAIL|ERROR)' | head -3 | tr '\n' ' ')"
 fi
 
+# ---------------------------------------------------------------- release-defaults.sh: DSpark at every context
+# release_settings leaves DSPARK and the prompt cache as set at any CONTEXT up to 1048576 (DSpark fits beside a 1M
+# stream); past it, refused. --vision by default (VISION=1), none with VISION=0. Each case in a clean shell.
+rd=${here}/../release-defaults.sh
+rel() { env -i PATH="${PATH}" "${BASH}" --norc --noprofile -c 'source "$1" || exit 9; shift; for a in "$@"; do eval "${a}"; done
+  release_settings || exit 3; printf "%s %s %s\n" "${CONTEXT}" "${DSPARK}" "$(release_args)"' _ "${rd}" "$@" 2>&1; }
+cases=(
+  "131072 1 --prompt-cache-gib 1.5 --decode-share 0.5 --vision|"
+  "524288 1 --prompt-cache-gib 1.5 --decode-share 0.5 --vision|CONTEXT=524288"
+  "1048575 1 --prompt-cache-gib 1.5 --decode-share 0.5 --vision|CONTEXT=1048575"
+  "1048576 1 --prompt-cache-gib 1.5 --decode-share 0.5 --vision|CONTEXT=1048576"
+  "1048576 0 --prompt-cache-gib 1.5 --decode-share 0.5 --vision|CONTEXT=1048576 DSPARK=0"
+  "1048576 1 --prompt-cache-gib 0.5 --decode-share 0.5 --vision|CONTEXT=1048576 PROMPT_CACHE_GIB=0.5"
+  "131072 1 --prompt-cache-gib 1.5 --decode-share 0.5|VISION=0"
+)
+bad=0
+for c in "${cases[@]}"; do
+  want=${c%%|*}; read -r -a sets <<< "${c#*|}"
+  got=$(rel ${sets[@]+"${sets[@]}"})
+  [ "${got}" = "${want}" ] || { no "release_settings (${c#*|}): got '${got}', want '${want}'"; bad=1; }
+done
+rel CONTEXT=1048577 > /dev/null; [ $? = 3 ] || { no "release_settings: CONTEXT=1048577 not refused"; bad=1; }
+rel CONTEXT=9999999999999999999999999 > /dev/null; [ $? = 3 ] || { no "release_settings: CONTEXT=9999999999999999999999999 not refused"; bad=1; }
+[ ${bad} = 0 ] && ok "release_settings: ${#cases[@]} contexts keep DSPARK and the prompt cache as set (1M with DSpark); past 1048576 refused (a 25-digit one too)"
+
 # ---------------------------------------------------------------- the checkpoint drop-in (weights/test-checkpoint.sh)
 out=$(bash "${here}/../weights/test-checkpoint.sh" 2>&1); rc=$?
 printf '%s\n' "${out}" | grep -E '^(PASS|FAIL|SKIP)' | sed -E 's/^(PASS|FAIL) /\1 checkpoint: /'
 n=$(printf '%s\n' "${out}" | grep -c '^FAIL'); fails=$((fails + n))
 [ ${rc} = 0 ] || [ "${n}" -gt 0 ] || no "checkpoint: weights/test-checkpoint.sh exit ${rc}: $(printf '%s\n' "${out}" | tail -1)"
+
+# ---------------------------------------------------------------- VISION's weights step (weights/test-vision.sh)
+out=$(bash "${here}/../weights/test-vision.sh" 2>&1); rc=$?
+printf '%s\n' "${out}" | grep -E '^(PASS|FAIL)' | sed -E 's/^(PASS|FAIL) /\1 vision weights: /'
+n=$(printf '%s\n' "${out}" | grep -c '^FAIL'); fails=$((fails + n))
+[ ${rc} = 0 ] || [ "${n}" -gt 0 ] || no "vision weights: weights/test-vision.sh exit ${rc}: $(printf '%s\n' "${out}" | tail -1)"
 
 echo "$([ ${fails} = 0 ] && echo "ALL PASS" || echo "${fails} FAILED")"
 exit $((fails > 0))

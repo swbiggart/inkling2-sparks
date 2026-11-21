@@ -15,6 +15,7 @@
 #                     ROOT/bin/tf-inkling2-fold; skipped with a note while the release is not installed there)
 #   --jobs J          parallel range requests (default 8)
 #   --check-gib G     size of the sample check --http reads again (default 3; 0: headers only; all: every run)
+# VISION=1 (release-defaults.sh) adds --vision on rank 0 alone: the tower's own file, inkling2-vision.safetensors.
 # RANK_COPY overrides the path of inkling2_rank_copy.py on this machine.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -37,6 +38,10 @@ start)
     done
   fi
   [ -f "$tool" ] || { echo "inkling2_rank_copy.py not found: set RANK_COPY" >&2; exit 2; }
+  if [ "${VISION:-0}" = 1 ]; then # rank 0's tower copy, beside the copy tool
+    vtool=$(dirname "$tool")/inkling2_vision_copy.py
+    [ -f "$vtool" ] || { echo "inkling2_vision_copy.py not found beside $tool" >&2; exit 2; }
+  fi
   for f in ranges-w4-r0.tsv ranges-w4-r1.tsv ranges-w4-r2.tsv ranges-w4-r3.tsv inkling2-digests-w4.tsv; do
     [ -f "$plan/$f" ] || { echo "missing $plan/$f" >&2; exit 2; }
   done
@@ -49,11 +54,14 @@ start)
     if ssh "$h" "test -f '$RUN/weights-$r.pid' && kill -0 \$(cat '$RUN/weights-$r.pid') 2>/dev/null"; then
       echo "rank $r: a copy is already running on $h" >&2; continue
     fi
+    # v0.2's files and options; VISION=1 adds the tower's copy tool and --vision on rank 0 alone
+    files=("$tool" "$here/weights/copy-rank.sh" "$here/weights/fold-rank.sh" "$here/weights/seed_rank_folder.py" "$here/weights/netrun.py" "$plan/ranges-w4-r$r.tsv" "$plan/inkling2-digests-w4.tsv")
+    ropts=$opts
+    if [ "${VISION:-0}" = 1 ] && [ "$r" = 0 ]; then files+=("$vtool"); ropts+="--vision "; fi
     ssh "$h" "mkdir -p '$remote' '$RUN'" &&
-      scp -q "$tool" "$here/weights/copy-rank.sh" "$here/weights/fold-rank.sh" "$here/weights/seed_rank_folder.py" "$here/weights/netrun.py" "$plan/ranges-w4-r$r.tsv" \
-        "$plan/inkling2-digests-w4.tsv" "$h:$remote/" || { echo "copy to $h failed" >&2; exit 1; }
+      scp -q "${files[@]}" "$h:$remote/" || { echo "copy to $h failed" >&2; exit 1; }
     # cd on its own: a backgrounded `cd && cmd` list would keep ssh's output open (and ssh waiting) until the copy ends
-    ssh "$h" "cd '$remote' || exit 1; setsid nohup bash copy-rank.sh $r '$MODEL' $opts > '$RUN/weights-$r.log' 2>&1 < /dev/null & echo \$! > '$RUN/weights-$r.pid'; echo \"rank $r on \$(hostname): copy pid \$(cat '$RUN/weights-$r.pid'), log $RUN/weights-$r.log\""
+    ssh "$h" "cd '$remote' || exit 1; setsid nohup bash copy-rank.sh $r '$MODEL' $ropts > '$RUN/weights-$r.log' 2>&1 < /dev/null & echo \$! > '$RUN/weights-$r.pid'; echo \"rank $r on \$(hostname): copy pid \$(cat '$RUN/weights-$r.pid'), log $RUN/weights-$r.log\""
   done;;
 status)
   for r in 0 1 2 3; do

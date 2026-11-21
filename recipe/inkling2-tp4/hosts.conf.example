@@ -52,8 +52,8 @@ EXTRA_ARGS=""                      # more serve flags, the same on every rank
 # The release's CONTEXT, PARALLEL, memory reserve, prompt cache, DSpark, XROWS and RoCE wire are in
 # release-defaults.sh. To differ from them on this install, set the same variable here (e.g. CONTEXT=32768).
 # CONTEXT is the one knob: the streams that fit at it run at once (PARALLEL=auto), at most MAX_STREAMS (4; up to 8);
-# CONTEXT is also the largest request: CONTEXT=524288 serves a 524,288-token request (one stream, DSpark by depth);
-# CONTEXT=1048576 (1M) serves one plain stream.
+# CONTEXT is also the largest request: CONTEXT=524288 serves requests of up to 524,288 tokens, and each such request
+# takes one stream (DSpark by depth); CONTEXT=1048576 (1M) serves one stream, DSpark by depth too.
 
 # Opt-in settings (recipe/inkling2-tp4/docs/SETTINGS.md), added to every rank's environment, e.g. OPT_ENV=(TF_INK2_GRAPH=0).
 OPT_ENV=()

@@ -14,6 +14,10 @@
 #      against the checkpoint's disk (the server's sha256 of each sampled run)
 #   6. folds (--folds BIN): the DSpark folds file from the folder's own bytes (weights/fold-rank.sh)
 # --drafter also copies the DSpark drafter's tensors (needed only with TF_INK2_DSPARK=1).
+# --vision (rank 0, VISION=1) then adds the vision tower as one NEW file, DEST/inkling2-vision.safetensors: its 422
+#   tensors by range requests from the pinned revision (also with --server), written beside the shards and renamed
+#   into place once its sha256 is VISION_SHA256 (inkling2_vision_copy.py; no existing file is written). With
+#   --verify-only the file's sha256 is checked. --vision-check checks only that file (a read) and exits.
 # --folds BIN then builds the drafter's folds file DEST/inkling2-dspark-fold.safetensors with BIN (tf-inkling2-fold)
 #   through fold-rank.sh (step 6; skipped with a note when BIN is not there yet: setup.sh's folds step builds it).
 # --prefix P (repeatable) copies only the tensors under P instead of all of model.llm. (a small download to test the
@@ -26,7 +30,10 @@ dest=${2:?usage: copy-rank.sh RANK DEST [options]}
 shift 2
 REVISION=aac974122acd33ddb0d3e1f54433a9c5dd2249ce
 HF=${HF_BASE:-https://huggingface.co/thinkingmachines/Inkling-2-Small/resolve/${REVISION}}
-seed=""; jobs=8; gib=3; only=0; manifest=1; folds=""; server=""
+# inkling2-vision.safetensors made from that revision's model-00024-of-00024.safetensors (the tower's 422 tensors;
+# each also equals the digest manifest's rank-0 line for it)
+VISION_SHA256=b8e7df24b5bcb0d69f246cd5c703912b81b4f752c2316850b1225959c3d79a71
+seed=""; jobs=8; gib=3; only=0; manifest=1; folds=""; server=""; vision=0
 P=(--prefix model.llm.)
 custom=()
 while [ $# -gt 0 ]; do
@@ -35,6 +42,8 @@ while [ $# -gt 0 ]; do
     --server) server=$2; shift 2;;
     --drafter) P+=(--prefix fuse_weight --prefix layers. --prefix markov_head --prefix mask_embed --prefix norm.weight); shift;;
     --folds) folds=$2; shift 2;;
+    --vision) vision=1; shift;;
+    --vision-check) exec python3 -I inkling2_vision_copy.py check --dest "${dest}" --sha256 "${VISION_SHA256}";;
     --jobs) jobs=$2; shift 2;;
     --check-gib) gib=$2; shift 2;;
     --prefix) custom+=(--prefix "$2"); shift 2;;
@@ -54,10 +63,15 @@ ranges=ranges-w4-r${r}.tsv
 for f in inkling2_rank_copy.py "${ranges}" inkling2-digests-w4.tsv; do
   [ -f "${f}" ] || { echo "missing ${f} in $(pwd)" >&2; exit 2; }
 done
+[ ${vision} = 0 ] || [ -f inkling2_vision_copy.py ] || { echo "missing inkling2_vision_copy.py in $(pwd)" >&2; exit 2; }
 if [ ${only} = 1 ]; then
   [ -f "${dest}/.rank_copy.json" ] || { echo "${dest} has no copy state (.rank_copy.json): not a rank folder made by this tool" >&2; exit 3; }
   echo "== verify (existing folder, read only) $(date -u +%T)"
   rc_py verify --ranges "${ranges}" --dest "${dest}" "${P[@]}" || exit 3
+  if [ ${vision} = 1 ]; then
+    echo "== vision tower (read only) $(date -u +%T)"
+    python3 -I inkling2_vision_copy.py check --dest "${dest}" --sha256 "${VISION_SHA256}" || exit 7
+  fi
   echo "== done $(date -u +%T)"
   exit 0
 fi
@@ -81,6 +95,10 @@ case ${gib} in
   *) echo "== check (${gib} GiB sample) $(date -u +%T)"
      rc_py check "${SRC[@]}" --ranges "${ranges}" --dest "${dest}" --jobs 4 --max-gib "${gib}" "${P[@]}" || exit 4;;
 esac
+if [ ${vision} = 1 ]; then
+  echo "== vision tower $(date -u +%T)"
+  python3 -I inkling2_vision_copy.py make --http "${HF}" --dest "${dest}" --sha256 "${VISION_SHA256}" || exit 7
+fi
 if [ -n "${folds}" ]; then
   echo "== folds $(date -u +%T)"
   if [ -x "${folds}" ]; then bash fold-rank.sh "${r}" "${dest}" "${folds}" || exit 6

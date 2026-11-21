@@ -105,7 +105,7 @@ BASE_IMAGE=nvcr.io/nvidia/cuda:13.3.1-runtime-ubuntu24.04@sha256:585155539dd4ff2
 SMOKE_LONG_TOKENS=8000; READY_WAIT=900; CHECK_PROMPT=3040; CHECK_STEPS=80; PROBE_PORTS=10
 # The release's settings (CONTEXT, PARALLEL, the reserve, the prompt cache, DSpark, XROWS, the RoCE wire, the folder
 # name): release-defaults.sh. HOSTS_CONF may override any of them; the config written below carries only the overrides.
-REL_VARS=(MODEL_DIRNAME EXPERTS CONTEXT PARALLEL MAX_STREAMS MEMORY_RESERVE_GIB PROMPT_CACHE_GIB DECODE_SHARE DSPARK XROWS ROCE_MULTI MAILBOX_MAX_KB TP_PORT)
+REL_VARS=(MODEL_DIRNAME EXPERTS CONTEXT PARALLEL MAX_STREAMS MEMORY_RESERVE_GIB PROMPT_CACHE_GIB DECODE_SHARE DSPARK XROWS ROCE_MULTI MAILBOX_MAX_KB TP_PORT VISION)
 # shellcheck source=/dev/null
 source "${here}/release-defaults.sh"
 # shellcheck source=setup/lib.sh
@@ -341,6 +341,8 @@ stage_release() {
   for f in "${d}"/bin/*; do case ${f} in *.py) cp -p "${f}" "${stage}/tools/";; *) cp -p "${f}" "${stage}/bin/";; esac; done
   [ -f "${stage}/tools/inkling2_rank_copy.py" ] || cp -p "${d}/tools/zig/inkling2_rank_copy.py" "${stage}/tools/" 2> /dev/null ||
     die "the release has no inkling2_rank_copy.py"
+  # VISION=1's tower copy (rank 0); a release without it serves text only
+  [ -f "${stage}/tools/inkling2_vision_copy.py" ] || cp -p "${d}/tools/zig/inkling2_vision_copy.py" "${stage}/tools/" 2> /dev/null || true
   for f in "${d}"/tools/*.py; do [ -f "${f}" ] && cp -p "${f}" "${stage}/tools/"; done
   for r in 0 1 2 3; do
     if [ -f "${d}/plan/ranges-w4-r${r}.tsv" ]; then cp -p "${d}/plan/ranges-w4-r${r}.tsv" "${stage}/plan/"
@@ -401,7 +403,7 @@ libs_host() {
   local r=$1 h=${HOSTS[$1]}
   if rq "${h}" "grep -q ' lib/libnccl.so.2\$' $(q "${ROOT}/.setup/assets.SHA256SUMS")"; then
     # libtfgrammar.so (structured output) is the release's own build: listed when the release carries it
-    rq "${h}" "cd $(q "${ROOT}/lib") && sha256sum libnccl.so.2 libcublas.so.13 libcublasLt.so.13 \$(ls libtfgrammar.so 2>/dev/null) > SHA256SUMS && echo \"rank ${r} ${h}: lib/ from the release\""
+    rq "${h}" "cd $(q "${ROOT}/lib") && sha256sum libnccl.so.2 libcublas.so.13 libcublasLt.so.13 \$(ls libtfgrammar.so libturbojpeg.so.0 libwebpdecoder.so.3 2>/dev/null) > SHA256SUMS && echo \"rank ${r} ${h}: lib/ from the release\""
   elif [ -n "${libs_dir}" ]; then
     tarc -C "${libs_dir}" -cf - libnccl.so.2 libcublas.so.13 libcublasLt.so.13 |
       rq "${h}" "mkdir -p $(q "${ROOT}/lib") && cd $(q "${ROOT}/lib") && ${UNTAR} && sha256sum libnccl.so.2 libcublas.so.13 libcublasLt.so.13 > SHA256SUMS &&
@@ -422,17 +424,31 @@ do_libs() {
 }
 
 # ---------------------------------------------------------------- weights
-weights_key() { echo "$(rq "${HOSTS[$1]}" "sha256sum $(q "${PLAN}/ranges-w4-r$1.tsv")" | cut -c1-16) ${wdir:-${MODEL_DIR}} ${wprefix[*]:-model.llm.} drafter ${DSPARK}"; }
-w_opts() { local p; for p in ${wprefix[@]+"${wprefix[@]}"}; do printf -- '--prefix %q ' "${p}"; done; [ "${DSPARK}" = 1 ] && printf -- '--drafter '; }
+# VISION=1 adds rank 0's tower file (copy-rank.sh --vision); the key and options are v0.2's while VISION=0
+w_vision() { [ "${VISION:-0}" = 1 ] && [ "$1" = 0 ]; }
+weights_key() { echo "$(rq "${HOSTS[$1]}" "sha256sum $(q "${PLAN}/ranges-w4-r$1.tsv")" | cut -c1-16) ${wdir:-${MODEL_DIR}} ${wprefix[*]:-model.llm.} drafter ${DSPARK}$(w_vision "$1" && printf ' vision')"; }
+w_opts() { local p; for p in ${wprefix[@]+"${wprefix[@]}"}; do printf -- '--prefix %q ' "${p}"; done; [ "${DSPARK}" = 1 ] && printf -- '--drafter '; w_vision "${1:-}" && printf -- '--vision '; return 0; }
 w_prepare() { # copy-rank.sh runs in ROOT/recipe/weights with the tool, the rank's ranges and the manifest beside it
-  rq "${HOSTS[$1]}" "cd $(q "${ROOT}") && cp -p tools/inkling2_rank_copy.py plan/ranges-w4-r$1.tsv plan/inkling2-digests-w4.tsv recipe/weights/ && mkdir -p $(q "${RUN}")"
+  local vtool=""; w_vision "$1" && vtool=" tools/inkling2_vision_copy.py" # and, for VISION=1's rank 0, the tower's tool
+  rq "${HOSTS[$1]}" "cd $(q "${ROOT}") && cp -p tools/inkling2_rank_copy.py plan/ranges-w4-r$1.tsv plan/inkling2-digests-w4.tsv${vtool} recipe/weights/ && mkdir -p $(q "${RUN}")"
+}
+# w_tower RANK: with VISION=1, rank 0's inkling2-vision.safetensors is whole and has the pin (copy-rank.sh
+# --vision-check, a read); true for any other rank. A copy that ran without --vision (an earlier text-only job this run
+# waited for) holds no tower: its stamp must not say vision.
+w_tower() {
+  w_vision "$1" || return 0
+  w_prepare "$1" || return 1 # the tower's tool beside copy-rank.sh (a copy this run only waited for had none)
+  rq "${HOSTS[$1]}" "bash $(q "${ROOT}/recipe/weights/copy-rank.sh") 0 $(q "${wdir:-${MODEL_DIR}}") --vision-check" ||
+    { echo "rank 0 ${HOSTS[0]}: no checked inkling2-vision.safetensors in ${wdir:-${MODEL_DIR}} (VISION=1)"; return 1; }
 }
 weights_verify_host() {
   local r=$1 h=${HOSTS[$1]} key; key=$(weights_key "$1")
-  if [ "$(stamp_get "${r}" weights)" = "${key}" ] && ! forced weights; then echo "rank ${r} ${h}: ${wdir} already verified"; return 0; fi
+  # a stamp is trusted only while rank 0's tower (VISION=1) still checks against its pin; else verify again
+  if [ "$(stamp_get "${r}" weights)" = "${key}" ] && ! forced weights && w_tower "${r}"; then echo "rank ${r} ${h}: ${wdir} already verified"; return 0; fi
   w_prepare "${r}" || return 1
-  rq "${h}" "nice ionice -c3 bash $(q "${ROOT}/recipe/weights/copy-rank.sh") ${r} $(q "${wdir}") --verify-only $(w_opts) > $(q "${RUN}/weights-${r}.log") 2>&1; rc=\$?;
+  rq "${h}" "nice ionice -c3 bash $(q "${ROOT}/recipe/weights/copy-rank.sh") ${r} $(q "${wdir}") --verify-only $(w_opts "${r}") > $(q "${RUN}/weights-${r}.log") 2>&1; rc=\$?;
     grep -E '^(coverage|headers|verify)' $(q "${RUN}/weights-${r}.log") | sed 's/^/rank ${r} ${h}: /'; exit \${rc}" || { echo "rank ${r} ${h}: verify FAILED (log ${RUN}/weights-${r}.log)"; return 1; }
+  w_tower "${r}" || return 1
   stamp_put "${r}" weights "${key}"
 }
 do_weights() {
@@ -446,6 +462,9 @@ do_weights() {
   for r in 0 1 2 3; do
     key=$(weights_key "${r}"); st=$(wjob_state "${r}")
     stamped=0; [ "$(stamp_get "${r}" weights)" = "${key}" ] && ! forced weights && stamped=1
+    # VISION=1: a stamp counts only while rank 0's tower file still checks against its pin (a removed or changed
+    # file is copied again: the copy resumes and fetches only what is missing)
+    [ ${stamped} = 1 ] && [ "${st}" != running ] && ! w_tower "${r}" && stamped=0
     case $(wjob_next "${r}" "${st}" "${stamped}") in
       done) echo "rank ${r} ${HOSTS[$r]}: ${MODEL_DIR} done";;
       wait) echo "rank ${r} ${HOSTS[$r]}: a copy is already running; waiting for it"; todo+=("${r}");;
@@ -460,7 +479,7 @@ do_weights() {
     src=""; [ -n "${ckpt}" ] && src=${ck_srv[$((r % ${#ck_srv[@]}))]}
     w_prepare "${r}" || die "weights: cannot prepare rank ${r}"
     [ -n "${src}" ] && ck_jobs+=("${r}") # stopped on any exit before the server (wjob_stop_all), also if the launch fails half way
-    wjob_launch "${r}" "${src}" "$(w_opts)" || die "weights: cannot start the copy on ${HOSTS[$r]}"
+    wjob_launch "${r}" "${src}" "$(w_opts "${r}")" || die "weights: cannot start the copy on ${HOSTS[$r]}"
     echo "rank ${r} ${HOSTS[$r]}: copy started into ${MODEL_DIR}${src:+ from ${src}} (log ${RUN}/weights-${r}.log)"
     todo+=("${r}")
   done
@@ -479,7 +498,10 @@ do_weights() {
   done
   ck_jobs=() # every copy ended: nothing left to stop
   ck_stop
-  for r in "${todo[@]}"; do stamp_put "${r}" weights "$(weights_key "${r}")"; done
+  for r in "${todo[@]}"; do
+    w_tower "${r}" || die "weights: rank 0's copy holds no vision tower (it ran without --vision); rerun setup.sh"
+    stamp_put "${r}" weights "$(weights_key "${r}")"
+  done
   echo "weights: all four ranks copied, verified and checked"
 }
 
@@ -629,7 +651,7 @@ ctr_write() {
     ENV_LIBS=/opt/inkling2/lib ENV_BIN_DIR=/opt/inkling2/bin bash $(q "${ROOT}/recipe/rank.sh") $(q "${ROOT}/recipe/config.sh") env ${r} > \"\$d/rank.env\";
     printf '%s\n' 'RANK=${r}' 'IMAGE=$(img)' 'MODEL=${MODEL}' 'PLAN=${PLAN}' 'DATA=${DATA}' 'RUN=${RUN}' \
       'HTTP_HOST=${HTTP_HOST}' 'HTTP_PORT=${HTTP_PORT}' 'CONTEXT=${CONTEXT}' 'PARALLEL=${PARALLEL}' \
-      'PROMPT_CACHE_GIB=${PROMPT_CACHE_GIB}' 'DECODE_SHARE=${DECODE_SHARE}' \"EXTRA_ARGS='${EXTRA_ARGS}'\" 'RUN_UID=${uid}' 'RUN_GID=${gid}' > \"\$d/.env\"; mkdir -p $(q "${DATA}")"
+      'PROMPT_CACHE_GIB=${PROMPT_CACHE_GIB}' 'DECODE_SHARE=${DECODE_SHARE}' $([ "${VISION:-0}" = 1 ] && printf "%s " "'VISION_ARGS=--vision'")\"EXTRA_ARGS='${EXTRA_ARGS}'\" 'RUN_UID=${uid}' 'RUN_GID=${gid}' > \"\$d/.env\"; mkdir -p $(q "${DATA}")"
 }
 do_start() {
   [ ${container} = 1 ] && installed
